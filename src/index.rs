@@ -1,81 +1,26 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, path::Path, sync::Mutex};
 
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::error::MemoryError;
 
 // ---------------------------------------------------------------------------
-// KeyMap — maps usearch u64 keys → memory name strings
-// ---------------------------------------------------------------------------
-
-/// A thread-safe map from vector-index keys to memory names.
-///
-/// usearch stores vectors under opaque `u64` keys. `KeyMap` lets us
-/// round-trip from a search result back to the memory name.
-#[derive(Clone, Default)]
-pub struct KeyMap {
-    inner: Arc<RwLock<HashMap<u64, String>>>,
-}
-
-impl KeyMap {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&self, key: u64, name: String) {
-        self.inner
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, name);
-    }
-
-    pub fn remove(&self, key: u64) {
-        self.inner
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
-    }
-
-    pub fn get(&self, key: u64) -> Option<String> {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .cloned()
-    }
-
-    /// Serialise to JSON for persistence alongside the index.
-    pub fn to_json(&self) -> Result<String, MemoryError> {
-        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        serde_json::to_string(&*map)
-            .map_err(|e| MemoryError::Index(format!("keymap serialise: {}", e)))
-    }
-
-    /// Deserialise from JSON.
-    pub fn from_json(json: &str) -> Result<Self, MemoryError> {
-        let map: HashMap<u64, String> = serde_json::from_str(json)
-            .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
-        Ok(Self {
-            inner: Arc::new(RwLock::new(map)),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // VectorIndex
 // ---------------------------------------------------------------------------
 
-/// Wraps `usearch::Index` and provides async-safe methods.
+/// Internal state kept behind the mutex.
+struct VectorState {
+    index: Index,
+    /// Maps usearch u64 keys → memory name strings.
+    key_map: HashMap<u64, String>,
+}
+
+/// Wraps `usearch::Index` and a key-map behind a single `std::sync::Mutex`.
 ///
-/// `usearch::Index` is `Send + Sync`, so we can share it behind an `Arc`
-/// without any additional mutex.
+/// `usearch::Index` is `Send + Sync`, and `HashMap` is `Send`, so
+/// `VectorIndex` is `Send + Sync` via the mutex.
 pub struct VectorIndex {
-    inner: Arc<Index>,
-    pub key_map: KeyMap,
+    state: Mutex<VectorState>,
 }
 
 impl VectorIndex {
@@ -97,48 +42,96 @@ impl VectorIndex {
             .reserve(Self::INITIAL_CAPACITY)
             .map_err(|e| MemoryError::Index(format!("reserve: {}", e)))?;
         Ok(Self {
-            inner: Arc::new(index),
-            key_map: KeyMap::new(),
+            state: Mutex::new(VectorState {
+                index,
+                key_map: HashMap::new(),
+            }),
         })
     }
 
-    /// Ensure the index has capacity for at least `additional` more vectors.
-    pub fn grow_if_needed(&self, additional: usize) -> Result<(), MemoryError> {
-        let current_capacity = self.inner.capacity();
-        let current_size = self.inner.size();
+    /// Grow the index if it doesn't have room for `additional` more vectors.
+    ///
+    /// Operates on an already-locked `VectorState` reference so callers that
+    /// already hold the lock can call this without re-locking.
+    fn grow_if_needed_inner(state: &VectorState, additional: usize) -> Result<(), MemoryError> {
+        let current_capacity = state.index.capacity();
+        let current_size = state.index.size();
         if current_size + additional > current_capacity {
             let new_capacity = (current_capacity + additional).max(current_capacity * 2);
-            self.inner
+            state
+                .index
                 .reserve(new_capacity)
                 .map_err(|e| MemoryError::Index(format!("reserve: {}", e)))?;
         }
         Ok(())
     }
 
-    /// Add a vector under the given key.
-    pub fn add(&self, key: u64, vector: &[f32]) -> Result<(), MemoryError> {
-        self.inner
+    /// Ensure the index has capacity for at least `additional` more vectors.
+    pub fn grow_if_needed(&self, additional: usize) -> Result<(), MemoryError> {
+        let state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        Self::grow_if_needed_inner(&state, additional)
+    }
+
+    /// Add a vector under the given key, growing the index if necessary.
+    pub fn add(&self, key: u64, vector: &[f32], name: String) -> Result<(), MemoryError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        Self::grow_if_needed_inner(&state, 1)?;
+        state
+            .index
             .add(key, vector)
-            .map_err(|e| MemoryError::Index(format!("add: {}", e)))
+            .map_err(|e| MemoryError::Index(format!("add: {}", e)))?;
+        state.key_map.insert(key, name);
+        Ok(())
     }
 
     /// Search for the `limit` nearest neighbours of `query`.
     ///
     /// Returns `(key, distance)` pairs sorted by ascending distance.
-    pub fn search(&self, query: &[f32], limit: usize) -> Result<Vec<(u64, f32)>, MemoryError> {
-        let matches = self
-            .inner
+    pub fn search(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(u64, String, f32)>, MemoryError> {
+        let state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        let matches = state
+            .index
             .search(query, limit)
             .map_err(|e| MemoryError::Index(format!("search: {}", e)))?;
 
-        Ok(matches.keys.into_iter().zip(matches.distances).collect())
+        let results = matches
+            .keys
+            .into_iter()
+            .zip(matches.distances)
+            .filter_map(|(key, dist)| {
+                state
+                    .key_map
+                    .get(&key)
+                    .map(|name| (key, name.clone(), dist))
+            })
+            .collect();
+        Ok(results)
     }
 
     /// Remove a vector by key.
     pub fn remove(&self, key: u64) -> Result<(), MemoryError> {
-        self.inner
+        let mut state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        state
+            .index
             .remove(key)
             .map_err(|e| MemoryError::Index(format!("remove: {}", e)))?;
+        state.key_map.remove(&key);
         Ok(())
     }
 
@@ -147,13 +140,20 @@ impl VectorIndex {
         let path_str = path.to_str().ok_or_else(|| MemoryError::InvalidInput {
             reason: "non-UTF-8 index path".to_string(),
         })?;
-        self.inner
+
+        let state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        state
+            .index
             .save(path_str)
             .map_err(|e| MemoryError::Index(format!("save: {}", e)))?;
 
         // Persist the key map alongside the index.
         let keys_path = format!("{}.keys.json", path_str);
-        let json = self.key_map.to_json()?;
+        let json = serde_json::to_string(&state.key_map)
+            .map_err(|e| MemoryError::Index(format!("keymap serialise: {}", e)))?;
         std::fs::write(&keys_path, json)?;
 
         Ok(())
@@ -182,16 +182,16 @@ impl VectorIndex {
 
         // Load the key map.
         let keys_path = format!("{}.keys.json", path_str);
-        let key_map = if std::path::Path::new(&keys_path).exists() {
+        let key_map: HashMap<u64, String> = if std::path::Path::new(&keys_path).exists() {
             let json = std::fs::read_to_string(&keys_path)?;
-            KeyMap::from_json(&json)?
+            serde_json::from_str(&json)
+                .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?
         } else {
-            KeyMap::new()
+            HashMap::new()
         };
 
         Ok(Self {
-            inner: Arc::new(index),
-            key_map,
+            state: Mutex::new(VectorState { index, key_map }),
         })
     }
 }

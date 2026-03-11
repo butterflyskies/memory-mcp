@@ -1811,6 +1811,7 @@ dependencies = [
  "clap",
  "fastembed",
  "git2",
+ "libc",
  "rmcp",
  "schemars 0.8.22",
  "serde",

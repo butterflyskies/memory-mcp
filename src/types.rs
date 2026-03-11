@@ -7,13 +7,59 @@ use uuid::Uuid;
 use crate::error::MemoryError;
 
 // ---------------------------------------------------------------------------
+// Name validation
+// ---------------------------------------------------------------------------
+
+/// Validate that a memory name or project name contains only safe characters.
+///
+/// Allowed: alphanumeric, hyphens, underscores, dots, and forward slashes
+/// (for nested paths). Dots may not start a component (no `..`). The name
+/// must not be empty.
+pub fn validate_name(name: &str) -> Result<(), MemoryError> {
+    if name.is_empty() {
+        return Err(MemoryError::InvalidInput {
+            reason: "name must not be empty".to_string(),
+        });
+    }
+
+    for component in name.split('/') {
+        if component.is_empty() {
+            return Err(MemoryError::InvalidInput {
+                reason: format!("name '{}' contains an empty path component", name),
+            });
+        }
+        if component.starts_with('.') {
+            return Err(MemoryError::InvalidInput {
+                reason: format!(
+                    "name '{}' contains a dot-prefixed component '{}'",
+                    name, component
+                ),
+            });
+        }
+        if !component
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(MemoryError::InvalidInput {
+                reason: format!(
+                    "name '{}' contains disallowed characters in component '{}'",
+                    name, component
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Scope
 // ---------------------------------------------------------------------------
 
 /// Where a memory lives on disk and conceptually.
 ///
 /// - `Global`           → `global/`
-/// - `Project(name)`    → `projects/<name>/`
+/// - `Project(name)`    → `projects/{name}/`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "name")]
 pub enum Scope {
@@ -45,7 +91,7 @@ impl FromStr for Scope {
 
     /// Parse a scope string:
     /// - `"global"` → `Scope::Global`
-    /// - `"project:<name>"` → `Scope::Project(name)`
+    /// - `"project:{name}"` → `Scope::Project(name)`
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s == "global" {
             return Ok(Scope::Global);
@@ -56,6 +102,7 @@ impl FromStr for Scope {
                     reason: "project scope requires a non-empty name after 'project:'".to_string(),
                 });
             }
+            validate_name(name)?;
             return Ok(Scope::Project(name.to_string()));
         }
         Err(MemoryError::InvalidInput {
@@ -219,7 +266,7 @@ pub struct RememberArgs {
     /// Optional list of tags for categorisation.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Scope: "global" or "project:<name>". Defaults to "global".
+    /// Scope: `"global"` or `"project:{name}"`. Defaults to `"global"`.
     #[serde(default)]
     pub scope: Option<String>,
     /// Optional hint about the source of this memory.
@@ -232,7 +279,7 @@ pub struct RememberArgs {
 pub struct RecallArgs {
     /// Natural-language query to search for.
     pub query: String,
-    /// Scope filter: "global", "project:<name>", or omit for all.
+    /// Scope filter: `"global"`, `"project:{name}"`, or omit for all.
     #[serde(default)]
     pub scope: Option<String>,
     /// Maximum number of results to return. Defaults to 5.
@@ -269,7 +316,7 @@ pub struct EditArgs {
 /// Arguments for the `list` tool — browse stored memories.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListArgs {
-    /// Scope filter: "global", "project:<name>", or omit for all.
+    /// Scope filter: `"global"`, `"project:{name}"`, or omit for all.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -296,14 +343,16 @@ pub struct SyncArgs {
 // AppState
 // ---------------------------------------------------------------------------
 
+use std::sync::Arc;
+
 use crate::{auth::AuthProvider, embedding::EmbeddingEngine, index::VectorIndex, repo::MemoryRepo};
 
 /// Shared application state threaded through the Axum server.
 ///
-/// Wrapped in a single outer `Arc` at the call site; inner fields do not
-/// need their own `Arc` because they are never shared independently.
+/// Wrapped in a single outer `Arc` at the call site. `repo` is additionally
+/// wrapped in its own `Arc` so it can be cloned into `spawn_blocking` closures.
 pub struct AppState {
-    pub repo: MemoryRepo,
+    pub repo: Arc<MemoryRepo>,
     pub embedding: EmbeddingEngine,
     pub index: VectorIndex,
     pub auth: AuthProvider,
@@ -415,5 +464,46 @@ mod tests {
     fn scope_from_str_unknown_fails() {
         assert!("unknown".parse::<Scope>().is_err());
         assert!("PROJECT:foo".parse::<Scope>().is_err());
+    }
+
+    #[test]
+    fn scope_from_str_project_traversal_fails() {
+        assert!("project:../../etc".parse::<Scope>().is_err());
+    }
+
+    // validate_name tests (moved from repo.rs)
+
+    #[test]
+    fn validate_name_accepts_valid() {
+        assert!(validate_name("my-memory").is_ok());
+        assert!(validate_name("some_memory").is_ok());
+        assert!(validate_name("nested/path").is_ok());
+        assert!(validate_name("v1.2.3").is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_traversal() {
+        assert!(validate_name("../../etc/passwd").is_err());
+        assert!(validate_name("..").is_err());
+        assert!(validate_name(".hidden").is_err());
+        assert!(validate_name("a/../b").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_empty() {
+        assert!(validate_name("").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_special_chars() {
+        assert!(validate_name("foo;bar").is_err());
+        assert!(validate_name("foo bar").is_err());
+        assert!(validate_name("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_empty_component() {
+        assert!(validate_name("foo//bar").is_err());
+        assert!(validate_name("/absolute").is_err());
     }
 }

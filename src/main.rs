@@ -101,11 +101,14 @@ async fn main() -> anyhow::Result<()> {
     let auth = AuthProvider::new();
 
     let state = Arc::new(AppState {
-        repo,
+        repo: Arc::new(repo),
         embedding,
         index,
         auth,
     });
+
+    // Keep a reference for post-shutdown index persistence.
+    let state_for_shutdown = Arc::clone(&state);
 
     // Build the MCP service.
     let ct = CancellationToken::new();
@@ -139,6 +142,17 @@ async fn main() -> anyhow::Result<()> {
         })
         .await
         .context("server error")?;
+
+    // Persist the vector index so the next startup can skip a full reindex.
+    let index_dir = repo_path.join(".memory-mcp-index");
+    std::fs::create_dir_all(&index_dir)
+        .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
+    let index_path = index_dir.join("index.usearch");
+    if let Err(e) = state_for_shutdown.index.save(&index_path) {
+        tracing::warn!("failed to persist vector index on shutdown: {}", e);
+    } else {
+        info!("vector index saved to {}", index_path.display());
+    }
 
     Ok(())
 }

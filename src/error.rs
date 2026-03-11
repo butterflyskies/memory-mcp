@@ -25,4 +25,7 @@ pub enum MemoryError {
 
     #[error("yaml error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+
+    #[error("task join error: {0}")]
+    Join(String),
 }

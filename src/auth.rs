@@ -63,7 +63,7 @@ impl AuthProvider {
     /// Create an `AuthProvider`, eagerly attempting token resolution.
     ///
     /// Does not fail if no token is available — some deployments may not
-    /// need remote sync. Call [`resolve_token`] when a token is required.
+    /// need remote sync. Call [`Self::resolve_token`] when a token is required.
     pub fn new() -> Self {
         let token = Self::try_resolve().ok().map(Secret::new);
         if token.is_some() {

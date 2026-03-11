@@ -1,16 +1,17 @@
+use std::sync::{Arc, Mutex};
+
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use tokio::sync::Mutex;
 
 use crate::error::MemoryError;
 
-/// Wraps `fastembed::TextEmbedding` behind a `Mutex` and exposes a minimal
-/// embedding API.
+/// Wraps `fastembed::TextEmbedding` behind an `Arc<Mutex<...>>` and exposes a
+/// minimal embedding API.
 ///
 /// `TextEmbedding::embed` takes `&mut self`, so interior mutability is
-/// required. We use `tokio::sync::Mutex` so the lock plays nicely in async
-/// contexts — callers can `.await` the lock without blocking the executor.
+/// required. We use `std::sync::Mutex` combined with `tokio::task::spawn_blocking`
+/// so blocking embed work doesn't occupy executor threads.
 pub struct EmbeddingEngine {
-    inner: Mutex<TextEmbedding>,
+    inner: Arc<Mutex<TextEmbedding>>,
     dim: usize,
 }
 
@@ -29,22 +30,42 @@ impl EmbeddingEngine {
                 .map_err(|e| MemoryError::Embedding(e.to_string()))?;
 
         Ok(Self {
-            inner: Mutex::new(inner),
+            inner: Arc::new(Mutex::new(inner)),
             dim,
         })
     }
 
     /// Embed a batch of texts, returning one vector per input.
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
-        let mut guard = self.inner.lock().await;
-        guard
-            .embed(texts, None)
-            .map_err(|e| MemoryError::Embedding(e.to_string()))
+        let arc = Arc::clone(&self.inner);
+        let texts = texts.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = arc
+                .lock()
+                .expect("lock poisoned — prior panic corrupted state");
+            guard
+                .embed(texts, None)
+                .map_err(|e| MemoryError::Embedding(e.to_string()))
+        })
+        .await
+        .map_err(|e| MemoryError::Join(e.to_string()))?
     }
 
     /// Convenience: embed a single text.
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
-        let mut results = self.embed(&[text.to_string()]).await?;
+        let arc = Arc::clone(&self.inner);
+        let text = text.to_string();
+        let mut results = tokio::task::spawn_blocking(move || {
+            let mut guard = arc
+                .lock()
+                .expect("lock poisoned — prior panic corrupted state");
+            guard
+                .embed(vec![text], None)
+                .map_err(|e| MemoryError::Embedding(e.to_string()))
+        })
+        .await
+        .map_err(|e| MemoryError::Join(e.to_string()))??;
+
         results
             .pop()
             .ok_or_else(|| MemoryError::Embedding("embedding returned no vectors".to_string()))
