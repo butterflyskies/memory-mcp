@@ -124,6 +124,16 @@ impl AuthProvider {
     }
 }
 
+impl AuthProvider {
+    /// Create an `AuthProvider` with a pre-set token. For testing only.
+    #[cfg(test)]
+    pub(crate) fn with_token(token: &str) -> Self {
+        Self {
+            token: Some(Secret::new(token.to_string())),
+        }
+    }
+}
+
 impl Default for AuthProvider {
     fn default() -> Self {
         Self::new()

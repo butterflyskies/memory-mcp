@@ -910,3 +910,329 @@ impl MemoryRepo {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthProvider;
+    use crate::types::{Memory, MemoryMetadata, PullResult, Scope};
+    use std::sync::Arc;
+
+    fn test_auth() -> AuthProvider {
+        AuthProvider::with_token("test-token-unused-for-file-remotes")
+    }
+
+    fn make_memory(name: &str, content: &str, updated_at_secs: i64) -> Memory {
+        let meta = MemoryMetadata {
+            tags: vec![],
+            scope: Scope::Global,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            updated_at: chrono::DateTime::from_timestamp(updated_at_secs, 0).unwrap(),
+            source: None,
+        };
+        Memory::new(name.to_string(), content.to_string(), meta)
+    }
+
+    fn setup_bare_remote() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        git2::Repository::init_bare(dir.path()).expect("failed to init bare repo");
+        let url = format!("file://{}", dir.path().display());
+        (dir, url)
+    }
+
+    fn open_repo(
+        dir: &tempfile::TempDir,
+        remote_url: Option<&str>,
+    ) -> Arc<MemoryRepo> {
+        Arc::new(
+            MemoryRepo::init_or_open(dir.path(), remote_url)
+                .expect("failed to init repo"),
+        )
+    }
+
+    // -- redact_url tests --------------------------------------------------
+
+    #[test]
+    fn redact_url_strips_userinfo() {
+        assert_eq!(
+            redact_url("https://user:ghp_token123@github.com/org/repo.git"),
+            "https://[REDACTED]@github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn redact_url_no_at_passthrough() {
+        let url = "https://github.com/org/repo.git";
+        assert_eq!(redact_url(url), url);
+    }
+
+    #[test]
+    fn redact_url_file_protocol_passthrough() {
+        let url = "file:///tmp/bare.git";
+        assert_eq!(redact_url(url), url);
+    }
+
+    // -- assert_within_root tests ------------------------------------------
+
+    #[test]
+    fn assert_within_root_accepts_valid_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = MemoryRepo::init_or_open(dir.path(), None).unwrap();
+        let valid = dir.path().join("global").join("my-memory.md");
+        // Create the parent so canonicalization works.
+        std::fs::create_dir_all(valid.parent().unwrap()).unwrap();
+        assert!(repo.assert_within_root(&valid).is_ok());
+    }
+
+    #[test]
+    fn assert_within_root_rejects_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = MemoryRepo::init_or_open(dir.path(), None).unwrap();
+        // Build a path that escapes the repo root. We need enough ".." to go
+        // above the tmpdir, then descend into /tmp/evil.
+        let _evil = dir.path().join("..").join("..").join("..").join("tmp").join("evil.md");
+        // Only assert if the path actually resolves outside root.
+        // (If the temp dir is at root level, this might not escape — use an
+        // explicit absolute path instead.)
+        let outside = std::path::PathBuf::from("/tmp/definitely-outside");
+        assert!(repo.assert_within_root(&outside).is_err());
+    }
+
+    // -- local-only mode tests (no origin) ---------------------------------
+
+    #[tokio::test]
+    async fn push_local_only_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir, None);
+        let auth = test_auth();
+        // No origin configured — push should silently succeed.
+        let result = repo.push(&auth, "main").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pull_local_only_returns_no_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir, None);
+        let auth = test_auth();
+        let result = repo.pull(&auth, "main").await.unwrap();
+        assert!(matches!(result, PullResult::NoRemote));
+    }
+
+    // -- push/pull with local bare remote ----------------------------------
+
+    #[tokio::test]
+    async fn push_to_bare_remote() {
+        let (_remote_dir, remote_url) = setup_bare_remote();
+        let local_dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&local_dir, Some(&remote_url));
+        let auth = test_auth();
+
+        // Save a memory so there's something to push.
+        let mem = make_memory("test-push", "push content", 1_700_000_000);
+        repo.save_memory(&mem).await.unwrap();
+
+        // Push should succeed.
+        repo.push(&auth, "main").await.unwrap();
+
+        // Verify the bare repo received the commit.
+        let bare = git2::Repository::open_bare(_remote_dir.path()).unwrap();
+        let head = bare.find_reference("refs/heads/main").unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        assert!(commit.message().unwrap().contains("test-push"));
+    }
+
+    #[tokio::test]
+    async fn pull_from_empty_bare_remote_returns_up_to_date() {
+        let (_remote_dir, remote_url) = setup_bare_remote();
+        let local_dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&local_dir, Some(&remote_url));
+        let auth = test_auth();
+
+        // First save something locally so we have an initial commit (HEAD exists).
+        let mem = make_memory("seed", "seed content", 1_700_000_000);
+        repo.save_memory(&mem).await.unwrap();
+
+        // Pull from empty remote — should be up-to-date (not an error).
+        let result = repo.pull(&auth, "main").await.unwrap();
+        assert!(matches!(result, PullResult::UpToDate));
+    }
+
+    #[tokio::test]
+    async fn pull_fast_forward() {
+        let (_remote_dir, remote_url) = setup_bare_remote();
+        let auth = test_auth();
+
+        // Repo A: save and push
+        let dir_a = tempfile::tempdir().unwrap();
+        let repo_a = open_repo(&dir_a, Some(&remote_url));
+        let mem = make_memory("from-a", "content from A", 1_700_000_000);
+        repo_a.save_memory(&mem).await.unwrap();
+        repo_a.push(&auth, "main").await.unwrap();
+
+        // Repo B: init with same remote, then pull
+        let dir_b = tempfile::tempdir().unwrap();
+        let repo_b = open_repo(&dir_b, Some(&remote_url));
+        // Repo B needs an initial commit for HEAD to exist.
+        let seed = make_memory("seed-b", "seed", 1_700_000_000);
+        repo_b.save_memory(&seed).await.unwrap();
+
+        let result = repo_b.pull(&auth, "main").await.unwrap();
+        assert!(
+            matches!(result, PullResult::FastForward | PullResult::Merged { .. }),
+            "expected fast-forward or merge, got {:?}",
+            result
+        );
+
+        // Verify the memory file from A exists in B's working directory.
+        let file = dir_b.path().join("global").join("from-a.md");
+        assert!(file.exists(), "from-a.md should exist in repo B after pull");
+    }
+
+    #[tokio::test]
+    async fn pull_up_to_date_after_push() {
+        let (_remote_dir, remote_url) = setup_bare_remote();
+        let local_dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&local_dir, Some(&remote_url));
+        let auth = test_auth();
+
+        let mem = make_memory("synced", "synced content", 1_700_000_000);
+        repo.save_memory(&mem).await.unwrap();
+        repo.push(&auth, "main").await.unwrap();
+
+        // Pull immediately after push — should be up to date.
+        let result = repo.pull(&auth, "main").await.unwrap();
+        assert!(matches!(result, PullResult::UpToDate));
+    }
+
+    // -- conflict resolution tests -----------------------------------------
+
+    #[tokio::test]
+    async fn pull_merge_conflict_theirs_newer_wins() {
+        let (_remote_dir, remote_url) = setup_bare_remote();
+        let auth = test_auth();
+
+        // Repo A: save "shared" with T1, push
+        let dir_a = tempfile::tempdir().unwrap();
+        let repo_a = open_repo(&dir_a, Some(&remote_url));
+        let mem_a1 = make_memory("shared", "version from A initial", 1_700_000_100);
+        repo_a.save_memory(&mem_a1).await.unwrap();
+        repo_a.push(&auth, "main").await.unwrap();
+
+        // Repo B: pull to get A's commit, then modify "shared" with T3 (newer), push
+        let dir_b = tempfile::tempdir().unwrap();
+        let repo_b = open_repo(&dir_b, Some(&remote_url));
+        let seed = make_memory("seed-b", "seed", 1_700_000_000);
+        repo_b.save_memory(&seed).await.unwrap();
+        repo_b.pull(&auth, "main").await.unwrap();
+
+        let mem_b = make_memory("shared", "version from B (newer)", 1_700_000_300);
+        repo_b.save_memory(&mem_b).await.unwrap();
+        repo_b.push(&auth, "main").await.unwrap();
+
+        // Repo A: modify "shared" with T2 (older than T3), then pull — conflict
+        let mem_a2 = make_memory("shared", "version from A (older)", 1_700_000_200);
+        repo_a.save_memory(&mem_a2).await.unwrap();
+        let result = repo_a.pull(&auth, "main").await.unwrap();
+
+        assert!(
+            matches!(result, PullResult::Merged { conflicts_resolved } if conflicts_resolved >= 1),
+            "expected merge with conflicts resolved, got {:?}",
+            result
+        );
+
+        // Verify theirs (B's version, T3=300) won.
+        let file = dir_a.path().join("global").join("shared.md");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            content.contains("version from B (newer)"),
+            "expected B's version to win (newer timestamp), got: {}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_merge_conflict_ours_newer_wins() {
+        let (_remote_dir, remote_url) = setup_bare_remote();
+        let auth = test_auth();
+
+        // Repo A: save "shared" with T1, push
+        let dir_a = tempfile::tempdir().unwrap();
+        let repo_a = open_repo(&dir_a, Some(&remote_url));
+        let mem_a1 = make_memory("shared", "version from A initial", 1_700_000_100);
+        repo_a.save_memory(&mem_a1).await.unwrap();
+        repo_a.push(&auth, "main").await.unwrap();
+
+        // Repo B: pull, modify with T2 (older), push
+        let dir_b = tempfile::tempdir().unwrap();
+        let repo_b = open_repo(&dir_b, Some(&remote_url));
+        let seed = make_memory("seed-b", "seed", 1_700_000_000);
+        repo_b.save_memory(&seed).await.unwrap();
+        repo_b.pull(&auth, "main").await.unwrap();
+
+        let mem_b = make_memory("shared", "version from B (older)", 1_700_000_200);
+        repo_b.save_memory(&mem_b).await.unwrap();
+        repo_b.push(&auth, "main").await.unwrap();
+
+        // Repo A: modify with T3 (newer), pull — conflict
+        let mem_a2 = make_memory("shared", "version from A (newer)", 1_700_000_300);
+        repo_a.save_memory(&mem_a2).await.unwrap();
+        let result = repo_a.pull(&auth, "main").await.unwrap();
+
+        assert!(
+            matches!(result, PullResult::Merged { conflicts_resolved } if conflicts_resolved >= 1),
+            "expected merge with conflicts resolved, got {:?}",
+            result
+        );
+
+        // Verify ours (A's version, T3=300) won.
+        let file = dir_a.path().join("global").join("shared.md");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            content.contains("version from A (newer)"),
+            "expected A's version to win (newer timestamp), got: {}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_merge_no_conflict_different_files() {
+        let (_remote_dir, remote_url) = setup_bare_remote();
+        let auth = test_auth();
+
+        // Repo A: save "mem-a", push
+        let dir_a = tempfile::tempdir().unwrap();
+        let repo_a = open_repo(&dir_a, Some(&remote_url));
+        let mem_a = make_memory("mem-a", "from A", 1_700_000_100);
+        repo_a.save_memory(&mem_a).await.unwrap();
+        repo_a.push(&auth, "main").await.unwrap();
+
+        // Repo B: pull, save "mem-b", push
+        let dir_b = tempfile::tempdir().unwrap();
+        let repo_b = open_repo(&dir_b, Some(&remote_url));
+        let seed = make_memory("seed-b", "seed", 1_700_000_000);
+        repo_b.save_memory(&seed).await.unwrap();
+        repo_b.pull(&auth, "main").await.unwrap();
+        let mem_b = make_memory("mem-b", "from B", 1_700_000_200);
+        repo_b.save_memory(&mem_b).await.unwrap();
+        repo_b.push(&auth, "main").await.unwrap();
+
+        // Repo A: save "mem-a2" (different file), pull — should merge cleanly
+        let mem_a2 = make_memory("mem-a2", "also from A", 1_700_000_300);
+        repo_a.save_memory(&mem_a2).await.unwrap();
+        let result = repo_a.pull(&auth, "main").await.unwrap();
+
+        assert!(
+            matches!(result, PullResult::Merged { conflicts_resolved: 0 }),
+            "expected clean merge, got {:?}",
+            result
+        );
+
+        // Both repos should have all files.
+        assert!(dir_a.path().join("global").join("mem-b.md").exists());
+    }
+}

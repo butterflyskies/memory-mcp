@@ -672,4 +672,49 @@ mod tests {
         assert_eq!(scope, Scope::Project("my-project".to_string()));
         assert_eq!(name, "nested/memory");
     }
+
+    // validate_branch_name tests
+
+    #[test]
+    fn validate_branch_name_accepts_valid() {
+        assert!(validate_branch_name("main").is_ok());
+        assert!(validate_branch_name("feature/foo").is_ok());
+        assert!(validate_branch_name("release-1.0").is_ok());
+        assert!(validate_branch_name("a/b/c").is_ok());
+        assert!(validate_branch_name("my-branch_v2").is_ok());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_empty() {
+        assert!(validate_branch_name("").is_err());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_dot_dot() {
+        assert!(validate_branch_name("foo..bar").is_err());
+        assert!(validate_branch_name("..").is_err());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_invalid_chars() {
+        for name in &[
+            "foo bar", "foo~bar", "foo^bar", "foo:bar", "foo?bar", "foo*bar", "foo[bar",
+            "foo\\bar",
+        ] {
+            assert!(validate_branch_name(name).is_err(), "should reject: {}", name);
+        }
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_invalid_start_end() {
+        assert!(validate_branch_name("/foo").is_err());
+        assert!(validate_branch_name("foo/").is_err());
+        assert!(validate_branch_name(".foo").is_err());
+        assert!(validate_branch_name("foo.").is_err());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_consecutive_slashes() {
+        assert!(validate_branch_name("foo//bar").is_err());
+    }
 }
