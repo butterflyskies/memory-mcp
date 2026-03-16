@@ -437,9 +437,25 @@ impl MemoryRepo {
                     // Empty remote — nothing to merge.
                     return Ok(PullResult::UpToDate);
                 }
+                Err(e)
+                    if e.class() == git2::ErrorClass::Reference
+                        && e.message().contains("corrupted") =>
+                {
+                    // Empty/corrupted FETCH_HEAD (e.g. remote has no commits yet).
+                    info!("pull: FETCH_HEAD is empty or corrupted — treating as empty remote");
+                    return Ok(PullResult::UpToDate);
+                }
                 Err(e) => return Err(MemoryError::Git(e)),
             };
-            let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
+            let fetch_commit = match repo.reference_to_annotated_commit(&fetch_head) {
+                Ok(c) => c,
+                Err(e) if e.class() == git2::ErrorClass::Reference => {
+                    // FETCH_HEAD exists but can't be resolved (empty remote).
+                    info!("pull: FETCH_HEAD not resolvable — treating as empty remote");
+                    return Ok(PullResult::UpToDate);
+                }
+                Err(e) => return Err(MemoryError::Git(e)),
+            };
 
             // ---- 4. Merge analysis ----------------------------------------------
             let (analysis, _preference) = repo.merge_analysis(&[&fetch_commit])?;
