@@ -2,20 +2,27 @@
 
 ## Phase 1: Core + Semantic from the start
 
-- [ ] Scaffold Rust MCP server with stdio transport
-- [ ] Define memory file format (markdown + YAML frontmatter for tags, timestamps, source)
-- [ ] Implement memory repo management (init, open existing, commit)
-- [ ] Choose local embedding model (e.g. fastembed-rs / ort with a small model)
-- [ ] Build embedding index alongside storage from the start
-- [ ] Implement `remember` — write file, commit, embed, index
-- [ ] Implement `recall` — semantic search by default, with optional tag/scope filters
-- [ ] Implement `forget` — delete file, commit, remove from index
-- [ ] Implement `list` — for parity with Serena's list_memories (browsing, not primary retrieval)
-- [ ] Implement `read` — read a specific memory by name (parity with Serena's read_memory)
+- [x] Scaffold Rust MCP server with streamable HTTP transport (PR #1)
+- [x] Define memory file format (markdown + YAML frontmatter for tags, timestamps, source)
+- [x] Implement memory repo management (init, open existing, commit) — git2
+- [x] Choose local embedding model — fastembed (AllMiniLML6V2)
+- [x] Build HNSW vector index alongside storage — usearch with cosine metric
+- [x] Implement `remember` — embed, index (atomic via `add_with_next_key`), commit to git
+- [x] Implement `recall` — semantic search with scope filtering, limit clamping, over-fetch
+- [x] Implement `forget` — remove from index, delete file, commit
+- [x] Implement `edit` — partial updates, skip re-embed when only tags change
+- [x] Implement `list` — browse memories with optional scope filter
+- [x] Implement `read` — read specific memory by name with full metadata
+- [x] Implement `sync` — pull/push orchestration (stubs wired, auth flow pending)
+- [x] Structured observability — tracing spans with timing on all handlers (ADR-0006)
+- [x] Input validation — name validation, content size limits, nesting depth limits
+- [x] Error mapping — `From<MemoryError> for ErrorData` with appropriate MCP error codes
 
 ## Phase 2: Sync + Migration
 
-- [ ] Implement git sync (pull, push, conflict handling)
+- [ ] Implement real git push/pull with remote auth (currently stubbed with warnings)
+  - [ ] Wire `AuthProvider.credentials_callback()` into push/pull
+  - [ ] Handle merge conflicts (strategy TBD — last-write-wins vs manual)
 - [ ] Index rebuild on pull (incremental if possible)
 - [ ] Migration tool: import Serena global memories (preserve content + metadata)
 - [ ] Migration tool: import Serena project-scoped memories
@@ -28,7 +35,6 @@
 
 - [ ] Deduplication / update detection on `remember` (semantic similarity threshold)
 - [ ] Memory metadata enrichment (last-accessed, access count, confidence)
-- [ ] Scoped recall (global vs project-specific filtering)
 - [ ] Periodic background sync
 - [ ] CLI for manual memory management outside of agent sessions
-- [ ] `edit` tool — modify existing memory in place
+- [ ] Tag-based filtering in `recall` (currently semantic-only; tags are stored but not queried)
