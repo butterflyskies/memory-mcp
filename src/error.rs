@@ -28,6 +28,9 @@ pub enum MemoryError {
 
     #[error("task join error: {0}")]
     Join(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 impl From<MemoryError> for rmcp::model::ErrorData {

@@ -22,7 +22,7 @@ use embedding::EmbeddingEngine;
 use index::VectorIndex;
 use repo::MemoryRepo;
 use server::MemoryServer;
-use types::AppState;
+use types::{validate_branch_name, AppState};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -50,6 +50,15 @@ struct Cli {
     /// URL path at which the MCP service is mounted.
     #[arg(long, default_value = "/mcp", env = "MEMORY_MCP_PATH")]
     mcp_path: String,
+
+    /// Remote URL for the git origin. If set, the origin remote is created or
+    /// updated on startup. Omit to run in local-only mode (no push/pull).
+    #[arg(long, env = "MEMORY_MCP_REMOTE_URL")]
+    remote_url: Option<String>,
+
+    /// Branch name used for push/pull operations.
+    #[arg(long, default_value = "main", env = "MEMORY_MCP_BRANCH")]
+    branch: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -69,13 +78,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Validate branch name early to prevent ref injection.
+    validate_branch_name(&cli.branch).context("invalid --branch value")?;
+
     // Expand `~` in repo_path, failing loudly if HOME is not set and the
     // path requires it (i.e. the user did not provide --repo-path explicitly).
     let repo_path = expand_tilde(&cli.repo_path)?;
     info!("repo path: {}", repo_path.display());
 
     // Initialise subsystems.
-    let repo = MemoryRepo::init_or_open(&repo_path)
+    let repo = MemoryRepo::init_or_open(&repo_path, cli.remote_url.as_deref())
         .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 
     let embedding = EmbeddingEngine::new(&cli.embedding_model)
@@ -101,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         embedding,
         index,
         auth,
+        branch: cli.branch.clone(),
     });
 
     // Keep a reference for post-shutdown index persistence.

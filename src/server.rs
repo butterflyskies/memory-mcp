@@ -10,7 +10,7 @@ use tracing::{info, warn, Instrument};
 
 use crate::types::{
     parse_qualified_name, parse_scope, validate_name, AppState, EditArgs, ForgetArgs, ListArgs,
-    Memory, MemoryMetadata, ReadArgs, RecallArgs, RememberArgs, Scope, SyncArgs,
+    Memory, MemoryMetadata, PullResult, ReadArgs, RecallArgs, RememberArgs, Scope, SyncArgs,
 };
 
 /// MCP server implementation.
@@ -547,27 +547,54 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             let start = Instant::now();
+            let branch = &state.branch;
 
-            if pull_first {
+            // Track whether origin is configured at all so we can skip push
+            // for local-only deployments that have no remote.
+            let mut has_remote = true;
+
+            let pull_status = if pull_first {
+                let result = state
+                    .repo
+                    .pull(&state.auth, branch)
+                    .await
+                    .map_err(ErrorData::from)?;
+                match &result {
+                    PullResult::NoRemote => {
+                        has_remote = false;
+                        "no-remote".to_string()
+                    }
+                    PullResult::UpToDate => "up-to-date".to_string(),
+                    PullResult::FastForward => "fast-forward".to_string(),
+                    PullResult::Merged { conflicts_resolved } => {
+                        format!("merged ({} conflicts resolved)", conflicts_resolved)
+                    }
+                }
+            } else {
+                "skipped".to_string()
+            };
+
+            if has_remote {
                 state
                     .repo
-                    .pull(&state.auth)
+                    .push(&state.auth, branch)
                     .await
                     .map_err(ErrorData::from)?;
             }
 
-            state
-                .repo
-                .push(&state.auth)
-                .await
-                .map_err(ErrorData::from)?;
-
             info!(
                 ms = start.elapsed().as_millis(),
-                pull_first, "sync complete"
+                pull_first,
+                pull_status = %pull_status,
+                "sync complete"
             );
 
-            Ok("sync complete".to_string())
+            Ok(serde_json::json!({
+                "status": "sync complete",
+                "pull": pull_status,
+                "branch": branch,
+            })
+            .to_string())
         }
         .instrument(span)
         .await
