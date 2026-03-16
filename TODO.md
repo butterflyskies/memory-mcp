@@ -20,11 +20,15 @@
 
 ## Phase 2: Sync + Migration
 
-- [ ] Implement real git push/pull with remote auth (currently stubbed with warnings)
-  - [ ] Wire `AuthProvider.credentials_callback()` into push/pull
-  - [ ] Handle merge conflicts (strategy TBD — last-write-wins vs manual)
+- [x] Implement real git push/pull with remote auth (PR #4)
+  - [x] Lazy token resolution — local-only mode works without credentials
+  - [x] Recency-based conflict resolution (ADR-0007)
+  - [x] Configurable branch name (ADR-0009)
+  - [x] Path-traversal and symlink protection in conflict resolution
+  - [x] Integration tests (20 new, all offline with local bare remotes)
+- [ ] Keyring-based token storage via `keyring` crate (sync-secret-service for KWallet/GNOME Keyring)
 - [ ] Index rebuild on pull (incremental if possible)
-- [ ] Migration tool: import Serena global memories (preserve content + metadata)
+- [ ] Migration tool: import Serena global memories (preserve content + metadata) (ADR-0008)
 - [ ] Migration tool: import Serena project-scoped memories
 - [ ] Migration tool: import Claude Code auto-memories
 - [ ] Configure as MCP server in `~/.claude.json`
