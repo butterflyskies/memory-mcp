@@ -22,7 +22,15 @@ pub fn validate_name(name: &str) -> Result<(), MemoryError> {
         });
     }
 
-    for component in name.split('/') {
+    let components: Vec<&str> = name.split('/').collect();
+
+    if components.len() > 3 {
+        return Err(MemoryError::InvalidInput {
+            reason: format!("name '{}' exceeds maximum nesting depth of 3", name),
+        });
+    }
+
+    for component in &components {
         if component.is_empty() {
             return Err(MemoryError::InvalidInput {
                 reason: format!("name '{}' contains an empty path component", name),
@@ -100,6 +108,11 @@ impl FromStr for Scope {
             if name.is_empty() {
                 return Err(MemoryError::InvalidInput {
                     reason: "project scope requires a non-empty name after 'project:'".to_string(),
+                });
+            }
+            if name.contains('/') {
+                return Err(MemoryError::InvalidInput {
+                    reason: "project name must not contain '/'".to_string(),
                 });
             }
             validate_name(name)?;
@@ -250,6 +263,57 @@ impl Memory {
             },
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Parse an optional scope string. `None` defaults to `Scope::Global`.
+pub fn parse_scope(scope: Option<&str>) -> Result<Scope, MemoryError> {
+    match scope {
+        None => Ok(Scope::Global),
+        Some(s) => s.parse::<Scope>(),
+    }
+}
+
+/// Parse a qualified name of the form `"global/<name>"` or
+/// `"projects/<project>/<name>"` back into a `(Scope, name)` pair.
+pub fn parse_qualified_name(qualified: &str) -> Result<(Scope, String), MemoryError> {
+    if let Some(rest) = qualified.strip_prefix("global/") {
+        validate_name(rest)?;
+        return Ok((Scope::Global, rest.to_string()));
+    }
+    if let Some(rest) = qualified.strip_prefix("projects/") {
+        // rest = "<project>/<memory_name>" (possibly nested)
+        if let Some(slash_pos) = rest.find('/') {
+            let project = &rest[..slash_pos];
+            let name = &rest[slash_pos + 1..];
+            if project.is_empty() || name.is_empty() {
+                return Err(MemoryError::InvalidInput {
+                    reason: format!(
+                        "malformed qualified name '{}': project or memory name is empty",
+                        qualified
+                    ),
+                });
+            }
+            validate_name(project)?;
+            validate_name(name)?;
+            return Ok((Scope::Project(project.to_string()), name.to_string()));
+        }
+        return Err(MemoryError::InvalidInput {
+            reason: format!(
+                "malformed qualified name '{}': missing memory name after project",
+                qualified
+            ),
+        });
+    }
+    Err(MemoryError::InvalidInput {
+        reason: format!(
+            "malformed qualified name '{}': must start with 'global/' or 'projects/'",
+            qualified
+        ),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -505,5 +569,48 @@ mod tests {
     fn validate_name_rejects_empty_component() {
         assert!(validate_name("foo//bar").is_err());
         assert!(validate_name("/absolute").is_err());
+    }
+
+    // parse_scope tests
+
+    #[test]
+    fn test_parse_scope_none_defaults_global() {
+        assert_eq!(parse_scope(None).unwrap(), Scope::Global);
+    }
+
+    #[test]
+    fn test_parse_scope_some_global() {
+        assert_eq!(parse_scope(Some("global")).unwrap(), Scope::Global);
+    }
+
+    #[test]
+    fn test_parse_scope_some_project() {
+        assert_eq!(
+            parse_scope(Some("project:my-proj")).unwrap(),
+            Scope::Project("my-proj".to_string())
+        );
+    }
+
+    // parse_qualified_name tests
+
+    #[test]
+    fn test_parse_qualified_name_global() {
+        let (scope, name) = parse_qualified_name("global/my-memory").unwrap();
+        assert_eq!(scope, Scope::Global);
+        assert_eq!(name, "my-memory");
+    }
+
+    #[test]
+    fn test_parse_qualified_name_project() {
+        let (scope, name) = parse_qualified_name("projects/my-project/my-memory").unwrap();
+        assert_eq!(scope, Scope::Project("my-project".to_string()));
+        assert_eq!(name, "my-memory");
+    }
+
+    #[test]
+    fn test_parse_qualified_name_nested() {
+        let (scope, name) = parse_qualified_name("projects/my-project/nested/memory").unwrap();
+        assert_eq!(scope, Scope::Project("my-project".to_string()));
+        assert_eq!(name, "nested/memory");
     }
 }

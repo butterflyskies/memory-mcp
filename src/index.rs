@@ -13,6 +13,10 @@ struct VectorState {
     index: Index,
     /// Maps usearch u64 keys → memory name strings.
     key_map: HashMap<u64, String>,
+    /// Reverse map: memory name strings → usearch u64 keys (derived from key_map).
+    name_map: HashMap<String, u64>,
+    /// Monotonic counter used to assign unique vector keys.
+    next_key: u64,
 }
 
 /// Wraps `usearch::Index` and a key-map behind a single `std::sync::Mutex`.
@@ -45,6 +49,8 @@ impl VectorIndex {
             state: Mutex::new(VectorState {
                 index,
                 key_map: HashMap::new(),
+                name_map: HashMap::new(),
+                next_key: 0,
             }),
         })
     }
@@ -67,6 +73,7 @@ impl VectorIndex {
     }
 
     /// Ensure the index has capacity for at least `additional` more vectors.
+    #[allow(dead_code)]
     pub fn grow_if_needed(&self, additional: usize) -> Result<(), MemoryError> {
         let state = self
             .state
@@ -75,7 +82,29 @@ impl VectorIndex {
         Self::grow_if_needed_inner(&state, additional)
     }
 
+    /// Atomically increment and return the next unique vector key.
+    #[allow(dead_code)]
+    pub fn next_key(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        let key = state.next_key;
+        state.next_key += 1;
+        key
+    }
+
+    /// Find the vector key associated with a qualified memory name.
+    pub fn find_key_by_name(&self, name: &str) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        state.name_map.get(name).copied()
+    }
+
     /// Add a vector under the given key, growing the index if necessary.
+    #[allow(dead_code)]
     pub fn add(&self, key: u64, vector: &[f32], name: String) -> Result<(), MemoryError> {
         let mut state = self
             .state
@@ -86,8 +115,31 @@ impl VectorIndex {
             .index
             .add(key, vector)
             .map_err(|e| MemoryError::Index(format!("add: {}", e)))?;
+        state.name_map.insert(name.clone(), key);
         state.key_map.insert(key, name);
         Ok(())
+    }
+
+    /// Atomically allocate the next key and add the vector in one lock acquisition.
+    /// Returns the assigned key on success. On failure the counter is not advanced.
+    pub fn add_with_next_key(&self, vector: &[f32], name: String) -> Result<u64, MemoryError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        Self::grow_if_needed_inner(&state, 1)?;
+        let key = state.next_key;
+        state
+            .index
+            .add(key, vector)
+            .map_err(|e| MemoryError::Index(format!("add: {}", e)))?;
+        state.name_map.insert(name.clone(), key);
+        state.key_map.insert(key, name);
+        state.next_key = state
+            .next_key
+            .checked_add(1)
+            .expect("vector key space exhausted");
+        Ok(key)
     }
 
     /// Search for the `limit` nearest neighbours of `query`.
@@ -131,7 +183,9 @@ impl VectorIndex {
             .index
             .remove(key)
             .map_err(|e| MemoryError::Index(format!("remove: {}", e)))?;
-        state.key_map.remove(&key);
+        if let Some(name) = state.key_map.remove(&key) {
+            state.name_map.remove(&name);
+        }
         Ok(())
     }
 
@@ -150,9 +204,13 @@ impl VectorIndex {
             .save(path_str)
             .map_err(|e| MemoryError::Index(format!("save: {}", e)))?;
 
-        // Persist the key map alongside the index.
+        // Persist the key map and counter alongside the index.
         let keys_path = format!("{}.keys.json", path_str);
-        let json = serde_json::to_string(&state.key_map)
+        let payload = serde_json::json!({
+            "key_map": &state.key_map,
+            "next_key": state.next_key,
+        });
+        let json = serde_json::to_string(&payload)
             .map_err(|e| MemoryError::Index(format!("keymap serialise: {}", e)))?;
         std::fs::write(&keys_path, json)?;
 
@@ -180,18 +238,46 @@ impl VectorIndex {
             .load(path_str)
             .map_err(|e| MemoryError::Index(format!("load: {}", e)))?;
 
-        // Load the key map.
+        // Load the key map and counter.
         let keys_path = format!("{}.keys.json", path_str);
-        let key_map: HashMap<u64, String> = if std::path::Path::new(&keys_path).exists() {
-            let json = std::fs::read_to_string(&keys_path)?;
-            serde_json::from_str(&json)
-                .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?
-        } else {
-            HashMap::new()
-        };
+        let (key_map, next_key): (HashMap<u64, String>, u64) =
+            if std::path::Path::new(&keys_path).exists() {
+                let json = std::fs::read_to_string(&keys_path)?;
+                // Support both old format (bare HashMap) and new format ({key_map, next_key}).
+                let value: serde_json::Value = serde_json::from_str(&json)
+                    .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
+                if value.is_object() && value.get("key_map").is_some() {
+                    let km: HashMap<u64, String> = serde_json::from_value(value["key_map"].clone())
+                        .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
+                    let nk: u64 = value["next_key"]
+                        .as_u64()
+                        .unwrap_or_else(|| km.keys().max().map(|k| k + 1).unwrap_or(0));
+                    (km, nk)
+                } else {
+                    // Legacy format: bare HashMap.
+                    let km: HashMap<u64, String> = serde_json::from_value(value)
+                        .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
+                    let nk = km.keys().max().map(|k| k + 1).unwrap_or(0);
+                    (km, nk)
+                }
+            } else {
+                (HashMap::new(), 0)
+            };
+
+        let name_map: HashMap<String, u64> = key_map.iter().map(|(&k, v)| (v.clone(), k)).collect();
+        debug_assert_eq!(
+            key_map.len(),
+            name_map.len(),
+            "key_map and name_map size mismatch — duplicate names in key_map"
+        );
 
         Ok(Self {
-            state: Mutex::new(VectorState { index, key_map }),
+            state: Mutex::new(VectorState {
+                index,
+                key_map,
+                name_map,
+                next_key,
+            }),
         })
     }
 }

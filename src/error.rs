@@ -29,3 +29,19 @@ pub enum MemoryError {
     #[error("task join error: {0}")]
     Join(String),
 }
+
+impl From<MemoryError> for rmcp::model::ErrorData {
+    fn from(err: MemoryError) -> Self {
+        let code = match &err {
+            MemoryError::NotFound { .. } | MemoryError::InvalidInput { .. } => {
+                rmcp::model::ErrorCode::INVALID_PARAMS
+            }
+            _ => rmcp::model::ErrorCode::INTERNAL_ERROR,
+        };
+        rmcp::model::ErrorData {
+            code,
+            message: std::borrow::Cow::Owned(err.to_string()),
+            data: None,
+        }
+    }
+}

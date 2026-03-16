@@ -36,6 +36,7 @@ impl EmbeddingEngine {
     }
 
     /// Embed a batch of texts, returning one vector per input.
+    #[allow(dead_code)]
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
         let arc = Arc::clone(&self.inner);
         let texts = texts.to_vec();

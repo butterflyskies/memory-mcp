@@ -291,13 +291,13 @@ impl MemoryRepo {
     }
 
     /// Push to the configured remote. Stubbed — full implementation is future work.
-    pub async fn push(&self, _auth: &AuthProvider) -> Result<(), MemoryError> {
+    pub async fn push(self: &Arc<Self>, _auth: &AuthProvider) -> Result<(), MemoryError> {
         warn!("push: git remote sync not yet implemented");
         Ok(())
     }
 
     /// Pull from the configured remote. Stubbed — full implementation is future work.
-    pub async fn pull(&self, _auth: &AuthProvider) -> Result<(), MemoryError> {
+    pub async fn pull(self: &Arc<Self>, _auth: &AuthProvider) -> Result<(), MemoryError> {
         warn!("pull: git remote sync not yet implemented");
         Ok(())
     }

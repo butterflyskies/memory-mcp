@@ -1,7 +1,3 @@
-// Business-logic modules are scaffolded but not yet wired to the server.
-// All dead-code warnings are expected at this stage.
-#![allow(dead_code)]
-
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;

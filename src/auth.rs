@@ -28,11 +28,13 @@ impl<T> Secret<T> {
     }
 
     /// Expose the inner value. Call sites make the exposure explicit.
+    #[allow(dead_code)]
     pub fn expose(&self) -> &T {
         &self.0
     }
 
     /// Consume the wrapper and return the inner value.
+    #[allow(dead_code)]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -56,6 +58,7 @@ impl<T> fmt::Display for Secret<T> {
 
 pub struct AuthProvider {
     /// Cached token, if resolved at startup.
+    #[allow(dead_code)]
     token: Option<Secret<String>>,
 }
 
@@ -81,6 +84,7 @@ impl AuthProvider {
     /// 1. `MEMORY_MCP_GITHUB_TOKEN` env var
     /// 2. `~/.config/memory-mcp/token` file
     /// 3. OAuth device flow — returns `Err(Auth("not yet implemented"))`.
+    #[allow(dead_code)]
     pub fn resolve_token(&self) -> Result<Secret<String>, MemoryError> {
         // Return cached token if we already have one.
         if let Some(ref t) = self.token {
@@ -127,6 +131,7 @@ impl AuthProvider {
     /// Build `git2::RemoteCallbacks` that inject the stored token as a
     /// username-password credential (GitHub accepts the token as the password
     /// with any non-empty username).
+    #[allow(dead_code)]
     pub fn credentials_callback<'cb>(&self) -> Result<RemoteCallbacks<'cb>, MemoryError> {
         let token = self.resolve_token()?;
         let raw = token.into_inner();

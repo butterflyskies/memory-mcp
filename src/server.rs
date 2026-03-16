@@ -1,27 +1,30 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
+use chrono::Utc;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ErrorData, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, ServerHandler,
 };
+use tracing::{info, warn, Instrument};
 
 use crate::types::{
-    AppState, EditArgs, ForgetArgs, ListArgs, ReadArgs, RecallArgs, RememberArgs, SyncArgs,
+    parse_qualified_name, parse_scope, validate_name, AppState, EditArgs, ForgetArgs, ListArgs,
+    Memory, MemoryMetadata, ReadArgs, RecallArgs, RememberArgs, Scope, SyncArgs,
 };
 
 /// MCP server implementation.
 ///
-/// Each tool method is a stub that returns a "not yet implemented" string.
-/// Tool methods return `String` because `String` implements `IntoContents`
-/// and therefore `IntoCallToolResult`, which is what `#[tool_router]` requires.
-/// The full business logic will be wired in once the transport layer is
-/// validated end-to-end.
+/// Each tool method is an async handler that calls into the backing subsystems
+/// (git repo, embedding engine, HNSW index) and returns structured JSON.
 #[derive(Clone)]
 pub struct MemoryServer {
     state: Arc<AppState>,
     tool_router: ToolRouter<Self>,
 }
+
+/// Maximum allowed content size in bytes (1 MiB).
+const MAX_CONTENT_SIZE: usize = 1_048_576;
 
 #[tool_router]
 impl MemoryServer {
@@ -43,9 +46,82 @@ impl MemoryServer {
         description = "Store a new memory. Saves the content to the git-backed repository \
         and indexes it for semantic search. Returns the assigned memory ID."
     )]
-    fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
-        let _ = (&self.state, args);
-        "not yet implemented".to_string()
+    async fn remember(
+        &self,
+        Parameters(args): Parameters<RememberArgs>,
+    ) -> Result<String, ErrorData> {
+        validate_name(&args.name).map_err(ErrorData::from)?;
+        if args.content.len() > MAX_CONTENT_SIZE {
+            return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
+                reason: format!(
+                    "content size {} exceeds maximum of {} bytes",
+                    args.content.len(),
+                    MAX_CONTENT_SIZE
+                ),
+            }));
+        }
+        let span = tracing::info_span!(
+            "remember",
+            name = %args.name,
+            scope = ?args.scope,
+        );
+        let state = Arc::clone(&self.state);
+        async move {
+            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let metadata = MemoryMetadata::new(scope.clone(), args.tags, args.source);
+            let memory = Memory::new(args.name, args.content, metadata);
+
+            // Order: (1) embed, (2) add to index, (3) save to repo.
+            // If step 3 fails, index has a stale entry (harmless — recall will skip it).
+            // If step 1 or 2 fail, no repo commit happens.
+            let start = Instant::now();
+            let vector = state
+                .embedding
+                .embed_one(&memory.content)
+                .await
+                .map_err(ErrorData::from)?;
+            info!(embed_ms = start.elapsed().as_millis(), "embedded");
+
+            let qualified_name = format!("{}/{}", memory.metadata.scope.dir_prefix(), memory.name);
+
+            // Look up any existing key BEFORE adding — we remove it only after
+            // the new entry is successfully inserted, so a failure in
+            // add_with_next_key never leaves the memory orphaned.
+            let old_key = state.index.find_key_by_name(&qualified_name);
+
+            state
+                .index
+                .add_with_next_key(&vector, qualified_name)
+                .map_err(ErrorData::from)?;
+
+            // Now safe to remove the old entry (new one is already in the index).
+            if let Some(old_key) = old_key {
+                if let Err(e) = state.index.remove(old_key) {
+                    warn!(
+                        name = %memory.name,
+                        error = %e,
+                        "old vector removal failed during remember; continuing"
+                    );
+                }
+            }
+
+            let start = Instant::now();
+            state
+                .repo
+                .save_memory(&memory)
+                .await
+                .map_err(ErrorData::from)?;
+            info!(repo_ms = start.elapsed().as_millis(), "saved to repo");
+
+            Ok(serde_json::json!({
+                "id": memory.id,
+                "name": memory.name,
+                "scope": memory.metadata.scope.to_string(),
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Search memories by semantic similarity to a natural-language query.
@@ -59,9 +135,120 @@ impl MemoryServer {
         description = "Search memories by semantic similarity. Embeds the query and returns \
         the top matching memories as a JSON array with name, scope, tags, and content snippet."
     )]
-    fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
-        let _ = (&self.state, args);
-        "not yet implemented".to_string()
+    async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> Result<String, ErrorData> {
+        let span = tracing::info_span!(
+            "recall",
+            query = %args.query,
+            scope = ?args.scope,
+            limit = ?args.limit,
+        );
+        let state = Arc::clone(&self.state);
+        async move {
+            // Parse optional scope filter.
+            let scope_filter: Option<Scope> = args
+                .scope
+                .as_deref()
+                .map(|s| s.parse::<Scope>())
+                .transpose()
+                .map_err(ErrorData::from)?;
+
+            let limit = args.limit.unwrap_or(5).min(100);
+            // Over-fetch to compensate for scope filtering.
+            let fetch_limit = limit.saturating_mul(3);
+
+            let start = Instant::now();
+            let query_vector = state
+                .embedding
+                .embed_one(&args.query)
+                .await
+                .map_err(ErrorData::from)?;
+            info!(embed_ms = start.elapsed().as_millis(), "query embedded");
+
+            let start = Instant::now();
+            let results = state
+                .index
+                .search(&query_vector, fetch_limit)
+                .map_err(ErrorData::from)?;
+            info!(
+                search_ms = start.elapsed().as_millis(),
+                candidates = results.len(),
+                "index searched"
+            );
+
+            let pre_filter_count = results.len();
+            let mut results_vec = Vec::new();
+            let mut scope_filtered: usize = 0;
+            let mut skipped_errors: usize = 0;
+
+            for (_key, qualified_name, distance) in results {
+                if results_vec.len() >= limit {
+                    break;
+                }
+                let (scope, name) = match parse_qualified_name(&qualified_name) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!(
+                            qualified_name = %qualified_name,
+                            error = %e,
+                            "could not parse qualified name from index; skipping"
+                        );
+                        skipped_errors += 1;
+                        continue;
+                    }
+                };
+
+                // Apply scope filter if present.
+                if let Some(ref filter) = scope_filter {
+                    if &scope != filter {
+                        scope_filtered += 1;
+                        continue;
+                    }
+                }
+
+                // Read the memory; if it was deleted but still in the index, skip it.
+                let memory = match state.repo.read_memory(&name, &scope).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            name = %name,
+                            error = %e,
+                            "could not read memory from repo (deleted?); skipping"
+                        );
+                        skipped_errors += 1;
+                        continue;
+                    }
+                };
+
+                // Truncate content to 500 chars for the snippet.
+                let snippet: String = memory.content.chars().take(500).collect();
+
+                results_vec.push(serde_json::json!({
+                    "id": memory.id,
+                    "name": memory.name,
+                    "scope": memory.metadata.scope.to_string(),
+                    "tags": memory.metadata.tags,
+                    "content": snippet,
+                    "distance": distance,
+                }));
+            }
+
+            info!(
+                returned = results_vec.len(),
+                scope_filtered, skipped_errors, "recall complete"
+            );
+
+            Ok(serde_json::json!({
+                "results": results_vec,
+                "count": results_vec.len(),
+                "limit": limit,
+                "pre_filter_count": pre_filter_count,
+                "scope_filtered": scope_filtered,
+                "skipped_errors": skipped_errors,
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Delete a memory from the repository and vector index.
@@ -75,9 +262,56 @@ impl MemoryServer {
         description = "Delete a memory by name. Removes the file from git and the vector from \
         the search index. Returns 'ok' on success."
     )]
-    fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> String {
-        let _ = (&self.state, args);
-        "not yet implemented".to_string()
+    async fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> Result<String, ErrorData> {
+        validate_name(&args.name).map_err(ErrorData::from)?;
+        let span = tracing::info_span!(
+            "forget",
+            name = %args.name,
+            scope = ?args.scope,
+        );
+        let state = Arc::clone(&self.state);
+        async move {
+            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+
+            let start = Instant::now();
+
+            let qualified_name = format!("{}/{}", scope.dir_prefix(), args.name);
+
+            // Look up the vector key by name instead of deriving it from UUID.
+            match state.index.find_key_by_name(&qualified_name) {
+                Some(key) => {
+                    if let Err(e) = state.index.remove(key) {
+                        warn!(
+                            name = %args.name,
+                            error = %e,
+                            "vector removal failed during forget; continuing"
+                        );
+                    }
+                }
+                None => {
+                    warn!(
+                        name = %args.name,
+                        "vector key not found in index during forget; continuing"
+                    );
+                }
+            }
+
+            state
+                .repo
+                .delete_memory(&args.name, &scope)
+                .await
+                .map_err(ErrorData::from)?;
+
+            info!(
+                ms = start.elapsed().as_millis(),
+                name = %args.name,
+                "memory forgotten"
+            );
+
+            Ok("ok".to_string())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Update the content or tags of an existing memory.
@@ -93,9 +327,105 @@ impl MemoryServer {
         description = "Edit an existing memory. Supports partial updates — omit content or \
         tags to preserve existing values. Re-embeds and re-indexes the memory. Returns the memory ID."
     )]
-    fn edit(&self, Parameters(args): Parameters<EditArgs>) -> String {
-        let _ = (&self.state, args);
-        "not yet implemented".to_string()
+    async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> Result<String, ErrorData> {
+        validate_name(&args.name).map_err(ErrorData::from)?;
+        if let Some(ref content) = args.content {
+            if content.len() > MAX_CONTENT_SIZE {
+                return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
+                    reason: format!(
+                        "content size {} exceeds maximum of {} bytes",
+                        content.len(),
+                        MAX_CONTENT_SIZE
+                    ),
+                }));
+            }
+        }
+        let span = tracing::info_span!(
+            "edit",
+            name = %args.name,
+            scope = ?args.scope,
+        );
+        let state = Arc::clone(&self.state);
+        async move {
+            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+
+            let start = Instant::now();
+
+            // Track whether content changed so we can skip re-embedding when only tags changed.
+            let content_changed = args.content.is_some();
+
+            // Read the existing memory.
+            let mut memory = state
+                .repo
+                .read_memory(&args.name, &scope)
+                .await
+                .map_err(ErrorData::from)?;
+
+            // Apply partial updates.
+            if let Some(content) = args.content {
+                memory.content = content;
+            }
+            if let Some(tags) = args.tags {
+                memory.metadata.tags = tags;
+            }
+            memory.metadata.updated_at = Utc::now();
+
+            // Only re-embed and re-index when content changed.
+            // Order: (1) embed, (2) remove old + add new index entry, (3) save to repo.
+            if content_changed {
+                let qualified_name =
+                    format!("{}/{}", memory.metadata.scope.dir_prefix(), memory.name);
+
+                // Re-embed updated content.
+                let vector = state
+                    .embedding
+                    .embed_one(&memory.content)
+                    .await
+                    .map_err(ErrorData::from)?;
+
+                // Add new entry first, then remove old — so a failure in
+                // add_with_next_key never leaves the memory orphaned.
+                let old_key = state.index.find_key_by_name(&qualified_name);
+
+                state
+                    .index
+                    .add_with_next_key(&vector, qualified_name)
+                    .map_err(ErrorData::from)?;
+
+                if let Some(old_key) = old_key {
+                    if let Err(e) = state.index.remove(old_key) {
+                        warn!(
+                            name = %args.name,
+                            error = %e,
+                            "old vector key removal failed during edit; continuing"
+                        );
+                    }
+                }
+            }
+
+            // Persist to repo (last, so partial failures leave recoverable state).
+            state
+                .repo
+                .save_memory(&memory)
+                .await
+                .map_err(ErrorData::from)?;
+
+            info!(
+                ms = start.elapsed().as_millis(),
+                name = %args.name,
+                content_changed,
+                "memory edited"
+            );
+
+            Ok(serde_json::json!({
+                "id": memory.id,
+                "name": memory.name,
+                "scope": memory.metadata.scope.to_string(),
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
     }
 
     /// List stored memories, optionally filtered by scope.
@@ -107,9 +437,52 @@ impl MemoryServer {
         description = "List stored memories. Optionally filter by scope ('global' or \
         'project:<name>'). Returns a JSON array of memory summaries without full content."
     )]
-    fn list(&self, Parameters(args): Parameters<ListArgs>) -> String {
-        let _ = (&self.state, args);
-        "not yet implemented".to_string()
+    async fn list(&self, Parameters(args): Parameters<ListArgs>) -> Result<String, ErrorData> {
+        let span = tracing::info_span!("list", scope = ?args.scope);
+        let state = Arc::clone(&self.state);
+        async move {
+            // None means all scopes.
+            let scope_filter: Option<Scope> = args
+                .scope
+                .as_deref()
+                .map(|s| s.parse::<Scope>())
+                .transpose()
+                .map_err(ErrorData::from)?;
+
+            let start = Instant::now();
+            let memories = state
+                .repo
+                .list_memories(scope_filter.as_ref())
+                .await
+                .map_err(ErrorData::from)?;
+            info!(
+                ms = start.elapsed().as_millis(),
+                count = memories.len(),
+                "listed memories"
+            );
+
+            let summaries: Vec<serde_json::Value> = memories
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "name": m.name,
+                        "scope": m.metadata.scope.to_string(),
+                        "tags": m.metadata.tags,
+                        "created_at": m.metadata.created_at,
+                        "updated_at": m.metadata.updated_at,
+                    })
+                })
+                .collect();
+
+            Ok(serde_json::json!({
+                "memories": summaries,
+                "count": summaries.len(),
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Read the full content of a specific memory by name.
@@ -121,9 +494,39 @@ impl MemoryServer {
         description = "Read a specific memory by name. Returns the full markdown content and \
         metadata (id, scope, tags, timestamps) as a JSON object."
     )]
-    fn read(&self, Parameters(args): Parameters<ReadArgs>) -> String {
-        let _ = (&self.state, args);
-        "not yet implemented".to_string()
+    async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> Result<String, ErrorData> {
+        validate_name(&args.name).map_err(ErrorData::from)?;
+        let span = tracing::info_span!("read", name = %args.name, scope = ?args.scope);
+        let state = Arc::clone(&self.state);
+        async move {
+            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+
+            let start = Instant::now();
+            let memory = state
+                .repo
+                .read_memory(&args.name, &scope)
+                .await
+                .map_err(ErrorData::from)?;
+            info!(
+                ms = start.elapsed().as_millis(),
+                name = %args.name,
+                "read memory"
+            );
+
+            Ok(serde_json::json!({
+                "id": memory.id,
+                "name": memory.name,
+                "scope": memory.metadata.scope.to_string(),
+                "tags": memory.metadata.tags,
+                "content": memory.content,
+                "source": memory.metadata.source,
+                "created_at": memory.metadata.created_at,
+                "updated_at": memory.metadata.updated_at,
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Synchronise the memory repository with the configured git remote.
@@ -138,9 +541,36 @@ impl MemoryServer {
         description = "Sync the memory repo with the git remote (push/pull). Requires \
         MEMORY_MCP_GITHUB_TOKEN or a token file. Returns a status message."
     )]
-    fn sync(&self, Parameters(args): Parameters<SyncArgs>) -> String {
-        let _ = (&self.state, args);
-        "not yet implemented".to_string()
+    async fn sync(&self, Parameters(args): Parameters<SyncArgs>) -> Result<String, ErrorData> {
+        let pull_first = args.pull_first.unwrap_or(true);
+        let span = tracing::info_span!("sync", pull_first);
+        let state = Arc::clone(&self.state);
+        async move {
+            let start = Instant::now();
+
+            if pull_first {
+                state
+                    .repo
+                    .pull(&state.auth)
+                    .await
+                    .map_err(ErrorData::from)?;
+            }
+
+            state
+                .repo
+                .push(&state.auth)
+                .await
+                .map_err(ErrorData::from)?;
+
+            info!(
+                ms = start.elapsed().as_millis(),
+                pull_first, "sync complete"
+            );
+
+            Ok("sync complete".to_string())
+        }
+        .instrument(span)
+        .await
     }
 }
 
