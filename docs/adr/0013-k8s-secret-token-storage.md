@@ -13,7 +13,7 @@ Uses the `kube` crate to create/update an Opaque Secret with a single `token` ke
 The k8s store is write-only — token resolution uses the existing env var chain (pod
 mounts the Secret as an env var). This avoids pulling kube deps into the server's hot path.
 
-Namespace and secret name are configurable via `--k8s-namespace` (default: `butterfly`)
+Namespace and secret name are configurable via `--k8s-namespace` (default: `memory-mcp`)
 and `--k8s-secret-name` (default: `memory-mcp-github-token`). The data key `token` is
 hardcoded to prevent drift with the pod spec.
 

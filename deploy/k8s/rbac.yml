@@ -1,0 +1,58 @@
+# RBAC for memory-mcp.
+#
+# The runtime pod only needs to read the token Secret via the kubelet's
+# env-var injection (secretKeyRef), which requires NO RBAC at all — the
+# kubelet reads the Secret on the pod's behalf. The ServiceAccount therefore
+# has no secret permissions at runtime.
+#
+# To bootstrap the token Secret, run "auth login --store k8s-secret" as a
+# one-off Job using the memory-mcp-bootstrap ServiceAccount (which has
+# create/update on the token Secret). See secret.yml for details.
+#
+# If you manage the Secret out-of-band (e.g. via Sealed Secrets or External
+# Secrets Operator), you can remove the bootstrap ServiceAccount entirely.
+---
+# Runtime ServiceAccount — no secret permissions needed.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: memory-mcp
+  namespace: memory-mcp
+---
+# Bootstrap ServiceAccount — used only for the one-off "auth login" Job.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: memory-mcp-bootstrap
+  namespace: memory-mcp
+---
+# Bootstrap Role — scoped to the single token Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: memory-mcp-bootstrap
+  namespace: memory-mcp
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["memory-mcp-github-token"]
+    verbs: ["get", "update"]
+  # create requires a separate rule because Kubernetes ignores
+  # resourceNames for the create verb (the resource doesn't exist yet).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: memory-mcp-bootstrap
+  namespace: memory-mcp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: memory-mcp-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: memory-mcp-bootstrap
+    namespace: memory-mcp

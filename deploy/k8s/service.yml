@@ -1,0 +1,21 @@
+# ClusterIP Service for memory-mcp.
+#
+# Exposes port 8080 within the cluster. To make the server reachable from
+# outside the cluster, add an Ingress or a Gateway API HTTPRoute in front
+# of this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-mcp
+  namespace: memory-mcp
+  labels:
+    app: memory-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: memory-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

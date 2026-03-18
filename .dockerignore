@@ -1,0 +1,8 @@
+target/
+.git/
+.serena/
+.github/
+docs/
+deploy/
+*.md
+!README.md

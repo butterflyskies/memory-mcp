@@ -25,6 +25,12 @@ use server::MemoryServer;
 use types::{validate_branch_name, AppState};
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const DEFAULT_EMBEDDING_MODEL: &str = "BGESmallENV15";
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -44,6 +50,8 @@ enum Command {
     Serve(ServeArgs),
     /// Manage authentication
     Auth(AuthCommand),
+    /// Pre-warm the embedding model cache (useful as a k8s init container)
+    Warmup(WarmupArgs),
 }
 
 #[derive(Args)]
@@ -67,7 +75,7 @@ struct LoginArgs {
     store: Option<StoreBackend>,
 
     #[cfg(feature = "k8s")]
-    #[arg(long, default_value = "butterfly")]
+    #[arg(long, default_value = "memory-mcp")]
     /// Kubernetes namespace for the token Secret.
     k8s_namespace: String,
 
@@ -90,7 +98,7 @@ struct ServeArgs {
     /// Embedding model name. Defaults to BGESmallENV15.
     #[arg(
         long,
-        default_value = "BGESmallENV15",
+        default_value = DEFAULT_EMBEDDING_MODEL,
         env = "MEMORY_MCP_EMBEDDING_MODEL"
     )]
     embedding_model: String,
@@ -107,6 +115,17 @@ struct ServeArgs {
     /// Branch name used for push/pull operations.
     #[arg(long, default_value = "main", env = "MEMORY_MCP_BRANCH")]
     branch: String,
+}
+
+#[derive(Args)]
+struct WarmupArgs {
+    /// Embedding model name to pre-warm.
+    #[arg(
+        long,
+        default_value = DEFAULT_EMBEDDING_MODEL,
+        env = "MEMORY_MCP_EMBEDDING_MODEL"
+    )]
+    embedding_model: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Command::Serve(args)) => run_serve(args).await?,
+        Some(Command::Warmup(args)) => run_warmup(args).await?,
         Some(Command::Auth(auth_cmd)) => match auth_cmd.action {
             AuthAction::Login(login_args) => {
                 #[cfg(feature = "k8s")]
@@ -191,8 +211,11 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let repo_path = expand_tilde(&args.repo_path)?;
     info!("repo path: {}", repo_path.display());
 
+    // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
+    let remote_url = args.remote_url.filter(|u| !u.is_empty());
+
     // Initialise subsystems.
-    let repo = MemoryRepo::init_or_open(&repo_path, args.remote_url.as_deref())
+    let repo = MemoryRepo::init_or_open(&repo_path, remote_url.as_deref())
         .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 
     let embedding = EmbeddingEngine::new(&args.embedding_model)
@@ -238,7 +261,18 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     );
 
     let mcp_path = args.mcp_path.clone();
-    let router = axum::Router::new().nest_service(&mcp_path, service);
+    let router = axum::Router::new()
+        .route(
+            // Static liveness check. Always returns 200 OK once the process is
+            // running. NOTE: a /readyz endpoint performing subsystem health checks
+            // (repo accessible, index loaded, embedding model ready) should be
+            // added when multi-replica deployments are supported.
+            "/healthz",
+            axum::routing::get(|| async {
+                axum::response::Json(serde_json::json!({"status": "ok"}))
+            }),
+        )
+        .nest_service(&mcp_path, service);
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
         .await
@@ -268,6 +302,22 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         info!("vector index saved to {}", index_path.display());
     }
 
+    Ok(())
+}
+
+/// Load the embedding model and run a single dummy embed to warm the on-disk
+/// model cache, then exit. Intended for use as a Kubernetes init container.
+async fn run_warmup(args: WarmupArgs) -> anyhow::Result<()> {
+    info!("warming up embedding model '{}'", args.embedding_model);
+    let engine = EmbeddingEngine::new(&args.embedding_model)
+        .with_context(|| format!("failed to init embedding model '{}'", args.embedding_model))?;
+    // Run one dummy embed to ensure the model weights are fully loaded and any
+    // cached files are written to disk.
+    let _ = engine
+        .embed_one("warmup")
+        .await
+        .context("warmup embed failed")?;
+    info!("warmup complete");
     Ok(())
 }
 
@@ -367,7 +417,7 @@ mod tests {
             Some(Command::Auth(auth_cmd)) => match auth_cmd.action {
                 AuthAction::Login(login_args) => {
                     assert!(matches!(login_args.store, Some(StoreBackend::K8sSecret)));
-                    assert_eq!(login_args.k8s_namespace, "butterfly");
+                    assert_eq!(login_args.k8s_namespace, "memory-mcp");
                     assert_eq!(login_args.k8s_secret_name, "memory-mcp-github-token");
                 }
                 _ => panic!("expected Login action"),

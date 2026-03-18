@@ -1,0 +1,110 @@
+# Deployment for memory-mcp.
+#
+# Before applying, customize:
+#   - image: replace YOUR_REGISTRY/memory-mcp:latest with your actual image
+#   - MEMORY_MCP_REMOTE_URL: uncomment and set to your private GitHub repo URL
+#     when configuring a remote; omit to run in local-only mode (no push/pull)
+#   - MEMORY_MCP_BRANCH: branch to push/pull (default: main)
+#   - resources: adjust requests/limits for your workload
+#
+# The GitHub token is sourced from the Secret created by secret.yml (or
+# "auth login --store k8s-secret"). The pod mounts the PVC at /data for
+# the git repo and vector index.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-mcp
+  namespace: memory-mcp
+  labels:
+    app: memory-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memory-mcp
+  template:
+    metadata:
+      labels:
+        app: memory-mcp
+    spec:
+      serviceAccountName: memory-mcp
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: memory-mcp
+          # Replace with your registry/image:tag.
+          image: YOUR_REGISTRY/memory-mcp:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: MEMORY_MCP_BIND
+              value: "0.0.0.0:8080"
+            - name: MEMORY_MCP_REPO_PATH
+              value: /data/repo
+            # Uncomment and set MEMORY_MCP_REMOTE_URL to your private GitHub
+            # repository URL when configuring a remote. Leave commented out to
+            # run in local-only mode (no push/pull).
+            # - name: MEMORY_MCP_REMOTE_URL
+            #   value: ""
+            - name: MEMORY_MCP_BRANCH
+              value: main
+            # Uncomment the MEMORY_MCP_GITHUB_TOKEN block when MEMORY_MCP_REMOTE_URL
+            # is set. The token is sourced from the Secret created by secret.yml or
+            # "auth login --store k8s-secret" (key name: token). Not needed for
+            # local-only mode.
+            # - name: MEMORY_MCP_GITHUB_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: memory-mcp-github-token
+            #       key: token
+            #       optional: false
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          # NOTE: readinessProbe uses the static /healthz endpoint as a
+          # placeholder. All subsystems (embedding engine, git repo, vector
+          # index) initialise before the listener binds, so /healthz is only
+          # reachable once the server is ready. A dedicated /readyz endpoint
+          # with subsystem health checks should replace this when multi-replica
+          # deployments or rolling updates are supported.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: memory-mcp-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 10Mi

@@ -1,0 +1,22 @@
+# PersistentVolumeClaim for the git-backed memory repository and vector index.
+#
+# The pod mounts this at /data. The git repo lives at /data/repo (controlled by
+# MEMORY_MCP_REPO_PATH) and the vector index is written alongside it at
+# /data/repo/.memory-mcp-index/index.usearch.
+#
+# Adjust the storage size and storageClassName to match your cluster's
+# available StorageClasses. 1Gi is typically more than enough for thousands
+# of memory files.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: memory-mcp-data
+  namespace: memory-mcp
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # Uncomment and set to your cluster's StorageClass if the default is not suitable.
+  # storageClassName: standard
