@@ -32,7 +32,8 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@94a7388bec5d4c8dd93e3ebf09e0ff448f3f6f4d # v2.68.35
         with:
-          tool: cargo-nextest@0.9.131
+          tool: cargo-binstall@1.17.7
+      - run: cargo binstall -y --no-symlinks cargo-nextest@=0.9.131
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo clippy --workspace --features k8s -- -D warnings
@@ -47,7 +48,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: taiki-e/install-action@94a7388bec5d4c8dd93e3ebf09e0ff448f3f6f4d # v2.68.35
         with:
-          tool: cargo-audit@0.22.1
+          tool: cargo-binstall@1.17.7
+      - run: cargo binstall -y --no-symlinks cargo-audit@=0.22.1
       - run: cargo audit
 
   build:
