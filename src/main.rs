@@ -106,11 +106,13 @@ struct ServeArgs {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Set a restrictive umask so all files created by this process are
-    // owner-only by default. This is process-global but we are single-process.
+    // owner-only by default.
     #[cfg(unix)]
     {
-        // Safety: umask is process-global but we're single-process.
-        // All files created by this process should be owner-only by default.
+        // SAFETY: `umask` is a simple syscall that sets the process file-creation
+        // mask. It has no memory-safety implications — the `unsafe` is required
+        // only because it is an FFI call. We are a single-process server so the
+        // process-global nature of umask is not a concern.
         unsafe {
             libc::umask(0o077);
         }
