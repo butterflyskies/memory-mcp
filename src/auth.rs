@@ -11,6 +11,10 @@ use crate::error::MemoryError;
 const ENV_VAR: &str = "MEMORY_MCP_GITHUB_TOKEN";
 const TOKEN_FILE: &str = ".config/memory-mcp/token";
 
+const GITHUB_CLIENT_ID: &str = "Ov23liWxHYkwXTxCrYHp";
+const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+
 // ---------------------------------------------------------------------------
 // Secret<T> — redacts sensitive values from Debug and Display output
 // ---------------------------------------------------------------------------
@@ -47,6 +51,66 @@ impl<T> fmt::Display for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[REDACTED]")
     }
+}
+
+// ---------------------------------------------------------------------------
+// StoreBackend — where to persist a newly acquired token
+// ---------------------------------------------------------------------------
+
+/// Token storage backend selection for `memory-mcp auth login`.
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum StoreBackend {
+    /// Store token in the system keyring.
+    Keyring,
+    /// Store token in `~/.config/memory-mcp/token`.
+    File,
+    /// Print token to stdout and do not persist it.
+    Stdout,
+}
+
+// ---------------------------------------------------------------------------
+// TokenSource — tracks which resolution step found the token
+// ---------------------------------------------------------------------------
+
+/// Indicates which source produced the resolved token.
+#[derive(Debug)]
+enum TokenSource {
+    EnvVar,
+    File,
+    Keyring,
+}
+
+impl fmt::Display for TokenSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenSource::EnvVar => write!(f, "environment variable ({})", ENV_VAR),
+            TokenSource::File => write!(f, "token file (~/.config/memory-mcp/token)"),
+            TokenSource::Keyring => write!(f, "system keyring"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serde structs for OAuth responses
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct AccessTokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,11 +156,12 @@ impl AuthProvider {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    fn try_resolve() -> Result<String, MemoryError> {
+    /// Resolve the token and return both the raw value and which source provided it.
+    fn try_resolve_with_source() -> Result<(String, TokenSource), MemoryError> {
         // 1. Environment variable.
         if let Ok(tok) = std::env::var(ENV_VAR) {
             if !tok.trim().is_empty() {
-                return Ok(tok.trim().to_string());
+                return Ok((tok.trim().to_string(), TokenSource::EnvVar));
             }
         }
 
@@ -110,7 +175,7 @@ impl AuthProvider {
                 let raw = std::fs::read_to_string(&path)?;
                 let tok = raw.trim().to_string();
                 if !tok.is_empty() {
-                    return Ok(tok);
+                    return Ok((tok, TokenSource::File));
                 }
             }
         }
@@ -120,7 +185,7 @@ impl AuthProvider {
             Ok(entry) => match entry.get_password() {
                 Ok(tok) if !tok.trim().is_empty() => {
                     info!("resolved GitHub token from system keyring");
-                    return Ok(tok.trim().to_string());
+                    return Ok((tok.trim().to_string(), TokenSource::Keyring));
                 }
                 Ok(_) => { /* empty password stored — fall through */ }
                 Err(keyring::Error::NoEntry) => { /* no entry — fall through */ }
@@ -143,6 +208,10 @@ impl AuthProvider {
                 .to_string(),
         ))
     }
+
+    fn try_resolve() -> Result<String, MemoryError> {
+        Self::try_resolve_with_source().map(|(tok, _)| tok)
+    }
 }
 
 impl AuthProvider {
@@ -153,6 +222,314 @@ impl AuthProvider {
             token: Some(Secret::new(token.to_string())),
         }
     }
+}
+
+impl Default for AuthProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device flow login
+// ---------------------------------------------------------------------------
+
+/// Authenticate with GitHub via the OAuth device flow and persist the token.
+///
+/// Prints user-facing prompts to stderr. Never logs the token value.
+pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), MemoryError> {
+    use std::time::{Duration, Instant};
+    use tokio::time::sleep;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| MemoryError::OAuthError(format!("failed to build HTTP client: {e}")))?;
+
+    // Step 1: Request a device code.
+    let device_resp = client
+        .post(GITHUB_DEVICE_CODE_URL)
+        .header("Accept", "application/json")
+        .form(&[("client_id", GITHUB_CLIENT_ID), ("scope", "repo")])
+        .send()
+        .await
+        .map_err(|e| {
+            MemoryError::OAuthError(format!(
+                "failed to contact GitHub device code endpoint: {e}"
+            ))
+        })?
+        .error_for_status()
+        .map_err(|e| MemoryError::OAuthError(format!("GitHub device code request failed: {e}")))?
+        .json::<DeviceCodeResponse>()
+        .await
+        .map_err(|e| {
+            MemoryError::OAuthError(format!("failed to parse device code response: {e}"))
+        })?;
+
+    // Compute overall deadline from expires_in.
+    let deadline = Instant::now() + Duration::from_secs(device_resp.expires_in);
+
+    // Step 2: Display instructions to the user.
+    eprintln!();
+    eprintln!("  Open this URL in your browser:");
+    eprintln!("    {}", device_resp.verification_uri);
+    eprintln!();
+    eprintln!("  Enter this code when prompted:");
+    eprintln!("    {}", device_resp.user_code);
+    eprintln!();
+    eprintln!("  Waiting for authorization...");
+
+    // Step 3: Poll for the access token.
+    let mut poll_interval = device_resp.interval;
+    let token = loop {
+        if Instant::now() >= deadline {
+            return Err(MemoryError::OAuthError(format!(
+                "Device code expired after {} seconds",
+                device_resp.expires_in
+            )));
+        }
+
+        sleep(Duration::from_secs(poll_interval)).await;
+
+        let resp = client
+            .post(GITHUB_ACCESS_TOKEN_URL)
+            .header("Accept", "application/json")
+            .form(&[
+                ("client_id", GITHUB_CLIENT_ID),
+                ("device_code", &device_resp.device_code),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                MemoryError::OAuthError(format!("polling GitHub token endpoint failed: {e}"))
+            })?
+            .error_for_status()
+            .map_err(|e| {
+                MemoryError::OAuthError(format!("GitHub token request returned error status: {e}"))
+            })?
+            .json::<AccessTokenResponse>()
+            .await
+            .map_err(|e| MemoryError::OAuthError(format!("failed to parse token response: {e}")))?;
+
+        if let Some(tok) = resp.access_token.filter(|t| !t.trim().is_empty()) {
+            break tok;
+        }
+
+        match resp.error.as_deref() {
+            Some("authorization_pending") => {
+                // Normal — user has not yet approved; keep polling.
+                continue;
+            }
+            Some("slow_down") => {
+                // GitHub asked us to back off; add 5 s to interval.
+                poll_interval += 5;
+                continue;
+            }
+            Some("expired_token") => {
+                return Err(MemoryError::OAuthError(
+                    "device code expired; please run `memory-mcp auth login` again".to_string(),
+                ));
+            }
+            Some("access_denied") => {
+                return Err(MemoryError::OAuthError(
+                    "authorization denied by user".to_string(),
+                ));
+            }
+            Some(other) => {
+                let desc = resp
+                    .error_description
+                    .as_deref()
+                    .unwrap_or("no description");
+                return Err(MemoryError::OAuthError(format!(
+                    "unexpected OAuth error '{other}': {desc}"
+                )));
+            }
+            None => {
+                return Err(MemoryError::OAuthError(
+                    "GitHub returned neither an access_token nor an error field; \
+                     unexpected response"
+                        .to_string(),
+                ));
+            }
+        }
+    };
+
+    // Step 4: Store the token.
+    store_token(&token, store)?;
+    eprintln!("Authentication successful.");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Token storage
+// ---------------------------------------------------------------------------
+
+/// Persist a token via the specified backend.
+///
+/// Never logs the token value — only the chosen storage destination.
+fn store_token(token: &str, backend: Option<StoreBackend>) -> Result<(), MemoryError> {
+    match backend {
+        Some(StoreBackend::Stdout) => {
+            println!("{token}");
+            debug!("token written to stdout");
+        }
+        Some(StoreBackend::Keyring) => {
+            store_in_keyring(token)?;
+        }
+        Some(StoreBackend::File) => {
+            store_in_file(token)?;
+        }
+        None => {
+            // No --store flag: try keyring ONLY. Do NOT fall back to file.
+            store_in_keyring(token).map_err(|e| {
+                MemoryError::TokenStorage(format!(
+                    "Keyring unavailable: {e}. Use --store file to write to \
+                     ~/.config/memory-mcp/token, or --store stdout to print the token."
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn store_in_keyring(token: &str) -> Result<(), MemoryError> {
+    let entry = keyring::Entry::new("memory-mcp", "github-token")
+        .map_err(|e| MemoryError::TokenStorage(format!("failed to create keyring entry: {e}")))?;
+    entry
+        .set_password(token)
+        .map_err(|e| MemoryError::TokenStorage(format!("failed to store token in keyring: {e}")))?;
+    info!("token stored in system keyring");
+    Ok(())
+}
+
+fn store_in_file(token: &str) -> Result<(), MemoryError> {
+    let home =
+        home_dir().ok_or_else(|| MemoryError::TokenStorage("HOME directory is not set".into()))?;
+    let token_path = home.join(TOKEN_FILE);
+
+    if let Some(parent) = token_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            MemoryError::TokenStorage(format!(
+                "failed to create config directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+
+        // Set config directory to 0700 on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    MemoryError::TokenStorage(format!(
+                        "failed to set config directory permissions: {e}"
+                    ))
+                },
+            )?;
+        }
+    }
+
+    // Atomically create file with 0600 permissions on Unix.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&token_path)
+            .map_err(|e| MemoryError::TokenStorage(format!("failed to open token file: {e}")))?;
+        f.write_all(token.as_bytes())
+            .map_err(|e| MemoryError::TokenStorage(format!("failed to write token file: {e}")))?;
+        f.write_all(b"\n")
+            .map_err(|e| MemoryError::TokenStorage(format!("failed to write token file: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&token_path, format!("{token}\n"))
+            .map_err(|e| MemoryError::TokenStorage(format!("failed to write token file: {e}")))?;
+    }
+
+    info!("token stored in file ({})", token_path.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Auth status
+// ---------------------------------------------------------------------------
+
+/// Print the current authentication status to stdout.
+///
+/// Shows the source of the resolved token and a redacted preview.
+/// Never prints the full token value.
+pub fn print_auth_status() {
+    match AuthProvider::try_resolve_with_source() {
+        Ok((token, source)) => {
+            let preview = if token.len() >= 12 {
+                format!("{}...", &token[..4])
+            } else {
+                "****...".to_string()
+            };
+            println!("Authenticated via {source}");
+            println!("Token: {preview}");
+        }
+        Err(_) => {
+            println!("No token configured.");
+            println!("Run `memory-mcp auth login` to authenticate with GitHub.");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Permission check (Unix only)
+// ---------------------------------------------------------------------------
+
+/// Warn if the token file has permissions that are wider than 0o600.
+fn check_token_file_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.mode() & 0o777;
+                if mode != 0o600 {
+                    warn!(
+                        "token file '{}' has permissions {:04o}; \
+                         expected 0600 — consider running: chmod 600 {}",
+                        path.display(),
+                        mode,
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("could not read permissions for '{}': {}", path.display(), e);
+            }
+        }
+    }
+    // On non-Unix platforms there are no POSIX permissions to check.
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+// ---------------------------------------------------------------------------
+// Platform-portable home directory helper (shared with main.rs)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            // Fallback for unusual environments
+            #[allow(deprecated)]
+            std::env::home_dir()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +591,57 @@ mod tests {
         assert_eq!(result.unwrap(), env_token);
     }
 
+    #[test]
+    fn test_try_resolve_with_source_returns_env_var_source() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let token_value = "ghp_source_test_abc";
+        std::env::set_var(ENV_VAR, token_value);
+        let result = AuthProvider::try_resolve_with_source();
+        std::env::remove_var(ENV_VAR);
+
+        assert!(result.is_ok(), "expected Ok but got: {result:?}");
+        let (tok, source) = result.unwrap();
+        assert_eq!(tok, token_value);
+        assert!(
+            matches!(source, TokenSource::EnvVar),
+            "expected TokenSource::EnvVar, got: {source:?}"
+        );
+    }
+
+    #[test]
+    fn test_store_token_file_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_dir = dir.path().join(".config").join("memory-mcp");
+        let token_path = token_dir.join("token");
+
+        // Temporarily override HOME.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", dir.path());
+
+        let result = store_in_file("ghp_file_backend_test");
+
+        // Restore HOME before asserting so other tests aren't affected.
+        match original_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(result.is_ok(), "store_in_file failed: {result:?}");
+        assert!(token_path.exists(), "token file was not created");
+
+        let content = std::fs::read_to_string(&token_path).unwrap();
+        assert_eq!(content, "ghp_file_backend_test\n");
+
+        // Verify 0o600 permissions on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = std::fs::metadata(&token_path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0600 permissions, got {:04o}", mode);
+        }
+    }
+
     /// This test exercises the keyring path and requires a live D-Bus /
     /// secret-service backend.  Mark it `#[ignore]` so it does not run in CI.
     #[test]
@@ -237,57 +665,13 @@ mod tests {
         assert!(result.is_ok(), "expected token from keyring: {result:?}");
         assert_eq!(result.unwrap(), test_token);
     }
-}
 
-impl Default for AuthProvider {
-    fn default() -> Self {
-        Self::new()
+    /// Device flow requires real GitHub interaction — skip in CI.
+    #[tokio::test]
+    #[ignore = "requires real GitHub OAuth interaction"]
+    async fn test_device_flow_login_ignored_in_ci() {
+        device_flow_login(Some(StoreBackend::Stdout))
+            .await
+            .expect("device flow should succeed");
     }
-}
-
-// ---------------------------------------------------------------------------
-// Permission check (Unix only)
-// ---------------------------------------------------------------------------
-
-/// Warn if the token file has permissions that are wider than 0o600.
-fn check_token_file_permissions(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(path) {
-            Ok(meta) => {
-                let mode = meta.mode() & 0o777;
-                if mode != 0o600 {
-                    warn!(
-                        "token file '{}' has permissions {:04o}; \
-                         expected 0600 — consider running: chmod 600 {}",
-                        path.display(),
-                        mode,
-                        path.display()
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("could not read permissions for '{}': {}", path.display(), e);
-            }
-        }
-    }
-    // On non-Unix platforms there are no POSIX permissions to check.
-    #[cfg(not(unix))]
-    let _ = path;
-}
-
-// ---------------------------------------------------------------------------
-// Platform-portable home directory helper
-// ---------------------------------------------------------------------------
-
-fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            // Fallback for unusual environments
-            #[allow(deprecated)]
-            std::env::home_dir()
-        })
 }

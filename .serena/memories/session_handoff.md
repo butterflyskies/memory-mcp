@@ -1,32 +1,18 @@
-# Session Handoff — memory-mcp tool implementation
+# Session Handoff — memory-mcp
+
+## Canonical tracking
+- **TODO.md** in repo root — Phase 2 checklist with completion status
+- **butterflyskies/tasks#80** — tracking issue with PR links and status comments
 
 ## Current state
-Branch `feature/implement-tool-handlers` has all 7 MCP tool handlers implemented and quality-checked.
-- fmt, clippy, 23/23 tests pass
-- ADR-0006 (structured observability) written in `docs/adr/`
-- Tracking issue butterflyskies/tasks#80 updated with observability requirements
+On `main`, all merged PRs up to date. Active work: keyring-based token storage (ADR-0010).
 
-## What's done
-- Phase 1 (Plan): Approved
-- Phase 1.5 (ADR): ADR-0006 written
-- Phase 2 (Implement): All 7 tools wired to MemoryRepo, EmbeddingEngine, VectorIndex
-- Phase 3 (Quality): All green
+## What's in flight
+- `/develop` workflow for keyring token storage — plan approved, ready for Phase 2 (implement)
+- Plan: add `keyring` crate, insert as step 3 in auth resolution chain (env → file → keyring → error), add `--set-token` CLI flag, tests
 
-## What's next
-- **Phase 4: Architectural review** — dispatch review sub-agent (opus) on the diff
-- Phase 4.5: Fix any P1/P2 findings
-- Phase 5: Land (commit, push, PR, tracking)
-
-## Key context
-- All tool handlers are in `src/server.rs` — async fns returning `Result<String, ErrorData>`
-- Every handler has tracing spans with structured timing fields
-- `recall` includes filter transparency: `pre_filter_count`, `filtered_by_scope`, `count`, `limit`
-- Vector index stores qualified names: `{scope.dir_prefix()}/{name}`
-- Vector keys derived from lower 64 bits of UUID (stable, no hash dependency)
-- Pre-existing dead_code warnings handled with targeted `#[allow(dead_code)]` on specific items
-- `sync` is wired but delegates to stub push/pull (logs warnings)
-- Server test instance was verified working at 127.0.0.1:3000 earlier in session
-
-## Run /develop to resume
-The `/develop` workflow should pick up at Phase 4 (architectural review). The diff is on
-`feature/implement-tool-handlers` vs `main`. Run `git diff main...HEAD` to see the changes.
+## Context worth preserving
+- Review cycles consistently take 2 passes (initial + re-review after fixes)
+- Pre-flight checklist added to develop skill (claude-skills PR #9) — watch if it reduces review cycles
+- IDE diagnostics are frequently stale — always verify with `cargo check`, not IDE
+- `capture_head_oid` is used in fast_forward but intentionally NOT in merge_with_remote (defensive: merge path should error on unborn HEAD, not silently sentinel)
