@@ -74,14 +74,14 @@ struct LoginArgs {
     #[arg(long, value_enum)]
     store: Option<StoreBackend>,
 
+    /// Kubernetes namespace for the token Secret.
     #[cfg(feature = "k8s")]
     #[arg(long, default_value = "memory-mcp")]
-    /// Kubernetes namespace for the token Secret.
     k8s_namespace: String,
 
+    /// Name of the Kubernetes Secret to create/update.
     #[cfg(feature = "k8s")]
     #[arg(long, default_value = "memory-mcp-github-token")]
-    /// Name of the Kubernetes Secret to create/update.
     k8s_secret_name: String,
 }
 
