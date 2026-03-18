@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/butterflyskies/memory-mcp/compare/v0.1.2...v0.1.3) (2026-03-18)
+
+
+### Bug Fixes
+
+* move doc comments above #[cfg] so clap shows help text for k8s flags ([#24](https://github.com/butterflyskies/memory-mcp/issues/24)) ([12047c9](https://github.com/butterflyskies/memory-mcp/commit/12047c9251617541822ae5b3228da3b8a4e118a3))
+
 ## [0.1.2](https://github.com/butterflyskies/memory-mcp/compare/v0.1.1...v0.1.2) (2026-03-18)
 
 
