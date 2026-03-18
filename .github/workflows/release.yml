@@ -46,7 +46,7 @@ jobs:
           echo "Waiting for CI workflow on ${{ github.sha }}..."
           for attempt in $(seq 1 20); do
             run_id=$(gh run list --repo "${{ github.repository }}" --workflow=build.yml \
-              --commit="${{ github.sha }}" --limit=1 --json databaseId -q '.[0].databaseId')
+              --event=push --commit="${{ github.sha }}" --limit=1 --json databaseId -q '.[0].databaseId')
             [ -n "$run_id" ] && break
             echo "CI run not found yet, retrying in 30s (attempt $attempt/20)..."
             sleep 30
@@ -104,14 +104,12 @@ jobs:
   publish-binaries:
     needs: [release-please, ci-gate]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             build-tool: cargo
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            build-tool: cross
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             build-tool: cargo
