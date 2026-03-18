@@ -18,7 +18,7 @@
 - [x] Input validation — name validation, content size limits, nesting depth limits
 - [x] Error mapping — `From<MemoryError> for ErrorData` with appropriate MCP error codes
 
-## Phase 2: Sync + Migration
+## Phase 2: Sync + Auth + Migration
 
 - [x] Implement real git push/pull with remote auth (PR #4)
   - [x] Lazy token resolution — local-only mode works without credentials
@@ -26,14 +26,29 @@
   - [x] Configurable branch name (ADR-0009)
   - [x] Path-traversal and symlink protection in conflict resolution
   - [x] Integration tests (20 new, all offline with local bare remotes)
-- [ ] Keyring-based token storage via `keyring` crate (sync-secret-service for KWallet/GNOME Keyring)
-- [ ] Index rebuild on pull (incremental if possible)
+- [x] Incremental index rebuild on pull (PR #7)
+  - [x] Diff old/new HEAD trees, re-embed only changed files
+  - [x] VectorIndex::remove name_map corruption fix
+  - [x] Refactor pull() into smaller named helpers
+- [x] Keyring-based token storage (PR #9, ADR-0010)
+  - [x] Resolution chain: env var → token file → system keyring
+  - [x] Graceful degradation for headless/k8s (NoStorageAccess)
+- [x] Auth subcommand with OAuth device flow (PR #10, ADR-0011, ADR-0012)
+  - [x] CLI restructure: `serve` (default), `auth login`, `auth status`
+  - [x] GitHub OAuth device flow with scoped token acquisition
+  - [x] Token storage: keyring default, explicit `--store file|stdout` opt-in
+  - [x] Security hardening: umask 0o077, atomic file writes, request/loop timeouts
+- [ ] `--store k8s-secret` backend (cargo feature-gated)
+- [ ] Extract OAuth client ID from hardcoded const into config module
+- [ ] Integration tests for `auth login`, `auth status`, `MEMORY_MCP_BIND` env var
 - [ ] Migration tool: import Serena global memories (preserve content + metadata) (ADR-0008)
 - [ ] Migration tool: import Serena project-scoped memories
 - [ ] Migration tool: import Claude Code auto-memories
+- [ ] Container image (Dockerfile, publish to Harbor)
+- [ ] K8s deployment: Cilium Gateway API, StepClusterIssuer certs
+- [ ] Test cross-device sync workflow
 - [ ] Configure as MCP server in `~/.claude.json`
 - [ ] Update CLAUDE.md instructions to use memory-mcp instead of Serena memories
-- [ ] Test cross-device sync workflow
 
 ## Phase 3: Polish
 

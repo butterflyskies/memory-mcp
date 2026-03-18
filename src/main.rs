@@ -65,6 +65,16 @@ struct LoginArgs {
     /// Where to store the token
     #[arg(long, value_enum)]
     store: Option<StoreBackend>,
+
+    #[cfg(feature = "k8s")]
+    #[arg(long, default_value = "butterfly")]
+    /// Kubernetes namespace for the token Secret.
+    k8s_namespace: String,
+
+    #[cfg(feature = "k8s")]
+    #[arg(long, default_value = "memory-mcp-github-token")]
+    /// Name of the Kubernetes Secret to create/update.
+    k8s_secret_name: String,
 }
 
 #[derive(Args)]
@@ -141,9 +151,22 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Serve(args)) => run_serve(args).await?,
         Some(Command::Auth(auth_cmd)) => match auth_cmd.action {
             AuthAction::Login(login_args) => {
-                auth::device_flow_login(login_args.store)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                #[cfg(feature = "k8s")]
+                let k8s_config = if matches!(login_args.store, Some(StoreBackend::K8sSecret)) {
+                    Some(auth::K8sSecretConfig {
+                        namespace: login_args.k8s_namespace.clone(),
+                        secret_name: login_args.k8s_secret_name.clone(),
+                    })
+                } else {
+                    None
+                };
+                auth::device_flow_login(
+                    login_args.store,
+                    #[cfg(feature = "k8s")]
+                    k8s_config,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
             AuthAction::Status => {
                 auth::print_auth_status();
@@ -333,5 +356,51 @@ mod tests {
         // produces a Serve command.
         let cli = Cli::parse_from(["memory-mcp", "serve"]);
         assert!(matches!(cli.command, Some(Command::Serve(_))));
+    }
+
+    #[cfg(feature = "k8s")]
+    #[test]
+    fn test_cli_auth_login_store_k8s_secret() {
+        let cli = Cli::try_parse_from(["memory-mcp", "auth", "login", "--store", "k8s-secret"])
+            .expect("auth login --store k8s-secret should parse");
+        match cli.command {
+            Some(Command::Auth(auth_cmd)) => match auth_cmd.action {
+                AuthAction::Login(login_args) => {
+                    assert!(matches!(login_args.store, Some(StoreBackend::K8sSecret)));
+                    assert_eq!(login_args.k8s_namespace, "butterfly");
+                    assert_eq!(login_args.k8s_secret_name, "memory-mcp-github-token");
+                }
+                _ => panic!("expected Login action"),
+            },
+            _ => panic!("expected Auth command"),
+        }
+    }
+
+    #[cfg(feature = "k8s")]
+    #[test]
+    fn test_cli_auth_login_k8s_namespace_override() {
+        let cli = Cli::try_parse_from([
+            "memory-mcp",
+            "auth",
+            "login",
+            "--store",
+            "k8s-secret",
+            "--k8s-namespace",
+            "custom-ns",
+            "--k8s-secret-name",
+            "custom-name",
+        ])
+        .expect("auth login with k8s flags should parse");
+        match cli.command {
+            Some(Command::Auth(auth_cmd)) => match auth_cmd.action {
+                AuthAction::Login(login_args) => {
+                    assert!(matches!(login_args.store, Some(StoreBackend::K8sSecret)));
+                    assert_eq!(login_args.k8s_namespace, "custom-ns");
+                    assert_eq!(login_args.k8s_secret_name, "custom-name");
+                }
+                _ => panic!("expected Login action"),
+            },
+            _ => panic!("expected Auth command"),
+        }
     }
 }

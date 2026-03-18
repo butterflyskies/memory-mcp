@@ -67,6 +67,21 @@ pub enum StoreBackend {
     File,
     /// Print token to stdout and do not persist it.
     Stdout,
+    #[cfg(feature = "k8s")]
+    /// Store token as a Kubernetes Secret.
+    #[clap(name = "k8s-secret")]
+    K8sSecret,
+}
+
+// ---------------------------------------------------------------------------
+// K8sSecretConfig — configuration for Kubernetes Secret storage
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "k8s")]
+#[derive(Debug)]
+pub struct K8sSecretConfig {
+    pub namespace: String,
+    pub secret_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +253,10 @@ impl Default for AuthProvider {
 /// Authenticate with GitHub via the OAuth device flow and persist the token.
 ///
 /// Prints user-facing prompts to stderr. Never logs the token value.
-pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), MemoryError> {
+pub async fn device_flow_login(
+    store: Option<StoreBackend>,
+    #[cfg(feature = "k8s")] k8s_config: Option<K8sSecretConfig>,
+) -> Result<(), MemoryError> {
     use std::time::{Duration, Instant};
     use tokio::time::sleep;
 
@@ -355,7 +373,13 @@ pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), Memory
     };
 
     // Step 4: Store the token.
-    store_token(&token, store)?;
+    store_token(
+        &token,
+        store,
+        #[cfg(feature = "k8s")]
+        k8s_config,
+    )
+    .await?;
     eprintln!("Authentication successful.");
 
     Ok(())
@@ -368,7 +392,11 @@ pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), Memory
 /// Persist a token via the specified backend.
 ///
 /// Never logs the token value — only the chosen storage destination.
-fn store_token(token: &str, backend: Option<StoreBackend>) -> Result<(), MemoryError> {
+async fn store_token(
+    token: &str,
+    backend: Option<StoreBackend>,
+    #[cfg(feature = "k8s")] k8s_config: Option<K8sSecretConfig>,
+) -> Result<(), MemoryError> {
     match backend {
         Some(StoreBackend::Stdout) => {
             println!("{token}");
@@ -380,12 +408,27 @@ fn store_token(token: &str, backend: Option<StoreBackend>) -> Result<(), MemoryE
         Some(StoreBackend::File) => {
             store_in_file(token)?;
         }
+        #[cfg(feature = "k8s")]
+        Some(StoreBackend::K8sSecret) => {
+            let config = k8s_config.ok_or_else(|| {
+                MemoryError::TokenStorage(
+                    "k8s-secret backend requires namespace and secret name".into(),
+                )
+            })?;
+            store_in_k8s_secret(token, &config).await?;
+        }
         None => {
             // No --store flag: try keyring ONLY. Do NOT fall back to file.
             store_in_keyring(token).map_err(|e| {
                 MemoryError::TokenStorage(format!(
                     "Keyring unavailable: {e}. Use --store file to write to \
-                     ~/.config/memory-mcp/token, or --store stdout to print the token."
+                     ~/.config/memory-mcp/token, --store stdout to print the token\
+                     {k8s_hint}.",
+                    k8s_hint = if cfg!(feature = "k8s") {
+                        ", or --store k8s-secret to store in a Kubernetes Secret"
+                    } else {
+                        ""
+                    }
                 ))
             })?;
         }
@@ -470,6 +513,107 @@ fn store_in_file(token: &str) -> Result<(), MemoryError> {
 
     info!("token stored in file ({})", token_path.display());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Kubernetes Secret storage (k8s feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "k8s")]
+async fn store_in_k8s_secret(token: &str, config: &K8sSecretConfig) -> Result<(), MemoryError> {
+    use k8s_openapi::api::core::v1::Secret;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kube::{api::PostParams, Api, Client};
+    use std::collections::BTreeMap;
+
+    let client = Client::try_default().await.map_err(|e| {
+        MemoryError::TokenStorage(format!(
+            "Failed to initialize Kubernetes client. Ensure KUBECONFIG is set \
+             or the pod has a service account: {e}"
+        ))
+    })?;
+
+    let secrets: Api<Secret> = Api::namespaced(client, &config.namespace);
+    let secret_name = &config.secret_name;
+
+    let mut data = BTreeMap::new();
+    data.insert(
+        "token".to_string(),
+        k8s_openapi::ByteString(token.as_bytes().to_vec()),
+    );
+
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        "memory-mcp".to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/component".to_string(),
+        "auth".to_string(),
+    );
+
+    let mut secret = Secret {
+        metadata: ObjectMeta {
+            name: Some(secret_name.clone()),
+            namespace: Some(config.namespace.clone()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        data: Some(data),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    };
+
+    // Create-first: attempt to create the secret; on 409 AlreadyExists, GET to
+    // fetch the current resourceVersion and replace. This avoids the TOCTOU
+    // race inherent in a GET-then-create/replace approach.
+    match secrets.create(&PostParams::default(), &secret).await {
+        Ok(_) => {
+            debug!(
+                "created Kubernetes Secret '{secret_name}' in namespace '{}'",
+                config.namespace
+            );
+        }
+        Err(kube::Error::Api(ref err_resp)) if err_resp.code == 409 => {
+            // Secret already exists; fetch resourceVersion then replace.
+            let existing = secrets
+                .get(secret_name)
+                .await
+                .map_err(|e| map_kube_error(e, &config.namespace))?;
+            secret.metadata.resource_version = existing.metadata.resource_version;
+            secrets
+                .replace(secret_name, &PostParams::default(), &secret)
+                .await
+                .map_err(|e| map_kube_error(e, &config.namespace))?;
+            debug!(
+                "updated Kubernetes Secret '{secret_name}' in namespace '{}'",
+                config.namespace
+            );
+        }
+        Err(e) => {
+            return Err(map_kube_error(e, &config.namespace));
+        }
+    }
+
+    eprintln!(
+        "Token stored in Kubernetes Secret '{secret_name}' (namespace: {})",
+        config.namespace
+    );
+    Ok(())
+}
+
+#[cfg(feature = "k8s")]
+fn map_kube_error(e: kube::Error, namespace: &str) -> MemoryError {
+    match &e {
+        kube::Error::Api(err_resp) if err_resp.code == 403 => MemoryError::TokenStorage(format!(
+            "Access denied. Ensure the service account has RBAC permission \
+                 for secrets in namespace '{namespace}': {e}"
+        )),
+        kube::Error::Api(err_resp) if err_resp.code == 404 => {
+            MemoryError::TokenStorage(format!("Namespace '{namespace}' does not exist: {e}"))
+        }
+        _ => MemoryError::TokenStorage(format!("Kubernetes API error: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -683,8 +827,19 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires real GitHub OAuth interaction"]
     async fn test_device_flow_login_ignored_in_ci() {
-        device_flow_login(Some(StoreBackend::Stdout))
-            .await
-            .expect("device flow should succeed");
+        device_flow_login(
+            Some(StoreBackend::Stdout),
+            #[cfg(feature = "k8s")]
+            None,
+        )
+        .await
+        .expect("device flow should succeed");
+    }
+
+    #[cfg(feature = "k8s")]
+    #[test]
+    #[ignore] // Requires a real Kubernetes cluster
+    fn test_store_in_k8s_secret_ignored_in_ci() {
+        // Placeholder for manual/integration testing
     }
 }
