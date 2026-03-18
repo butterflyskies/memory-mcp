@@ -12,8 +12,8 @@ docker push YOUR_REGISTRY/memory-mcp:latest
 ```
 
 Or let the [GitHub Actions workflow](../.github/workflows/build.yml) do it on
-push to `main`. Set `HARBOR_USERNAME` and `HARBOR_PASSWORD` as repository
-secrets pointing at your registry.
+push to `main`. The workflow pushes to `ghcr.io/butterflyskies/memory-mcp`
+using the built-in `GITHUB_TOKEN` — no extra secrets needed.
 
 ### 2. Apply the manifests
 
@@ -110,7 +110,8 @@ Add to `~/.claude.json` (or your project-local `.mcp.json`):
 The goddess cluster uses a richer stack. The production manifests live in the
 ArgoCD gitops repo, not here. Key differences from the generic path:
 
-- **Registry**: `harbor.svc.echoes` — image is `library/memory-mcp`
+- **Registry**: `ghcr.io/butterflyskies/memory-mcp` (public); mirrored to
+  `harbor.svc.echoes` if needed for air-gapped pulls
 - **Namespace**: `memory-mcp`
 - **Ingress**: Cilium Gateway API (HTTPRoute, not Ingress)
 - **TLS**: `StepClusterIssuer` (step-ca) — certificate auto-provisioned

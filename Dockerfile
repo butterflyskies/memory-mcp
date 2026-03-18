@@ -1,5 +1,6 @@
 # Stage 1: Build
 FROM rust:1.87-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
 RUN cargo build --release --features k8s
@@ -23,7 +24,7 @@ RUN /usr/local/bin/memory-mcp warmup
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git libdbus-1-3 && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 memory-mcp
 COPY --from=builder /build/target/release/memory-mcp /usr/local/bin/memory-mcp
 # Copy the pre-warmed model cache from the model stage.
