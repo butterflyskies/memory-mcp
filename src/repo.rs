@@ -460,7 +460,8 @@ impl MemoryRepo {
         branch: &str,
     ) -> Result<PullResult, MemoryError> {
         // Capture old HEAD before the merge commit.
-        // At this point we know HEAD exists (merge analysis succeeded).
+        // HEAD must exist here — merge analysis would not reach this path
+        // with an unborn branch. Propagate the error if it somehow does.
         let oid = repo.head()?.peel_to_commit()?.id();
         let mut old_head = [0u8; 20];
         old_head.copy_from_slice(oid.as_bytes());
