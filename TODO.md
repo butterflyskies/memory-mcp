@@ -44,8 +44,10 @@
 - [ ] Migration tool: import Serena global memories (preserve content + metadata) (ADR-0008)
 - [ ] Migration tool: import Serena project-scoped memories
 - [ ] Migration tool: import Claude Code auto-memories
-- [ ] Container image (Dockerfile, publish to Harbor)
+- [ ] Container image (Dockerfile, publish to ghcr.io) — PR #13
 - [ ] K8s deployment: Cilium Gateway API, StepClusterIssuer certs
+- [ ] Container signing (cosign) — keyless vs long-lived key ADR, verify in deploy pipeline
+- [ ] CVE scanning gate in CI — consume SBOM attestation with Grype/Trivy, block on critical
 - [ ] Test cross-device sync workflow
 - [ ] Configure as MCP server in `~/.claude.json`
 - [ ] Update CLAUDE.md instructions to use memory-mcp instead of Serena memories
