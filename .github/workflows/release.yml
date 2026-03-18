@@ -34,8 +34,9 @@ jobs:
   # Build and push a semver-tagged container image when a release is published.
   #
   # This runs in the same workflow as release-please because GITHUB_TOKEN events
-  # don't trigger other workflows (anti-cascade rule). The CI workflow already
-  # validated this commit on the main-branch push — we skip re-testing here.
+  # don't trigger other workflows (anti-cascade rule). We wait for the CI workflow
+  # to pass on the same commit before publishing — CI triggers from the same push
+  # event but runs independently.
   publish-image:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
@@ -45,6 +46,24 @@ jobs:
       packages: write
       id-token: write
     steps:
+      - name: Wait for CI to pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Waiting for CI workflow on ${{ github.sha }}..."
+          for attempt in 1 2 3 4 5; do
+            run_id=$(gh run list --repo "${{ github.repository }}" --workflow=build.yml \
+              --commit="${{ github.sha }}" --limit=1 --json databaseId -q '.[0].databaseId')
+            [ -n "$run_id" ] && break
+            echo "CI run not found yet, retrying in 15s (attempt $attempt/5)..."
+            sleep 15
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::CI run not found for ${{ github.sha }} after 75s"
+            exit 1
+          fi
+          echo "Found CI run $run_id, watching..."
+          gh run watch "$run_id" --repo "${{ github.repository }}" --exit-status
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
