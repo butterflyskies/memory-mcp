@@ -184,7 +184,11 @@ impl VectorIndex {
             .remove(key)
             .map_err(|e| MemoryError::Index(format!("remove: {}", e)))?;
         if let Some(name) = state.key_map.remove(&key) {
-            state.name_map.remove(&name);
+            // Only remove from name_map if it still points to this key.
+            // An upsert may have already updated name_map to point to a newer key.
+            if state.name_map.get(&name).copied() == Some(key) {
+                state.name_map.remove(&name);
+            }
         }
         Ok(())
     }
@@ -279,5 +283,72 @@ impl VectorIndex {
                 next_key,
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_index() -> VectorIndex {
+        VectorIndex::new(4).expect("failed to create index")
+    }
+
+    fn dummy_vec() -> Vec<f32> {
+        vec![1.0, 0.0, 0.0, 0.0]
+    }
+
+    /// Verify that `remove(old_key)` does NOT clobber `name_map` when an
+    /// upsert has already updated `name_map` to point to a newer key.
+    ///
+    /// Pattern: add_with_next_key("name") → old_key
+    ///          add_with_next_key("name") → new_key  (name_map now points to new_key)
+    ///          remove(old_key)
+    ///          find_key_by_name("name") must return new_key (not None)
+    #[test]
+    fn remove_old_key_does_not_clobber_upserted_name_map_entry() {
+        let index = make_index();
+        let v = dummy_vec();
+
+        // First insert — establishes old_key.
+        let old_key = index
+            .add_with_next_key(&v, "global/foo".to_string())
+            .expect("first add failed");
+
+        // Upsert (second insert for same name) — name_map now points to new_key.
+        let new_key = index
+            .add_with_next_key(&v, "global/foo".to_string())
+            .expect("second add failed");
+
+        assert_ne!(old_key, new_key, "keys must differ");
+
+        // Remove the OLD key — should not disturb name_map's entry for new_key.
+        index.remove(old_key).expect("remove failed");
+
+        // name_map must still resolve "global/foo" to new_key.
+        assert_eq!(
+            index.find_key_by_name("global/foo"),
+            Some(new_key),
+            "name_map entry for new_key was incorrectly removed"
+        );
+    }
+
+    /// Removing the current (only) key should clear the name_map entry.
+    #[test]
+    fn remove_only_key_clears_name_map() {
+        let index = make_index();
+        let v = dummy_vec();
+
+        let key = index
+            .add_with_next_key(&v, "global/bar".to_string())
+            .expect("add failed");
+
+        index.remove(key).expect("remove failed");
+
+        assert_eq!(
+            index.find_key_by_name("global/bar"),
+            None,
+            "name_map entry should have been cleared"
+        );
     }
 }

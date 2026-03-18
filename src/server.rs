@@ -8,9 +8,16 @@ use rmcp::{
 };
 use tracing::{info, warn, Instrument};
 
-use crate::types::{
-    parse_qualified_name, parse_scope, validate_name, AppState, EditArgs, ForgetArgs, ListArgs,
-    Memory, MemoryMetadata, PullResult, ReadArgs, RecallArgs, RememberArgs, Scope, SyncArgs,
+use crate::{
+    embedding::EmbeddingEngine,
+    error::MemoryError,
+    index::VectorIndex,
+    repo::MemoryRepo,
+    types::{
+        parse_qualified_name, parse_scope, validate_name, AppState, ChangedMemories, EditArgs,
+        ForgetArgs, ListArgs, Memory, MemoryMetadata, PullResult, ReadArgs, RecallArgs,
+        ReindexStats, RememberArgs, Scope, SyncArgs,
+    },
 };
 
 /// MCP server implementation.
@@ -25,6 +32,150 @@ pub struct MemoryServer {
 
 /// Maximum allowed content size in bytes (1 MiB).
 const MAX_CONTENT_SIZE: usize = 1_048_576;
+
+// ---------------------------------------------------------------------------
+// Incremental reindex helper
+// ---------------------------------------------------------------------------
+
+/// Re-embed and re-index all memories that changed between two commits.
+///
+/// Removals are processed first so a name that was deleted and re-added in
+/// the same pull gets a fresh entry rather than a ghost.
+async fn incremental_reindex(
+    repo: &Arc<MemoryRepo>,
+    embedding: &EmbeddingEngine,
+    index: &VectorIndex,
+    changes: &ChangedMemories,
+) -> ReindexStats {
+    let mut stats = ReindexStats::default();
+
+    // ---- 1. Removals --------------------------------------------------------
+    for name in &changes.removed {
+        if let Some(key) = index.find_key_by_name(name) {
+            if let Err(e) = index.remove(key) {
+                warn!(
+                    qualified_name = %name,
+                    error = %e,
+                    "incremental_reindex: failed to remove vector; skipping"
+                );
+                stats.errors += 1;
+            } else {
+                stats.removed += 1;
+            }
+        }
+        // If not in index, nothing to do — not an error.
+    }
+
+    // ---- 2. Resolve (scope, name) pairs for upserts -------------------------
+    // Each qualified name is "global/foo" or "projects/<project>/foo".
+    // parse_qualified_name handles both forms.
+    let mut pairs: Vec<(Scope, String, String)> = Vec::new(); // (scope, name, qualified_name)
+    for qualified in &changes.upserted {
+        match parse_qualified_name(qualified) {
+            Ok((scope, name)) => pairs.push((scope, name, qualified.clone())),
+            Err(e) => {
+                warn!(
+                    qualified_name = %qualified,
+                    error = %e,
+                    "incremental_reindex: cannot parse qualified name; skipping"
+                );
+                stats.errors += 1;
+            }
+        }
+    }
+
+    // ---- 3. Read memories from disk -----------------------------------------
+    // (qualified_name, content, old_key_if_exists)
+    let mut to_embed: Vec<(String, String, Option<u64>)> = Vec::new();
+    for (scope, name, qualified) in &pairs {
+        let old_key = index.find_key_by_name(qualified);
+        let memory = match repo.read_memory(name, scope).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    qualified_name = %qualified,
+                    error = %e,
+                    "incremental_reindex: failed to read memory; skipping"
+                );
+                stats.errors += 1;
+                continue;
+            }
+        };
+        to_embed.push((qualified.clone(), memory.content, old_key));
+    }
+
+    if to_embed.is_empty() {
+        return stats;
+    }
+
+    // ---- 4. Batch embed all content -----------------------------------------
+    let contents: Vec<String> = to_embed.iter().map(|(_, c, _)| c.clone()).collect();
+    let vectors = match embedding.embed(&contents).await {
+        Ok(v) => v,
+        Err(batch_err) => {
+            warn!(error = %batch_err, "incremental_reindex: batch embed failed; falling back to per-item");
+            let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(contents.len());
+            let mut failed: Vec<usize> = Vec::new();
+            for (i, content) in contents.iter().enumerate() {
+                match embedding.embed(std::slice::from_ref(content)).await {
+                    Ok(mut v) => vecs.push(v.remove(0)),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            qualified_name = %to_embed[i].0,
+                            "incremental_reindex: per-item embed failed; skipping"
+                        );
+                        failed.push(i);
+                        stats.errors += 1;
+                    }
+                }
+            }
+            // Remove failed items from to_embed in reverse order to preserve indices.
+            for &i in failed.iter().rev() {
+                to_embed.remove(i);
+            }
+            vecs
+        }
+    };
+
+    // ---- 5. Update index entries --------------------------------------------
+    for ((qualified_name, _, old_key), vector) in to_embed.iter().zip(vectors.iter()) {
+        let is_update = old_key.is_some();
+
+        // Add new entry first — if this fails, leave the old entry intact.
+        match index.add_with_next_key(vector, qualified_name.clone()) {
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    qualified_name = %qualified_name,
+                    error = %e,
+                    "incremental_reindex: add_with_next_key failed; skipping"
+                );
+                stats.errors += 1;
+                continue;
+            }
+        }
+
+        // Now remove the old entry (new one already in the index).
+        if let Some(key) = old_key {
+            if let Err(e) = index.remove(*key) {
+                warn!(
+                    qualified_name = %qualified_name,
+                    error = %e,
+                    "incremental_reindex: old vector removal failed; continuing"
+                );
+            }
+        }
+
+        if is_update {
+            stats.updated += 1;
+        } else {
+            stats.added += 1;
+        }
+    }
+
+    stats
+}
 
 #[tool_router]
 impl MemoryServer {
@@ -68,7 +219,7 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
-            let metadata = MemoryMetadata::new(scope.clone(), args.tags, args.source);
+            let metadata = MemoryMetadata::new(scope, args.tags, args.source);
             let memory = Memory::new(args.name, args.content, metadata);
 
             // Order: (1) embed, (2) add to index, (3) save to repo.
@@ -553,23 +704,66 @@ impl MemoryServer {
             // for local-only deployments that have no remote.
             let mut has_remote = true;
 
+            let mut reindex_stats: Option<ReindexStats> = None;
+
             let pull_status = if pull_first {
                 let result = state
                     .repo
                     .pull(&state.auth, branch)
                     .await
                     .map_err(ErrorData::from)?;
-                match &result {
+
+                let mut oid_range: Option<([u8; 20], [u8; 20])> = None;
+                let status = match result {
                     PullResult::NoRemote => {
                         has_remote = false;
                         "no-remote".to_string()
                     }
                     PullResult::UpToDate => "up-to-date".to_string(),
-                    PullResult::FastForward => "fast-forward".to_string(),
-                    PullResult::Merged { conflicts_resolved } => {
+                    PullResult::FastForward { old_head, new_head } => {
+                        oid_range = Some((old_head, new_head));
+                        "fast-forward".to_string()
+                    }
+                    PullResult::Merged {
+                        conflicts_resolved,
+                        old_head,
+                        new_head,
+                    } => {
+                        oid_range = Some((old_head, new_head));
                         format!("merged ({} conflicts resolved)", conflicts_resolved)
                     }
+                };
+
+                if let Some((old_head, new_head)) = oid_range {
+                    let repo = Arc::clone(&state.repo);
+                    let changes = tokio::task::spawn_blocking(move || {
+                        repo.diff_changed_memories(old_head, new_head)
+                    })
+                    .await
+                    .map_err(|e| MemoryError::Join(e.to_string()))
+                    .map_err(ErrorData::from)?
+                    .map_err(ErrorData::from)?;
+
+                    if !changes.is_empty() {
+                        let stats = incremental_reindex(
+                            &state.repo,
+                            &state.embedding,
+                            &state.index,
+                            &changes,
+                        )
+                        .await;
+                        info!(
+                            added = stats.added,
+                            updated = stats.updated,
+                            removed = stats.removed,
+                            errors = stats.errors,
+                            "incremental reindex complete"
+                        );
+                        reindex_stats = Some(stats);
+                    }
                 }
+
+                status
             } else {
                 "skipped".to_string()
             };
@@ -589,12 +783,22 @@ impl MemoryServer {
                 "sync complete"
             );
 
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "status": "sync complete",
                 "pull": pull_status,
                 "branch": branch,
-            })
-            .to_string())
+            });
+
+            if let Some(stats) = reindex_stats {
+                response["reindex"] = serde_json::json!({
+                    "added": stats.added,
+                    "updated": stats.updated,
+                    "removed": stats.removed,
+                    "errors": stats.errors,
+                });
+            }
+
+            Ok(response.to_string())
         }
         .instrument(span)
         .await

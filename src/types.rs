@@ -455,9 +455,49 @@ pub enum PullResult {
     /// The local branch was already up to date with the remote.
     UpToDate,
     /// The remote was ahead and the branch was fast-forwarded.
-    FastForward,
+    FastForward {
+        old_head: [u8; 20],
+        new_head: [u8; 20],
+    },
     /// A merge was performed; `conflicts_resolved` counts auto-resolved files.
-    Merged { conflicts_resolved: usize },
+    Merged {
+        conflicts_resolved: usize,
+        old_head: [u8; 20],
+        new_head: [u8; 20],
+    },
+}
+
+// ---------------------------------------------------------------------------
+// ChangedMemories
+// ---------------------------------------------------------------------------
+
+/// Memories that changed between two git commits.
+#[derive(Debug, Default)]
+pub struct ChangedMemories {
+    /// Qualified names (e.g. `"global/foo"`) that were added or modified.
+    pub upserted: Vec<String>,
+    /// Qualified names that were deleted.
+    pub removed: Vec<String>,
+}
+
+impl ChangedMemories {
+    /// Returns `true` if there are no changes.
+    pub fn is_empty(&self) -> bool {
+        self.upserted.is_empty() && self.removed.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReindexStats
+// ---------------------------------------------------------------------------
+
+/// Statistics from an incremental reindex operation.
+#[derive(Debug, Default)]
+pub struct ReindexStats {
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub errors: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -698,10 +738,13 @@ mod tests {
     #[test]
     fn validate_branch_name_rejects_invalid_chars() {
         for name in &[
-            "foo bar", "foo~bar", "foo^bar", "foo:bar", "foo?bar", "foo*bar", "foo[bar",
-            "foo\\bar",
+            "foo bar", "foo~bar", "foo^bar", "foo:bar", "foo?bar", "foo*bar", "foo[bar", "foo\\bar",
         ] {
-            assert!(validate_branch_name(name).is_err(), "should reject: {}", name);
+            assert!(
+                validate_branch_name(name).is_err(),
+                "should reject: {}",
+                name
+            );
         }
     }
 
