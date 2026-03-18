@@ -1,9 +1,15 @@
 # Stage 1: Build
-FROM rust:1.87-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
-RUN cargo build --release --features k8s
+# BuildKit cache mounts keep the cargo registry and compiled dependencies
+# across builds, so only changed crates are recompiled. The caches are not
+# part of the image — they persist on the builder between runs.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --features k8s && \
+    cp target/release/memory-mcp /usr/local/bin/memory-mcp
 
 # Stage 2: Model download
 # fastembed downloads models from HuggingFace into the cache directory on first
@@ -17,7 +23,7 @@ RUN cargo build --release --features k8s
 FROM debian:bookworm-slim AS model
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 app
-COPY --from=builder /build/target/release/memory-mcp /usr/local/bin/memory-mcp
+COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
 USER app
 ENV HOME=/home/app
 RUN /usr/local/bin/memory-mcp warmup
@@ -26,7 +32,7 @@ RUN /usr/local/bin/memory-mcp warmup
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git libdbus-1-3 && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 memory-mcp
-COPY --from=builder /build/target/release/memory-mcp /usr/local/bin/memory-mcp
+COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
 # Copy the pre-warmed model cache from the model stage.
 COPY --from=model /home/app/.cache/fastembed /home/memory-mcp/.cache/fastembed
 RUN chown -R memory-mcp:memory-mcp /home/memory-mcp/.cache

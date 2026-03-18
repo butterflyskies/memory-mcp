@@ -11,7 +11,7 @@ that takes several seconds to load. Container images must be self-contained and 
 Multi-stage Dockerfile: Rust builder stage compiles with `--features k8s`, a model stage
 downloads AllMiniLML6V2 at build time, and a minimal runtime stage combines both. A `warmup`
 subcommand pre-loads the embedding model so readiness probes pass quickly. `/healthz` endpoint
-for liveness/readiness checks. GitHub Actions builds and pushes to Harbor.
+for liveness/readiness checks. GitHub Actions builds and pushes to ghcr.io.
 
 ## Consequences
 - Container images are ~150-200MB (static binary + model weights)
