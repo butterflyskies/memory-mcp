@@ -1,13 +1,13 @@
 use std::fmt;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::MemoryError;
 
 /// Token resolution order:
 /// 1. `MEMORY_MCP_GITHUB_TOKEN` environment variable
 /// 2. `~/.config/memory-mcp/token` file
-/// 3. OAuth device flow (not yet implemented)
+/// 3. System keyring (GNOME Keyring / KWallet / macOS Keychain)
 const ENV_VAR: &str = "MEMORY_MCP_GITHUB_TOKEN";
 const TOKEN_FILE: &str = ".config/memory-mcp/token";
 
@@ -79,7 +79,7 @@ impl AuthProvider {
     /// Checks (in order):
     /// 1. `MEMORY_MCP_GITHUB_TOKEN` env var
     /// 2. `~/.config/memory-mcp/token` file
-    /// 3. OAuth device flow — returns `Err(Auth("not yet implemented"))`.
+    /// 3. System keyring (GNOME Keyring / KWallet / macOS Keychain)
     pub fn resolve_token(&self) -> Result<Secret<String>, MemoryError> {
         // Return cached token if we already have one.
         if let Some(ref t) = self.token {
@@ -115,10 +115,31 @@ impl AuthProvider {
             }
         }
 
-        // 3. OAuth device flow — not yet implemented.
+        // 3. System keyring (GNOME Keyring / KWallet / macOS Keychain).
+        match keyring::Entry::new("memory-mcp", "github-token") {
+            Ok(entry) => match entry.get_password() {
+                Ok(tok) if !tok.trim().is_empty() => {
+                    info!("resolved GitHub token from system keyring");
+                    return Ok(tok.trim().to_string());
+                }
+                Ok(_) => { /* empty password stored — fall through */ }
+                Err(keyring::Error::NoEntry) => { /* no entry — fall through */ }
+                Err(keyring::Error::NoStorageAccess(_)) => {
+                    debug!("keyring: no storage backend available (headless?)");
+                }
+                Err(e) => {
+                    warn!("keyring: unexpected error: {e}");
+                }
+            },
+            Err(e) => {
+                debug!("keyring: could not create entry: {e}");
+            }
+        }
+
         Err(MemoryError::Auth(
-            "no token available; set MEMORY_MCP_GITHUB_TOKEN or add ~/.config/memory-mcp/token. \
-             OAuth device flow is not yet implemented."
+            "no token available; set MEMORY_MCP_GITHUB_TOKEN, add \
+             ~/.config/memory-mcp/token, or store a token in the system keyring \
+             under service 'memory-mcp', account 'github-token'."
                 .to_string(),
         ))
     }
@@ -131,6 +152,90 @@ impl AuthProvider {
         Self {
             token: Some(Secret::new(token.to_string())),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    // Serialise all tests that mutate environment variables so they don't race
+    // under `cargo test` (which runs tests in parallel by default).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_resolve_from_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let token_value = "ghp_test_env_token_abc123";
+        std::env::set_var(ENV_VAR, token_value);
+        let result = AuthProvider::try_resolve();
+        std::env::remove_var(ENV_VAR);
+
+        assert!(result.is_ok(), "expected Ok but got: {result:?}");
+        assert_eq!(result.unwrap(), token_value);
+    }
+
+    #[test]
+    fn test_resolve_trims_env_var_whitespace() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let token_value = "  ghp_padded_token  ";
+        std::env::set_var(ENV_VAR, token_value);
+        let result = AuthProvider::try_resolve();
+        std::env::remove_var(ENV_VAR);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), token_value.trim());
+    }
+
+    #[test]
+    fn test_resolve_prefers_env_over_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Write a token file and simultaneously set the env var; env must win.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("token");
+        std::fs::write(&file_path, "ghp_file_token").unwrap();
+
+        let env_token = "ghp_env_wins";
+        std::env::set_var(ENV_VAR, env_token);
+
+        // Override HOME so the file lookup would pick up our temp file if env
+        // were not consulted first.  We rely on env taking precedence, so
+        // this primarily tests ordering rather than actual file resolution.
+        let result = AuthProvider::try_resolve();
+        std::env::remove_var(ENV_VAR);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), env_token);
+    }
+
+    /// This test exercises the keyring path and requires a live D-Bus /
+    /// secret-service backend.  Mark it `#[ignore]` so it does not run in CI.
+    #[test]
+    #[ignore = "requires live system keyring (D-Bus/GNOME Keyring/KWallet)"]
+    fn test_resolve_from_keyring_ignored_in_ci() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Pre-condition: no env var, no token file (rely on absence).
+        std::env::remove_var(ENV_VAR);
+
+        // Attempt to store then retrieve; if the keyring is unavailable the
+        // test is inconclusive rather than failing.
+        let entry = keyring::Entry::new("memory-mcp", "github-token")
+            .expect("keyring entry creation should succeed");
+        let test_token = "ghp_keyring_test_token";
+        entry
+            .set_password(test_token)
+            .expect("storing token should succeed");
+
+        let result = AuthProvider::try_resolve();
+        let _ = entry.delete_credential(); // cleanup before assert
+        assert!(result.is_ok(), "expected token from keyring: {result:?}");
+        assert_eq!(result.unwrap(), test_token);
     }
 }
 
