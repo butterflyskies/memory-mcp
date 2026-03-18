@@ -23,6 +23,7 @@ uuid = { version = "1", features = ["v4"] }
 schemars = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
 libc = "0.2"
+keyring = { version = "3", features = ["sync-secret-service"] }
 
 [dev-dependencies]
 tempfile = "3"
