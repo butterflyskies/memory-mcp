@@ -41,8 +41,19 @@ jobs:
       - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo nextest run --workspace --no-fail-fast --features k8s
 
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: taiki-e/install-action@94a7388bec5d4c8dd93e3ebf09e0ff448f3f6f4d # v2.68.35
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
   build:
-    needs: test
+    needs: [test, audit]
     runs-on: ubuntu-latest
     permissions:
       contents: read
