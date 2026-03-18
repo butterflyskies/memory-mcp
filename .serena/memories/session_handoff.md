@@ -2,17 +2,23 @@
 
 ## Canonical tracking
 - **TODO.md** in repo root — Phase 2 checklist with completion status
-- **butterflyskies/tasks#80** — tracking issue with PR links and status comments
+- **butterflyskies/tasks#80** — tracking issue with PR links and status comments (keep reopening — auto-closes on PR merge)
 
 ## Current state
-On `main`, all merged PRs up to date. Active work: keyring-based token storage (ADR-0010).
+On `main`, all Phase 2 work through auth subcommand merged (PRs #1–#10).
 
-## What's in flight
-- `/develop` workflow for keyring token storage — plan approved, ready for Phase 2 (implement)
-- Plan: add `keyring` crate, insert as step 3 in auth resolution chain (env → file → keyring → error), add `--set-token` CLI flag, tests
+## What's next
+- `--store k8s-secret` backend (cargo feature-gated)
+- Extract GitHub OAuth client ID from hardcoded const into config file/module (follow-up on tasks#80)
+- Integration tests for `auth login`, `auth status`, `MEMORY_MCP_BIND` env var (follow-up on tasks#80)
+- Migration tools (Serena global, Serena project, Claude Code auto-memories)
+- Configure as MCP server in `~/.claude.json`
+- K8s deployment: Cilium Gateway API, StepClusterIssuer certs
 
 ## Context worth preserving
-- Review cycles consistently take 2 passes (initial + re-review after fixes)
-- Pre-flight checklist added to develop skill (claude-skills PR #9) — watch if it reduces review cycles
-- IDE diagnostics are frequently stale — always verify with `cargo check`, not IDE
-- `capture_head_oid` is used in fast_forward but intentionally NOT in merge_with_remote (defensive: merge path should error on unborn HEAD, not silently sentinel)
+- Review cycles take 2-3 passes — pre-flight checklist helped but P3s still emerge
+- IDE diagnostics are frequently stale — always verify with `cargo check`
+- `capture_head_oid` used in fast_forward but NOT in merge_with_remote (defensive)
+- User strongly prefers no tech debt, even P3-level findings get fixed
+- Never amend commits — always add new commits on top
+- Never silently fall back to plaintext file storage for credentials
