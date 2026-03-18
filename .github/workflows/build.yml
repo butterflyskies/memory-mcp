@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: {}
 
@@ -53,7 +53,7 @@ jobs:
           curl -fsSL "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.1/cargo-audit-x86_64-unknown-linux-musl-v0.22.1.tgz" \
             -o /tmp/cargo-audit.tar.gz
           echo "c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab  /tmp/cargo-audit.tar.gz" | sha256sum -c -
-          tar xzf /tmp/cargo-audit.tar.gz -C /usr/local/bin
+          tar xzf /tmp/cargo-audit.tar.gz -C /usr/local/bin --strip-components=1
       - run: cargo audit
 
   build:
