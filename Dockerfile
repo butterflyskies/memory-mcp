@@ -1,5 +1,7 @@
 # Stage 1: Build
-FROM rust:bookworm AS builder
+# Trixie (not Bookworm) required: ort_sys ships pre-built ONNX Runtime binaries
+# linked against glibc ≥2.38 (__isoc23_strtoll etc.). Bookworm has glibc 2.36.
+FROM rust:trixie AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
@@ -20,7 +22,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # We run as a dedicated non-root user (app, uid 1000) to avoid writing model
 # files under /root. XDG_CACHE_HOME is pinned to /home/app/.cache so the
 # cache path is deterministic regardless of the default HOME resolution.
-FROM debian:bookworm-slim AS model
+FROM debian:trixie-slim AS model
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 app
 COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
@@ -29,7 +31,7 @@ ENV HOME=/home/app
 RUN /usr/local/bin/memory-mcp warmup
 
 # Stage 3: Runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git libdbus-1-3 && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 memory-mcp
 COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
