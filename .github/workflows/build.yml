@@ -22,11 +22,14 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@94a7388bec5d4c8dd93e3ebf09e0ff448f3f6f4d # v2.68.35
+        with:
+          tool: cargo-nextest
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo clippy --workspace --features k8s -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo test --workspace --features k8s
+      - run: cargo nextest run --workspace
+      - run: cargo nextest run --workspace --features k8s
 
   build:
     needs: test
