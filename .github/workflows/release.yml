@@ -51,15 +51,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "Waiting for CI workflow on ${{ github.sha }}..."
-          for attempt in 1 2 3 4 5; do
+          for attempt in $(seq 1 20); do
             run_id=$(gh run list --repo "${{ github.repository }}" --workflow=build.yml \
               --commit="${{ github.sha }}" --limit=1 --json databaseId -q '.[0].databaseId')
             [ -n "$run_id" ] && break
-            echo "CI run not found yet, retrying in 15s (attempt $attempt/5)..."
-            sleep 15
+            echo "CI run not found yet, retrying in 30s (attempt $attempt/20)..."
+            sleep 30
           done
           if [ -z "$run_id" ]; then
-            echo "::error::CI run not found for ${{ github.sha }} after 75s"
+            echo "::error::CI run not found for ${{ github.sha }} after 10 minutes"
             exit 1
           fi
           echo "Found CI run $run_id, watching..."
