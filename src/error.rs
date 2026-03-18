@@ -24,7 +24,7 @@ pub enum MemoryError {
     Auth(String),
 
     #[error("oauth error: {0}")]
-    OAuthError(String),
+    OAuth(String),
 
     #[error("token storage error: {0}")]
     TokenStorage(String),

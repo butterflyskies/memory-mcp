@@ -36,6 +36,7 @@ impl<T> Secret<T> {
     }
 
     /// Consume the wrapper and return the inner value.
+    #[allow(dead_code)] // API surface for future callers needing to unwrap secrets
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -245,7 +246,7 @@ pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), Memory
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| MemoryError::OAuthError(format!("failed to build HTTP client: {e}")))?;
+        .map_err(|e| MemoryError::OAuth(format!("failed to build HTTP client: {e}")))?;
 
     // Step 1: Request a device code.
     let device_resp = client
@@ -255,20 +256,20 @@ pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), Memory
         .send()
         .await
         .map_err(|e| {
-            MemoryError::OAuthError(format!(
+            MemoryError::OAuth(format!(
                 "failed to contact GitHub device code endpoint: {e}"
             ))
         })?
         .error_for_status()
-        .map_err(|e| MemoryError::OAuthError(format!("GitHub device code request failed: {e}")))?
+        .map_err(|e| MemoryError::OAuth(format!("GitHub device code request failed: {e}")))?
         .json::<DeviceCodeResponse>()
         .await
-        .map_err(|e| {
-            MemoryError::OAuthError(format!("failed to parse device code response: {e}"))
-        })?;
+        .map_err(|e| MemoryError::OAuth(format!("failed to parse device code response: {e}")))?;
 
-    // Compute overall deadline from expires_in.
-    let deadline = Instant::now() + Duration::from_secs(device_resp.expires_in);
+    // Compute overall deadline from expires_in, capped at 30 minutes to guard
+    // against a compromised response setting an excessively long expiry.
+    let expires_in = device_resp.expires_in.min(1800);
+    let deadline = Instant::now() + Duration::from_secs(expires_in);
 
     // Step 2: Display instructions to the user.
     eprintln!();
@@ -281,12 +282,11 @@ pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), Memory
     eprintln!("  Waiting for authorization...");
 
     // Step 3: Poll for the access token.
-    let mut poll_interval = device_resp.interval;
+    let mut poll_interval = device_resp.interval.clamp(1, 30);
     let token = loop {
         if Instant::now() >= deadline {
-            return Err(MemoryError::OAuthError(format!(
-                "Device code expired after {} seconds",
-                device_resp.expires_in
+            return Err(MemoryError::OAuth(format!(
+                "Device code expired after {expires_in} seconds"
             )));
         }
 
@@ -302,16 +302,14 @@ pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), Memory
             ])
             .send()
             .await
-            .map_err(|e| {
-                MemoryError::OAuthError(format!("polling GitHub token endpoint failed: {e}"))
-            })?
+            .map_err(|e| MemoryError::OAuth(format!("polling GitHub token endpoint failed: {e}")))?
             .error_for_status()
             .map_err(|e| {
-                MemoryError::OAuthError(format!("GitHub token request returned error status: {e}"))
+                MemoryError::OAuth(format!("GitHub token request returned error status: {e}"))
             })?
             .json::<AccessTokenResponse>()
             .await
-            .map_err(|e| MemoryError::OAuthError(format!("failed to parse token response: {e}")))?;
+            .map_err(|e| MemoryError::OAuth(format!("failed to parse token response: {e}")))?;
 
         if let Some(tok) = resp.access_token.filter(|t| !t.trim().is_empty()) {
             break tok;
@@ -323,17 +321,17 @@ pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), Memory
                 continue;
             }
             Some("slow_down") => {
-                // GitHub asked us to back off; add 5 s to interval.
-                poll_interval += 5;
+                // GitHub asked us to back off; add 5 s to interval, capped at 60 s.
+                poll_interval = (poll_interval + 5).min(60);
                 continue;
             }
             Some("expired_token") => {
-                return Err(MemoryError::OAuthError(
+                return Err(MemoryError::OAuth(
                     "device code expired; please run `memory-mcp auth login` again".to_string(),
                 ));
             }
             Some("access_denied") => {
-                return Err(MemoryError::OAuthError(
+                return Err(MemoryError::OAuth(
                     "authorization denied by user".to_string(),
                 ));
             }
@@ -342,12 +340,12 @@ pub async fn device_flow_login(store: Option<StoreBackend>) -> Result<(), Memory
                     .error_description
                     .as_deref()
                     .unwrap_or("no description");
-                return Err(MemoryError::OAuthError(format!(
+                return Err(MemoryError::OAuth(format!(
                     "unexpected OAuth error '{other}': {desc}"
                 )));
             }
             None => {
-                return Err(MemoryError::OAuthError(
+                return Err(MemoryError::OAuth(
                     "GitHub returned neither an access_token nor an error field; \
                      unexpected response"
                         .to_string(),
