@@ -30,6 +30,67 @@ fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Return the current HEAD commit OID as a 20-byte array.
+///
+/// Returns `[0u8; 20]` as a sentinel when the branch is unborn (no commits yet).
+fn capture_head_oid(repo: &git2::Repository) -> Result<[u8; 20], MemoryError> {
+    match repo.head() {
+        Ok(h) => {
+            let oid = h.peel_to_commit()?.id();
+            let mut buf = [0u8; 20];
+            buf.copy_from_slice(oid.as_bytes());
+            Ok(buf)
+        }
+        // Unborn branch — use zero OID as sentinel.
+        Err(e) if e.code() == ErrorCode::UnbornBranch || e.code() == ErrorCode::NotFound => {
+            Ok([0u8; 20])
+        }
+        Err(e) => Err(MemoryError::Git(e)),
+    }
+}
+
+/// Perform a fast-forward of `fetch_commit` into `branch`.
+///
+/// Captures the old HEAD OID (zero sentinel if unborn), advances the branch
+/// ref, sets HEAD, and force-checks out the new tree.
+fn fast_forward(
+    repo: &git2::Repository,
+    fetch_commit: &git2::AnnotatedCommit,
+    branch: &str,
+) -> Result<PullResult, MemoryError> {
+    let old_head = capture_head_oid(repo)?;
+
+    let refname = format!("refs/heads/{branch}");
+    let target_oid = fetch_commit.id();
+
+    match repo.find_reference(&refname) {
+        Ok(mut reference) => {
+            reference.set_target(target_oid, &format!("pull: fast-forward to {}", target_oid))?;
+        }
+        Err(e) if e.code() == ErrorCode::NotFound => {
+            // Branch doesn't exist locally yet — create it.
+            repo.reference(
+                &refname,
+                target_oid,
+                true,
+                &format!("pull: create branch {} from fetch", branch),
+            )?;
+        }
+        Err(e) => return Err(MemoryError::Git(e)),
+    }
+
+    repo.set_head(&refname)?;
+    let mut checkout = CheckoutBuilder::default();
+    checkout.force();
+    repo.checkout_head(Some(&mut checkout))?;
+
+    let mut new_head = [0u8; 20];
+    new_head.copy_from_slice(target_oid.as_bytes());
+
+    info!("pull: fast-forwarded to {}", target_oid);
+    Ok(PullResult::FastForward { old_head, new_head })
+}
+
 /// Build a `RemoteCallbacks` that authenticates with the given token.
 ///
 /// The callbacks live for `'static` because the token is moved in.
@@ -388,6 +449,77 @@ impl MemoryRepo {
         .map_err(|e| MemoryError::Join(e.to_string()))?
     }
 
+    /// Perform a normal (non-fast-forward) merge of `fetch_commit` into HEAD.
+    ///
+    /// Resolves any conflicts using recency-based auto-resolution, creates the
+    /// merge commit, and cleans up MERGE state.
+    fn merge_with_remote(
+        &self,
+        repo: &git2::Repository,
+        fetch_commit: &git2::AnnotatedCommit,
+        branch: &str,
+    ) -> Result<PullResult, MemoryError> {
+        // Capture old HEAD before the merge commit.
+        // At this point we know HEAD exists (merge analysis succeeded).
+        let oid = repo.head()?.peel_to_commit()?.id();
+        let mut old_head = [0u8; 20];
+        old_head.copy_from_slice(oid.as_bytes());
+
+        let mut merge_opts = MergeOptions::new();
+        merge_opts.fail_on_conflict(false);
+        repo.merge(&[fetch_commit], Some(&mut merge_opts), None)?;
+
+        let mut index = repo.index()?;
+        let conflicts_resolved = if index.has_conflicts() {
+            self.resolve_conflicts_by_recency(repo, &mut index)?
+        } else {
+            0
+        };
+
+        // Safety check: if any conflicts remain after auto-resolution,
+        // clean up the MERGE state and surface a clear error rather than
+        // letting write_tree() fail with an opaque message.
+        if index.has_conflicts() {
+            let _ = repo.cleanup_state();
+            return Err(MemoryError::Internal(
+                "unresolved conflicts remain after auto-resolution".into(),
+            ));
+        }
+
+        // Write the merged tree and create the merge commit.
+        index.write()?;
+        let tree_oid = index.write_tree()?;
+        let tree = repo.find_tree(tree_oid)?;
+        let sig = self.signature(repo)?;
+
+        let head_commit = repo.head()?.peel_to_commit()?;
+        let fetch_commit_obj = repo.find_commit(fetch_commit.id())?;
+
+        let new_commit_oid = repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &format!("chore: merge origin/{}", branch),
+            &tree,
+            &[&head_commit, &fetch_commit_obj],
+        )?;
+
+        repo.cleanup_state()?;
+
+        let mut new_head = [0u8; 20];
+        new_head.copy_from_slice(new_commit_oid.as_bytes());
+
+        info!(
+            "pull: merge complete ({} conflicts auto-resolved)",
+            conflicts_resolved
+        );
+        Ok(PullResult::Merged {
+            conflicts_resolved,
+            old_head,
+            new_head,
+        })
+    }
+
     /// Pull from `origin/<branch>` and merge into the current HEAD.
     ///
     /// Uses a recency-based auto-resolution strategy for conflicts: the version
@@ -466,121 +598,10 @@ impl MemoryRepo {
             }
 
             if analysis.is_fast_forward() {
-                // Capture old HEAD before the fast-forward.
-                let old_head: [u8; 20] = match repo.head() {
-                    Ok(h) => {
-                        let oid = h.peel_to_commit()?.id();
-                        let mut buf = [0u8; 20];
-                        buf.copy_from_slice(oid.as_bytes());
-                        buf
-                    }
-                    // Unborn branch — use zero OID as sentinel.
-                    Err(e)
-                        if e.code() == ErrorCode::UnbornBranch
-                            || e.code() == ErrorCode::NotFound =>
-                    {
-                        [0u8; 20]
-                    }
-                    Err(e) => return Err(MemoryError::Git(e)),
-                };
-
-                // Fast-forward: update the branch ref and checkout.
-                let refname = format!("refs/heads/{branch}");
-                let target_oid = fetch_commit.id();
-
-                match repo.find_reference(&refname) {
-                    Ok(mut reference) => {
-                        reference.set_target(
-                            target_oid,
-                            &format!("pull: fast-forward to {}", target_oid),
-                        )?;
-                    }
-                    Err(e) if e.code() == ErrorCode::NotFound => {
-                        // Branch doesn't exist locally yet — create it.
-                        repo.reference(
-                            &refname,
-                            target_oid,
-                            true,
-                            &format!("pull: create branch {} from fetch", branch),
-                        )?;
-                    }
-                    Err(e) => return Err(MemoryError::Git(e)),
-                }
-
-                repo.set_head(&refname)?;
-                let mut checkout = CheckoutBuilder::default();
-                checkout.force();
-                repo.checkout_head(Some(&mut checkout))?;
-
-                let mut new_head = [0u8; 20];
-                new_head.copy_from_slice(target_oid.as_bytes());
-
-                info!("pull: fast-forwarded to {}", target_oid);
-                return Ok(PullResult::FastForward { old_head, new_head });
+                return fast_forward(&repo, &fetch_commit, &branch);
             }
 
-            // ---- 5. Normal merge ------------------------------------------------
-            // Capture old HEAD before the merge commit.
-            let old_head: [u8; 20] = {
-                let oid = repo.head()?.peel_to_commit()?.id();
-                let mut buf = [0u8; 20];
-                buf.copy_from_slice(oid.as_bytes());
-                buf
-            };
-
-            let mut merge_opts = MergeOptions::new();
-            merge_opts.fail_on_conflict(false);
-            repo.merge(&[&fetch_commit], Some(&mut merge_opts), None)?;
-
-            let mut index = repo.index()?;
-            let conflicts_resolved = if index.has_conflicts() {
-                arc.resolve_conflicts_by_recency(&repo, &mut index)?
-            } else {
-                0
-            };
-
-            // Safety check: if any conflicts remain after auto-resolution,
-            // clean up the MERGE state and surface a clear error rather than
-            // letting write_tree() fail with an opaque message.
-            if index.has_conflicts() {
-                let _ = repo.cleanup_state();
-                return Err(MemoryError::Internal(
-                    "unresolved conflicts remain after auto-resolution".into(),
-                ));
-            }
-
-            // Write the merged tree and create the merge commit.
-            index.write()?;
-            let tree_oid = index.write_tree()?;
-            let tree = repo.find_tree(tree_oid)?;
-            let sig = arc.signature(&repo)?;
-
-            let head_commit = repo.head()?.peel_to_commit()?;
-            let fetch_commit_obj = repo.find_commit(fetch_commit.id())?;
-
-            let new_commit_oid = repo.commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                &format!("chore: merge origin/{}", branch),
-                &tree,
-                &[&head_commit, &fetch_commit_obj],
-            )?;
-
-            repo.cleanup_state()?;
-
-            let mut new_head = [0u8; 20];
-            new_head.copy_from_slice(new_commit_oid.as_bytes());
-
-            info!(
-                "pull: merge complete ({} conflicts auto-resolved)",
-                conflicts_resolved
-            );
-            Ok(PullResult::Merged {
-                conflicts_resolved,
-                old_head,
-                new_head,
-            })
+            arc.merge_with_remote(&repo, &fetch_commit, &branch)
         })
         .await
         .map_err(|e| MemoryError::Join(e.to_string()))?
