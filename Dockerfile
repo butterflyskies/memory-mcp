@@ -14,20 +14,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/memory-mcp /usr/local/bin/memory-mcp
 
 # Stage 2: Model download
-# fastembed downloads models from HuggingFace into the cache directory on first
+# fastembed downloads models from HuggingFace into its cache directory on first
 # use. We pre-download by running "warmup" in this stage so the runtime image
 # ships with the model already on disk — no internet access required at pod
 # startup, and cold-start latency is eliminated.
 #
-# We run as a dedicated non-root user (app, uid 1000) to avoid writing model
-# files under /root. XDG_CACHE_HOME is pinned to /home/app/.cache so the
-# cache path is deterministic regardless of the default HOME resolution.
+# FASTEMBED_CACHE_DIR must be set to an absolute path — fastembed defaults to
+# `.fastembed_cache` relative to CWD, which fails when CWD is not writable.
 FROM debian:trixie-slim AS model
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libdbus-1-3 && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 app
 COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
 USER app
-ENV HOME=/home/app
+ENV FASTEMBED_CACHE_DIR=/home/app/.cache/fastembed
 RUN /usr/local/bin/memory-mcp warmup
 
 # Stage 3: Runtime
@@ -42,9 +41,9 @@ USER memory-mcp
 WORKDIR /home/memory-mcp
 ENV MEMORY_MCP_BIND=0.0.0.0:8080
 ENV MEMORY_MCP_REPO_PATH=/data/repo
-# Explicitly pin XDG_CACHE_HOME so fastembed always resolves to the same path
-# regardless of HOME or XDG defaults in the base image.
-ENV XDG_CACHE_HOME=/home/memory-mcp/.cache
+# Pin FASTEMBED_CACHE_DIR to the same absolute path used in the model stage,
+# so fastembed finds the pre-warmed model files regardless of CWD.
+ENV FASTEMBED_CACHE_DIR=/home/memory-mcp/.cache/fastembed
 EXPOSE 8080
 ENTRYPOINT ["memory-mcp"]
 CMD ["serve"]
