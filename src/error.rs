@@ -23,6 +23,12 @@ pub enum MemoryError {
     #[error("auth error: {0}")]
     Auth(String),
 
+    #[error("oauth error: {0}")]
+    OAuth(String),
+
+    #[error("token storage error: {0}")]
+    TokenStorage(String),
+
     #[error("yaml error: {0}")]
     Yaml(#[from] serde_yaml::Error),
 
