@@ -1,0 +1,50 @@
+name: Lint PR Title
+
+# NOTE: Using `pull_request` (not `pull_request_target`) deliberately.
+# pull_request_target runs in the base branch context with base-repo secrets,
+# which is a privilege escalation footgun — if anyone later adds a checkout step,
+# fork PRs would execute attacker-controlled code with repo-scoped tokens.
+# This action only reads the PR title from the event payload, so `pull_request`
+# is sufficient and inherently safe.
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@e32d7e603df1aa1ba07e981f2a23455dee596825 # v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Require conventional commit prefix in PR title.
+          # Major bumps: use ! suffix (e.g., "feat!: breaking change")
+          #
+          # COUPLING: release-please generates PR titles like "chore(main): release X.Y.Z".
+          # `chore` must remain in this list and `requireScope` must stay false, or
+          # release-please PRs will be blocked by this check.
+          types: |
+            feat
+            fix
+            chore
+            docs
+            refactor
+            revert
+            test
+            ci
+            perf
+            build
+          requireScope: false
+          # Squash-merge means PR title = commit message on main.
+          # This ensures release-please can parse all commits.
+          #
+          # Reject angle brackets to prevent HTML/markdown injection in
+          # auto-generated changelogs. GitHub sanitizes release bodies, so this
+          # is cosmetic protection against broken formatting, not XSS.
+          subjectPattern: ^[^<>]+$
+          subjectPatternError: "PR title must not be empty after the type prefix and must not contain < or > characters."
