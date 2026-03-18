@@ -28,8 +28,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo clippy --workspace --features k8s -- -D warnings
-      - run: cargo nextest run --workspace
-      - run: cargo nextest run --workspace --features k8s
+      - run: cargo nextest run --workspace --no-fail-fast
+      - run: cargo nextest run --workspace --no-fail-fast --features k8s
 
   build:
     needs: test
