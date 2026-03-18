@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:1.88-bookworm AS builder
+FROM rust:bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
