@@ -62,8 +62,9 @@ jobs:
             echo "::error::CI run not found for ${{ github.sha }} after 10 minutes"
             exit 1
           fi
-          echo "Found CI run $run_id, watching..."
-          gh run watch "$run_id" --repo "${{ github.repository }}" --exit-status
+          echo "Found CI run $run_id, waiting for completion..."
+          gh run watch "$run_id" --repo "${{ github.repository }}" --exit-status > /dev/null
+          echo "CI run $run_id passed."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
