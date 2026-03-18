@@ -1,14 +1,14 @@
-name: Build & Push
+name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 permissions: {}
@@ -26,15 +26,13 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1 (stable)
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          cache-on-failure: true
       - uses: taiki-e/install-action@94a7388bec5d4c8dd93e3ebf09e0ff448f3f6f4d # v2.68.35
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.131
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo clippy --workspace --features k8s -- -D warnings
@@ -49,7 +47,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: taiki-e/install-action@94a7388bec5d4c8dd93e3ebf09e0ff448f3f6f4d # v2.68.35
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.1
       - run: cargo audit
 
   build:
@@ -58,7 +56,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      attestations: write
       id-token: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -75,13 +72,12 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
             type=sha,prefix=sha-,format=long
             type=raw,value=latest,enable={{is_default_branch}}
       - uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
-          push: ${{ github.event_name == 'push' }}
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: true
