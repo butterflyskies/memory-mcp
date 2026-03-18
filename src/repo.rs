@@ -122,7 +122,9 @@ impl MemoryRepo {
         let repo = if path.join(".git").exists() {
             Repository::open(path)?
         } else {
-            let repo = Repository::init(path)?;
+            let mut opts = git2::RepositoryInitOptions::new();
+            opts.initial_head("main");
+            let repo = Repository::init_opts(path, &opts)?;
             // Write a .gitignore so the vector index is never committed.
             let gitignore = path.join(".gitignore");
             if !gitignore.exists() {
