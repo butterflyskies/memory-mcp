@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # files under /root. XDG_CACHE_HOME is pinned to /home/app/.cache so the
 # cache path is deterministic regardless of the default HOME resolution.
 FROM debian:trixie-slim AS model
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libdbus-1-3 && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 app
 COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
 USER app
