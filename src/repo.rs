@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::{
     auth::AuthProvider,
     error::MemoryError,
-    types::{validate_name, Memory, PullResult, Scope},
+    types::{validate_name, ChangedMemories, Memory, PullResult, Scope},
 };
 
 // ---------------------------------------------------------------------------
@@ -466,6 +466,24 @@ impl MemoryRepo {
             }
 
             if analysis.is_fast_forward() {
+                // Capture old HEAD before the fast-forward.
+                let old_head: [u8; 20] = match repo.head() {
+                    Ok(h) => {
+                        let oid = h.peel_to_commit()?.id();
+                        let mut buf = [0u8; 20];
+                        buf.copy_from_slice(oid.as_bytes());
+                        buf
+                    }
+                    // Unborn branch — use zero OID as sentinel.
+                    Err(e)
+                        if e.code() == ErrorCode::UnbornBranch
+                            || e.code() == ErrorCode::NotFound =>
+                    {
+                        [0u8; 20]
+                    }
+                    Err(e) => return Err(MemoryError::Git(e)),
+                };
+
                 // Fast-forward: update the branch ref and checkout.
                 let refname = format!("refs/heads/{branch}");
                 let target_oid = fetch_commit.id();
@@ -493,11 +511,23 @@ impl MemoryRepo {
                 let mut checkout = CheckoutBuilder::default();
                 checkout.force();
                 repo.checkout_head(Some(&mut checkout))?;
+
+                let mut new_head = [0u8; 20];
+                new_head.copy_from_slice(target_oid.as_bytes());
+
                 info!("pull: fast-forwarded to {}", target_oid);
-                return Ok(PullResult::FastForward);
+                return Ok(PullResult::FastForward { old_head, new_head });
             }
 
             // ---- 5. Normal merge ------------------------------------------------
+            // Capture old HEAD before the merge commit.
+            let old_head: [u8; 20] = {
+                let oid = repo.head()?.peel_to_commit()?.id();
+                let mut buf = [0u8; 20];
+                buf.copy_from_slice(oid.as_bytes());
+                buf
+            };
+
             let mut merge_opts = MergeOptions::new();
             merge_opts.fail_on_conflict(false);
             repo.merge(&[&fetch_commit], Some(&mut merge_opts), None)?;
@@ -528,7 +558,7 @@ impl MemoryRepo {
             let head_commit = repo.head()?.peel_to_commit()?;
             let fetch_commit_obj = repo.find_commit(fetch_commit.id())?;
 
-            repo.commit(
+            let new_commit_oid = repo.commit(
                 Some("HEAD"),
                 &sig,
                 &sig,
@@ -538,14 +568,118 @@ impl MemoryRepo {
             )?;
 
             repo.cleanup_state()?;
+
+            let mut new_head = [0u8; 20];
+            new_head.copy_from_slice(new_commit_oid.as_bytes());
+
             info!(
                 "pull: merge complete ({} conflicts auto-resolved)",
                 conflicts_resolved
             );
-            Ok(PullResult::Merged { conflicts_resolved })
+            Ok(PullResult::Merged {
+                conflicts_resolved,
+                old_head,
+                new_head,
+            })
         })
         .await
         .map_err(|e| MemoryError::Join(e.to_string()))?
+    }
+
+    /// Diff two commits and return the memory files that changed.
+    ///
+    /// Only `.md` files under `global/` or `projects/` are considered.
+    /// Added/modified files go into `upserted`; deleted files go into `removed`.
+    /// Qualified names are returned without the `.md` suffix (e.g. `"global/foo"`).
+    ///
+    /// Must be called from within `spawn_blocking` since it uses git2.
+    pub(crate) fn diff_changed_memories(
+        &self,
+        old_oid: [u8; 20],
+        new_oid: [u8; 20],
+    ) -> Result<ChangedMemories, MemoryError> {
+        let repo = self
+            .inner
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+
+        let new_git_oid = git2::Oid::from_bytes(&new_oid).map_err(MemoryError::Git)?;
+        let new_tree = repo.find_commit(new_git_oid)?.tree()?;
+
+        // A zero OID indicates an unborn branch (no prior commits). In that case,
+        // diff against an empty tree so all files appear as additions.
+        let diff = if old_oid == [0u8; 20] {
+            repo.diff_tree_to_tree(None, Some(&new_tree), None)?
+        } else {
+            let old_git_oid = git2::Oid::from_bytes(&old_oid).map_err(MemoryError::Git)?;
+            let old_tree = repo.find_commit(old_git_oid)?.tree()?;
+            repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)?
+        };
+
+        let mut changes = ChangedMemories::default();
+
+        diff.foreach(
+            &mut |delta, _progress| {
+                use git2::Delta;
+
+                let path = match delta.new_file().path().or_else(|| delta.old_file().path()) {
+                    Some(p) => p,
+                    None => return true,
+                };
+
+                let path_str = match path.to_str() {
+                    Some(s) => s,
+                    None => return true,
+                };
+
+                // Only care about .md files under global/ or projects/
+                if !path_str.ends_with(".md") {
+                    return true;
+                }
+                if !path_str.starts_with("global/") && !path_str.starts_with("projects/") {
+                    return true;
+                }
+
+                // Strip the .md suffix to get the qualified name.
+                let qualified = &path_str[..path_str.len() - 3];
+
+                match delta.status() {
+                    Delta::Added | Delta::Modified => {
+                        changes.upserted.push(qualified.to_string());
+                    }
+                    Delta::Renamed | Delta::Copied => {
+                        // For renames, the old path must be removed from the index
+                        // to avoid leaving a ghost vector behind.
+                        if matches!(delta.status(), Delta::Renamed) {
+                            if let Some(old_path) = delta.old_file().path().and_then(|p| p.to_str())
+                            {
+                                if old_path.ends_with(".md")
+                                    && (old_path.starts_with("global/")
+                                        || old_path.starts_with("projects/"))
+                                {
+                                    changes
+                                        .removed
+                                        .push(old_path[..old_path.len() - 3].to_string());
+                                }
+                            }
+                        }
+                        changes.upserted.push(qualified.to_string());
+                    }
+                    Delta::Deleted => {
+                        changes.removed.push(qualified.to_string());
+                    }
+                    _ => {}
+                }
+
+                true
+            },
+            None,
+            None,
+            None,
+        )
+        .map_err(MemoryError::Git)?;
+
+        Ok(changes)
     }
 
     // -----------------------------------------------------------------------
@@ -648,27 +782,23 @@ impl MemoryRepo {
                             "ours (timestamp unparseable)".to_string(),
                         ),
                     },
-                    (Some(ours), None) => {
-                        (ours.as_bytes().to_vec(), "ours (theirs missing)".to_string())
-                    }
+                    (Some(ours), None) => (
+                        ours.as_bytes().to_vec(),
+                        "ours (theirs missing)".to_string(),
+                    ),
                     (None, Some(theirs)) => (
                         theirs.as_bytes().to_vec(),
                         "theirs (ours missing)".to_string(),
                     ),
                     (None, None) => {
                         // Both UTF-8 conversions failed — fall back to raw blob bytes.
-                        match (
-                            info.our_blob.as_deref(),
-                            info.their_blob.as_deref(),
-                        ) {
-                            (Some(ours), _) => (
-                                ours.to_vec(),
-                                "ours (binary/non-UTF-8)".to_string(),
-                            ),
-                            (_, Some(theirs)) => (
-                                theirs.to_vec(),
-                                "theirs (binary/non-UTF-8)".to_string(),
-                            ),
+                        match (info.our_blob.as_deref(), info.their_blob.as_deref()) {
+                            (Some(ours), _) => {
+                                (ours.to_vec(), "ours (binary/non-UTF-8)".to_string())
+                            }
+                            (_, Some(theirs)) => {
+                                (theirs.to_vec(), "theirs (binary/non-UTF-8)".to_string())
+                            }
                             (None, None) => {
                                 // Both blobs truly absent — remove the entry from
                                 // the index so write_tree() succeeds.
@@ -676,14 +806,14 @@ impl MemoryRepo {
                                     "conflict at '{}': both sides missing — removing from index",
                                     info.path.display()
                                 );
-                                let relative = info.path.strip_prefix(&self.root).map_err(
-                                    |e| MemoryError::InvalidInput {
+                                let relative = info.path.strip_prefix(&self.root).map_err(|e| {
+                                    MemoryError::InvalidInput {
                                         reason: format!(
                                             "path strip error during conflict resolution: {}",
                                             e
                                         ),
-                                    },
-                                )?;
+                                    }
+                                })?;
                                 index.conflict_remove(relative)?;
                                 resolved += 1;
                                 continue;
@@ -944,14 +1074,8 @@ mod tests {
         (dir, url)
     }
 
-    fn open_repo(
-        dir: &tempfile::TempDir,
-        remote_url: Option<&str>,
-    ) -> Arc<MemoryRepo> {
-        Arc::new(
-            MemoryRepo::init_or_open(dir.path(), remote_url)
-                .expect("failed to init repo"),
-        )
+    fn open_repo(dir: &tempfile::TempDir, remote_url: Option<&str>) -> Arc<MemoryRepo> {
+        Arc::new(MemoryRepo::init_or_open(dir.path(), remote_url).expect("failed to init repo"))
     }
 
     // -- redact_url tests --------------------------------------------------
@@ -994,7 +1118,13 @@ mod tests {
         let repo = MemoryRepo::init_or_open(dir.path(), None).unwrap();
         // Build a path that escapes the repo root. We need enough ".." to go
         // above the tmpdir, then descend into /tmp/evil.
-        let _evil = dir.path().join("..").join("..").join("..").join("tmp").join("evil.md");
+        let _evil = dir
+            .path()
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("tmp")
+            .join("evil.md");
         // Only assert if the path actually resolves outside root.
         // (If the temp dir is at root level, this might not escape — use an
         // explicit absolute path instead.)
@@ -1083,7 +1213,10 @@ mod tests {
 
         let result = repo_b.pull(&auth, "main").await.unwrap();
         assert!(
-            matches!(result, PullResult::FastForward | PullResult::Merged { .. }),
+            matches!(
+                result,
+                PullResult::FastForward { .. } | PullResult::Merged { .. }
+            ),
             "expected fast-forward or merge, got {:?}",
             result
         );
@@ -1140,7 +1273,7 @@ mod tests {
         let result = repo_a.pull(&auth, "main").await.unwrap();
 
         assert!(
-            matches!(result, PullResult::Merged { conflicts_resolved } if conflicts_resolved >= 1),
+            matches!(result, PullResult::Merged { conflicts_resolved, .. } if conflicts_resolved >= 1),
             "expected merge with conflicts resolved, got {:?}",
             result
         );
@@ -1184,7 +1317,7 @@ mod tests {
         let result = repo_a.pull(&auth, "main").await.unwrap();
 
         assert!(
-            matches!(result, PullResult::Merged { conflicts_resolved } if conflicts_resolved >= 1),
+            matches!(result, PullResult::Merged { conflicts_resolved, .. } if conflicts_resolved >= 1),
             "expected merge with conflicts resolved, got {:?}",
             result
         );
@@ -1227,12 +1360,176 @@ mod tests {
         let result = repo_a.pull(&auth, "main").await.unwrap();
 
         assert!(
-            matches!(result, PullResult::Merged { conflicts_resolved: 0 }),
+            matches!(
+                result,
+                PullResult::Merged {
+                    conflicts_resolved: 0,
+                    ..
+                }
+            ),
             "expected clean merge, got {:?}",
             result
         );
 
         // Both repos should have all files.
         assert!(dir_a.path().join("global").join("mem-b.md").exists());
+    }
+
+    // -- diff_changed_memories tests ----------------------------------------
+
+    /// Helper: commit a file with given content and return the new HEAD OID bytes.
+    fn commit_file(repo: &Arc<MemoryRepo>, rel_path: &str, content: &str) -> [u8; 20] {
+        let inner = repo.inner.lock().expect("lock poisoned");
+        let full_path = repo.root.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, content).unwrap();
+
+        let mut index = inner.index().unwrap();
+        index.add_path(std::path::Path::new(rel_path)).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = inner.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+
+        let oid = match inner.head() {
+            Ok(head) => {
+                let parent = head.peel_to_commit().unwrap();
+                inner
+                    .commit(Some("HEAD"), &sig, &sig, "test commit", &tree, &[&parent])
+                    .unwrap()
+            }
+            Err(_) => inner
+                .commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
+                .unwrap(),
+        };
+
+        let mut buf = [0u8; 20];
+        buf.copy_from_slice(oid.as_bytes());
+        buf
+    }
+
+    #[test]
+    fn diff_changed_memories_detects_added_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir, None);
+
+        // Capture the initial HEAD (init commit).
+        let old_oid = {
+            let inner = repo.inner.lock().unwrap();
+            let head = inner.head().unwrap();
+            let mut buf = [0u8; 20];
+            buf.copy_from_slice(head.peel_to_commit().unwrap().id().as_bytes());
+            buf
+        };
+
+        let new_oid = commit_file(&repo, "global/my-note.md", "# content");
+
+        let changes = repo.diff_changed_memories(old_oid, new_oid).unwrap();
+        assert_eq!(changes.upserted, vec!["global/my-note".to_string()]);
+        assert!(changes.removed.is_empty());
+    }
+
+    #[test]
+    fn diff_changed_memories_detects_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir, None);
+
+        let first_oid = commit_file(&repo, "global/to-delete.md", "hello");
+        let second_oid = {
+            let inner = repo.inner.lock().unwrap();
+            let full_path = dir.path().join("global/to-delete.md");
+            std::fs::remove_file(&full_path).unwrap();
+            let mut index = inner.index().unwrap();
+            index
+                .remove_path(std::path::Path::new("global/to-delete.md"))
+                .unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = inner.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("test", "test@test.com").unwrap();
+            let parent = inner.head().unwrap().peel_to_commit().unwrap();
+            let oid = inner
+                .commit(Some("HEAD"), &sig, &sig, "delete file", &tree, &[&parent])
+                .unwrap();
+            let mut buf = [0u8; 20];
+            buf.copy_from_slice(oid.as_bytes());
+            buf
+        };
+
+        let changes = repo.diff_changed_memories(first_oid, second_oid).unwrap();
+        assert!(changes.upserted.is_empty());
+        assert_eq!(changes.removed, vec!["global/to-delete".to_string()]);
+    }
+
+    #[test]
+    fn diff_changed_memories_ignores_non_md_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir, None);
+
+        let old_oid = {
+            let inner = repo.inner.lock().unwrap();
+            let mut buf = [0u8; 20];
+            buf.copy_from_slice(
+                inner
+                    .head()
+                    .unwrap()
+                    .peel_to_commit()
+                    .unwrap()
+                    .id()
+                    .as_bytes(),
+            );
+            buf
+        };
+
+        // Add a non-.md file under global/ and a .md file outside tracked dirs.
+        let _ = commit_file(&repo, "global/config.json", "{}");
+        let new_oid = commit_file(&repo, "other/note.md", "# ignored");
+
+        let changes = repo.diff_changed_memories(old_oid, new_oid).unwrap();
+        assert!(
+            changes.upserted.is_empty(),
+            "should ignore non-.md and out-of-scope files"
+        );
+        assert!(changes.removed.is_empty());
+    }
+
+    #[test]
+    fn diff_changed_memories_detects_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir, None);
+
+        let first_oid = commit_file(&repo, "projects/myproject/note.md", "version 1");
+        let second_oid = commit_file(&repo, "projects/myproject/note.md", "version 2");
+
+        let changes = repo.diff_changed_memories(first_oid, second_oid).unwrap();
+        assert_eq!(
+            changes.upserted,
+            vec!["projects/myproject/note".to_string()]
+        );
+        assert!(changes.removed.is_empty());
+    }
+
+    /// A zero OID (unborn branch sentinel) must not crash; all files in the
+    /// new commit should appear as additions.
+    #[test]
+    fn diff_changed_memories_zero_oid_treats_all_as_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir, None);
+
+        // Commit a global memory file — this is the "new" state.
+        let new_oid = commit_file(&repo, "global/first-memory.md", "# Hello");
+
+        // old_oid = [0u8; 20] simulates an unborn branch (no prior commit).
+        let old_oid = [0u8; 20];
+
+        let changes = repo.diff_changed_memories(old_oid, new_oid).unwrap();
+        assert_eq!(
+            changes.upserted,
+            vec!["global/first-memory".to_string()],
+            "zero OID: all new-tree files should be additions"
+        );
+        assert!(changes.removed.is_empty(), "zero OID: no removals expected");
     }
 }
