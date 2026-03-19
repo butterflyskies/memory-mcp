@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/butterflyskies/memory-mcp/compare/v0.1.4...v0.1.5) (2026-03-19)
+
+
+### Bug Fixes
+
+* vendor OpenSSL only on non-Linux platforms ([#45](https://github.com/butterflyskies/memory-mcp/issues/45)) ([6f3dc4f](https://github.com/butterflyskies/memory-mcp/commit/6f3dc4f370865a719310a53f625e2dcb093d979a))
+
 ## [0.1.4](https://github.com/butterflyskies/memory-mcp/compare/v0.1.3...v0.1.4) (2026-03-19)
 
 
