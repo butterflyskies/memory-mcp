@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.4](https://github.com/butterflyskies/memory-mcp/compare/v0.1.3...v0.1.4) (2026-03-19)
+
+
+### Bug Fixes
+
+* clean up orphaned release state and skip labeling ([#31](https://github.com/butterflyskies/memory-mcp/issues/31)) ([a684190](https://github.com/butterflyskies/memory-mcp/commit/a684190cc1d8f1d02e0d3f23bce85392542b8642))
+* move doc comment above #[cfg] so clap shows help for k8s-secret store ([#28](https://github.com/butterflyskies/memory-mcp/issues/28)) ([1967c6c](https://github.com/butterflyskies/memory-mcp/commit/1967c6ccad431115086313e8a5ca45862798804a))
+* use draft releases so binary assets can be uploaded before publish ([#26](https://github.com/butterflyskies/memory-mcp/issues/26)) ([76a3982](https://github.com/butterflyskies/memory-mcp/commit/76a39824f8efbecc48c71c07c3a6ca58286e2745))
+
 ## [0.1.3](https://github.com/butterflyskies/memory-mcp/compare/v0.1.2...v0.1.3) (2026-03-18)
 
 
