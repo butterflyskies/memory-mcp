@@ -42,6 +42,28 @@ jobs:
       - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo nextest run --workspace --no-fail-fast --features k8s
 
+  cross-compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: universal-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo check --features k8s
+
   audit:
     runs-on: ubuntu-latest
     permissions:
@@ -57,7 +79,7 @@ jobs:
       - run: cargo audit
 
   build:
-    needs: [test, audit]
+    needs: [test, audit, cross-compile]
     runs-on: ubuntu-latest
     permissions:
       contents: read
