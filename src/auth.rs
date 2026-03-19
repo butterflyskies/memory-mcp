@@ -67,8 +67,8 @@ pub enum StoreBackend {
     File,
     /// Print token to stdout and do not persist it.
     Stdout,
-    #[cfg(feature = "k8s")]
     /// Store token as a Kubernetes Secret.
+    #[cfg(feature = "k8s")]
     #[clap(name = "k8s-secret")]
     K8sSecret,
 }
