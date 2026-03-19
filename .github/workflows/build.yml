@@ -67,7 +67,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
-      - run: cargo check --features k8s
+      - run: cargo build --features k8s
 
   audit:
     runs-on: ubuntu-latest
