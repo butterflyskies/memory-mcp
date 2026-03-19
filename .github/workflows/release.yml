@@ -59,7 +59,7 @@ jobs:
           gh run watch "$run_id" --repo "${{ github.repository }}" --exit-status > /dev/null
           echo "CI run $run_id passed."
 
-  # Build and push a semver-tagged container image when a release is published.
+  # Build and push a semver-tagged container image.
   #
   # This runs in the same workflow as release-please because GITHUB_TOKEN events
   # don't trigger other workflows (anti-cascade rule).
@@ -141,3 +141,20 @@ jobs:
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: refs/tags/${{ needs.release-please.outputs.tag_name }}
+
+  # Undraft the release after all artifacts (image + binaries) are uploaded.
+  # release-please creates a draft so that immutable-release rules don't block
+  # asset uploads; this job flips the draft flag once everything is in place.
+  publish-release:
+    needs: [release-please, publish-image, publish-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ needs.release-please.outputs.tag_name }}" \
+            --draft=false \
+            --repo "${{ github.repository }}"
