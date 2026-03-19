@@ -111,9 +111,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             build-tool: cargo
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            build-tool: cargo
+          # Windows excluded until usearch supports it (see #42).
           - target: universal-apple-darwin
             os: macos-latest
             build-tool: cargo
@@ -138,7 +136,6 @@ jobs:
           features: k8s
           archive: memory-mcp-$tag-$target
           tar: all
-          zip: windows
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: refs/tags/${{ needs.release-please.outputs.tag_name }}

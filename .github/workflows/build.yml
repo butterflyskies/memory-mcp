@@ -42,13 +42,15 @@ jobs:
       - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo nextest run --workspace --no-fail-fast --features k8s
 
+  # Catch cross-platform compilation failures before they reach the release pipeline.
+  # Mirrors the release.yml publish-binaries matrix (minus Windows — see #42).
   cross-compile:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
           - target: universal-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
@@ -56,6 +58,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
         with:
           toolchain: stable
