@@ -29,9 +29,11 @@ Streamable HTTP only (no stdio, no SSE). Single binary serves both local dev and
 - **Dockerfile**: multi-stage (rust:trixie → model warmup → debian:trixie-slim runtime)
 - **Trixie required**: ort_sys (ONNX Runtime) needs glibc ≥2.38; Bookworm only has 2.36
 - **FASTEMBED_CACHE_DIR**: must be pinned to absolute path in Docker (defaults to CWD-relative `.fastembed_cache`)
-- **CI**: GitHub Actions — fmt, clippy, nextest, cargo audit, Docker build
+- **CI**: GitHub Actions — fmt, clippy, nextest, cargo audit, Docker build, cross-platform build (Linux + macOS)
+- **Cross-compile**: `cargo build --features k8s` on ubuntu-latest + macos-latest in PRs; Windows blocked by usearch (#42)
+- **OpenSSL**: vendored on non-Linux (macOS/Windows lack system headers); Linux uses system OpenSSL via pkg-config
 - **Attestations**: SLSA provenance + SBOM on every image push
-- **Release**: release-please with conventional commit enforcement (lint-pr workflow)
+- **Release**: release-please (draft → upload assets → undraft) with conventional commits, Node.js 24 opt-in
 
 ## Security
 - Process-wide umask 0o077, atomic token writes, no silent credential fallback
