@@ -25,6 +25,8 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - id: release
         uses: googleapis/release-please-action@8bb7a2ed0f90c9802c83129a9488d235a1f31a7c # main (2026-02-20, includes release-please 17.3.0 with force-tag-creation)
