@@ -6,7 +6,6 @@ license = "MIT OR Apache-2.0"
 
 [features]
 k8s = ["dep:kube", "dep:k8s-openapi"]
-legacy-fastembed = ["dep:fastembed"]
 
 [dependencies]
 rmcp = { version = "1.1", features = ["server", "macros", "transport-streamable-http-server"] }
@@ -39,7 +38,6 @@ tokenizers = "0.22"
 hf-hub = "0.4"
 
 # Optional dependencies gated behind features.
-fastembed = { version = "5", optional = true }
 kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls"], optional = true }
 k8s-openapi = { version = "0.27", features = ["v1_31"], optional = true }
 
