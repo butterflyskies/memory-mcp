@@ -83,8 +83,8 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
                 tracing::warn!("embedding mutex was poisoned — clearing poison and continuing");
                 poisoned.into_inner()
             });
-            catch_unwind(AssertUnwindSafe(|| embed_batch(&guard, &texts)))
-                .unwrap_or_else(|panic_payload| {
+            catch_unwind(AssertUnwindSafe(|| embed_batch(&guard, &texts))).unwrap_or_else(
+                |panic_payload| {
                     let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
                         (*s).to_string()
                     } else if let Some(s) = panic_payload.downcast_ref::<String>() {
@@ -95,7 +95,8 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
                     Err(MemoryError::Embedding(format!(
                         "embedding engine panicked: {msg}"
                     )))
-                })
+                },
+            )
         })
         .await
         .map_err(|e| MemoryError::Join(e.to_string()))?
