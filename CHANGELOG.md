@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/butterflyskies/memory-mcp/compare/v0.1.5...v0.2.0) (2026-03-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* Embedding vectors change when switching from fastembed to candle. The vector index (derived data) will need to be rebuilt on first launch — it is always rebuildable from the git repo.
+
+### Features
+
+* replace fastembed with candle direct for pure-Rust embeddings ([#51](https://github.com/butterflyskies/memory-mcp/issues/51)) ([13cde5a](https://github.com/butterflyskies/memory-mcp/commit/13cde5ab9a322eddee071f0279ed1ad5388752f9))
+
 ## [0.1.5](https://github.com/butterflyskies/memory-mcp/compare/v0.1.4...v0.1.5) (2026-03-19)
 
 
