@@ -5,7 +5,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use hf_hub::{api::sync::Api, Repo, RepoType};
-use tokenizers::Tokenizer;
+use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
 use super::EmbeddingBackend;
 use crate::error::MemoryError;
@@ -36,8 +36,20 @@ impl CandleEmbeddingEngine {
     pub fn new(_model_name: &str) -> Result<Self, MemoryError> {
         let device = Device::Cpu;
 
-        let (config, tokenizer, weights_path) =
+        let (config, mut tokenizer, weights_path) =
             load_model_files().map_err(|e| MemoryError::Embedding(e.to_string()))?;
+
+        // Enable padding so encode_batch produces equal-length sequences.
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            ..Default::default()
+        }));
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 512,
+                ..Default::default()
+            }))
+            .map_err(|e| MemoryError::Embedding(format!("failed to set truncation: {e}")))?;
 
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
@@ -121,45 +133,55 @@ fn load_model_files() -> anyhow::Result<(BertConfig, Tokenizer, PathBuf)> {
 // Inference
 // ---------------------------------------------------------------------------
 
-/// Embed a batch of texts one-at-a-time through the BERT model.
+/// Embed a batch of texts through the BERT model in a single forward pass.
 ///
-/// We process individually rather than as a padded batch because candle's
-/// multi-head attention can hit `MatMulUnexpectedStriding` with non-contiguous
-/// tensors from padded batches. For our workload (short texts, CPU inference)
-/// the overhead is negligible.
+/// Texts are tokenised with padding (to the longest sequence in the batch)
+/// and truncation (to 512 tokens), then passed through BERT together.
+/// CLS pooling extracts the first token's hidden state, which is then
+/// L2-normalised to produce unit vectors.
 fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
-    let mut results = Vec::with_capacity(texts.len());
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    for text in texts {
-        let encoding = inner
-            .tokenizer
-            .encode(text.as_str(), true)
-            .map_err(|e| MemoryError::Embedding(format!("tokenization failed: {e}")))?;
+    let encodings = inner
+        .tokenizer
+        .encode_batch(texts.to_vec(), true)
+        .map_err(|e| MemoryError::Embedding(format!("tokenization failed: {e}")))?;
 
-        let ids = encoding.get_ids();
-        let type_ids = encoding.get_type_ids();
-        let len = ids.len();
+    let batch_size = encodings.len();
+    let seq_len = encodings[0].get_ids().len();
 
-        let input_ids = Tensor::new(ids, &inner.device)
-            .and_then(|t| t.reshape((1, len)))
-            .map_err(|e| MemoryError::Embedding(format!("tensor creation failed: {e}")))?;
+    let all_ids: Vec<u32> = encodings
+        .iter()
+        .flat_map(|e| e.get_ids().to_vec())
+        .collect();
+    let all_type_ids: Vec<u32> = encodings
+        .iter()
+        .flat_map(|e| e.get_type_ids().to_vec())
+        .collect();
 
-        let token_type_ids = Tensor::new(type_ids, &inner.device)
-            .and_then(|t| t.reshape((1, len)))
-            .map_err(|e| MemoryError::Embedding(format!("tensor creation failed: {e}")))?;
+    let input_ids = Tensor::new(all_ids.as_slice(), &inner.device)
+        .and_then(|t| t.reshape((batch_size, seq_len)))
+        .map_err(|e| MemoryError::Embedding(format!("tensor creation failed: {e}")))?;
 
-        let embeddings = inner
-            .model
-            .forward(&input_ids, &token_type_ids, None)
-            .map_err(|e| MemoryError::Embedding(format!("BERT forward pass failed: {e}")))?;
+    let token_type_ids = Tensor::new(all_type_ids.as_slice(), &inner.device)
+        .and_then(|t| t.reshape((batch_size, seq_len)))
+        .map_err(|e| MemoryError::Embedding(format!("tensor creation failed: {e}")))?;
 
-        // CLS pooling: take the first token's hidden state.
+    let embeddings = inner
+        .model
+        .forward(&input_ids, &token_type_ids, None)
+        .map_err(|e| MemoryError::Embedding(format!("BERT forward pass failed: {e}")))?;
+
+    // CLS pooling + L2 normalise each vector in the batch.
+    let mut results = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
         let cls = embeddings
-            .get(0)
+            .get(i)
             .and_then(|seq| seq.get(0))
             .map_err(|e| MemoryError::Embedding(format!("CLS extraction failed: {e}")))?;
 
-        // L2 normalise.
         let norm = cls
             .sqr()
             .and_then(|s| s.sum_all())
