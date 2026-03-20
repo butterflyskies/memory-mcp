@@ -52,6 +52,10 @@ impl CandleEmbeddingEngine {
             }))
             .map_err(|e| MemoryError::Embedding(format!("failed to set truncation: {e}")))?;
 
+        // SAFETY: `from_mmaped_safetensors` memory-maps the weights file. The
+        // caller must ensure the file is not modified for the lifetime of the
+        // resulting tensors. HuggingFace Hub writes cache files atomically and
+        // never modifies them in-place, so the mapping is stable.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
                 .map_err(|e| MemoryError::Embedding(format!("failed to load weights: {e}")))?
@@ -178,6 +182,21 @@ fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, M
     let batch_size = encodings.len();
     let seq_len = encodings[0].get_ids().len();
 
+    // Verify padding produced uniform sequence lengths before allocating
+    // the flat token vectors. A mismatch here means the tokenizer's
+    // padding config was not applied (e.g. silently reset).
+    if let Some((i, enc)) = encodings
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.get_ids().len() != seq_len)
+    {
+        return Err(MemoryError::Embedding(format!(
+            "padding invariant violated: encoding[0] has {seq_len} tokens \
+             but encoding[{i}] has {} — check tokenizer padding config",
+            enc.get_ids().len(),
+        )));
+    }
+
     let all_ids: Vec<u32> = encodings
         .iter()
         .flat_map(|e| e.get_ids().to_vec())
@@ -190,15 +209,6 @@ fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, M
         .iter()
         .flat_map(|e| e.get_attention_mask().to_vec())
         .collect();
-
-    if all_ids.len() != batch_size * seq_len {
-        return Err(MemoryError::Embedding(format!(
-            "padding invariant violated: expected {} token ids, got {} \
-             (batch_size={batch_size}, seq_len={seq_len})",
-            batch_size * seq_len,
-            all_ids.len(),
-        )));
-    }
 
     let input_ids = Tensor::new(all_ids.as_slice(), &inner.device)
         .and_then(|t| t.reshape((batch_size, seq_len)))

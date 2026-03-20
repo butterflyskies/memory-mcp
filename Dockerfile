@@ -33,8 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 RUN useradd -m -u 1000 memory-mcp
 COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
 # Copy the pre-warmed model cache from the model stage.
-COPY --from=model /home/app/.cache/huggingface /home/memory-mcp/.cache/huggingface
-RUN chown -R memory-mcp:memory-mcp /home/memory-mcp/.cache
+# --chown avoids a separate chown layer that would double the ~130 MB cache.
+COPY --from=model --chown=memory-mcp:memory-mcp /home/app/.cache/huggingface /home/memory-mcp/.cache/huggingface
 USER memory-mcp
 WORKDIR /home/memory-mcp
 ENV MEMORY_MCP_BIND=0.0.0.0:8080
