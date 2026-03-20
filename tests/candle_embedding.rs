@@ -120,6 +120,37 @@ async fn empty_batch_returns_empty() {
     assert!(result.is_empty());
 }
 
+/// Batches larger than MAX_BATCH_SIZE (64) must be chunked transparently.
+/// Verifies that the chunking wrapper produces one vector per input and that
+/// vectors are identical regardless of which chunk they land in.
+#[tokio::test]
+async fn large_batch_is_chunked() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+
+    // 65 texts: first chunk of 64, second chunk of 1.
+    let texts: Vec<String> = (0..65).map(|i| format!("sentence number {i}")).collect();
+    let vecs = engine.embed(&texts).await.unwrap();
+    assert_eq!(vecs.len(), 65, "must return one vector per input");
+
+    for (i, v) in vecs.iter().enumerate() {
+        assert_eq!(v.len(), 384, "vector {i} has wrong dimensions");
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "vector {i} not normalised: norm = {norm}"
+        );
+    }
+
+    // The last text lands alone in its own chunk. Verify it matches a
+    // single-item embed (no padding contamination from chunk boundaries).
+    let single = engine.embed_one("sentence number 64").await.unwrap();
+    let sim = cosine_similarity(&vecs[64], &single);
+    assert!(
+        sim > 0.9999,
+        "chunk-boundary text differs from single embed: similarity = {sim}"
+    );
+}
+
 /// Text exceeding the 512-token limit must be truncated, not rejected.
 #[tokio::test]
 async fn long_text_is_truncated() {
