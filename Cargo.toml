@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [features]
 k8s = ["dep:kube", "dep:k8s-openapi"]
+candle-backend = ["dep:ort-candle", "dep:candle-core", "ort/alternative-backend"]
 
 [dependencies]
 rmcp = { version = "1.1", features = ["server", "macros", "transport-streamable-http-server"] }
@@ -13,6 +14,11 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 git2 = "0.20"
 fastembed = "5"
+ort = { version = "=2.0.0-rc.11", default-features = false }
+ort-candle = { version = "=0.2.0", optional = true }
+# Pin candle-core to match ort-candle 0.2.0's expected API (0.9.2 adds DType
+# variants that 0.2.0 doesn't handle).
+candle-core = { version = "=0.9.1", optional = true }
 usearch = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,6 +45,12 @@ openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+# Patch ort-candle to no-op SetSessionGraphOptimizationLevel, SetIntraOpNumThreads,
+# and SetInterOpNumThreads. These are meaningless for candle but fastembed calls
+# them unconditionally. Upstream PR pending.
+ort-candle = { path = "patches/ort-candle" }
 
 [profile.release]
 strip = true

@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config protobuf-compiler
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
         with:
           toolchain: stable
@@ -39,6 +39,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo clippy --workspace --features k8s -- -D warnings
+      - run: cargo clippy --workspace --features candle-backend -- -D warnings
       - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo nextest run --workspace --no-fail-fast --features k8s
 
@@ -58,9 +59,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config protobuf-compiler
+      - name: Install system dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
         with:
           toolchain: stable
@@ -68,6 +72,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --features k8s
+      - run: cargo build --features candle-backend
 
   audit:
     runs-on: ubuntu-latest
