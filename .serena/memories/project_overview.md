@@ -43,7 +43,17 @@ Streamable HTTP only (no stdio, no SSE). Single binary serves both local dev and
 
 ## Branch Protection
 - **Org ruleset** (`protect main branch`): deletion, no force-push, linear history, signed commits, 1 approving review, Copilot code review
-- **Repo ruleset** (`require CI checks`): test, build, audit, cross-compile (Linux + macOS), lint — all must pass before merge
+- **Repo ruleset** (`require CI checks`): test, build, audit, msrv, cross-compile (Linux + macOS), lint — all must pass before merge
+
+## Trust Signals
+- **Shipped**: Cargo.toml metadata (description, repository, keywords, categories incl. artificial-intelligence), cargo-deny replacing cargo-audit, `#![warn(missing_docs)]` on lib crate, MSRV 1.88 declared + CI enforced
+- **ADRs**: 0017 (MSRV match-deps policy), 0018 (dedicated GitHub App for release-please)
+- **Deferred**: cargo-auditable (#60, blocked on upstream action support), cargo-semver-checks (#61 prereq: lib refactor), crates.io publish (#62, blocked on #61)
+
+## Release Infrastructure
+- **GitHub App**: `butterflyskies-release-manager-bot` (app ID 3144639) generates tokens for release-please so its PRs trigger CI workflows
+- **Org secrets**: `RELEASE_BOT_APP_ID`, `RELEASE_BOT_PRIVATE_KEY`
+- **deny.toml**: license allowlist tuned to actual transitive deps; webpki-roots CDLA-Permissive-2.0 as scoped exception; unmaintained transitive deps (number_prefix, paste) ignored
 
 ## Status
-Phase 2 mostly complete. candle direct embeddings shipped (PR #51, v0.1.6 pending release). Next: BM25/Tantivy (Phase 2 of retrieval plan), migration tools, k8s cluster deployment (ArgoCD, HTTPRoute, certs), cosign signing, CVE scanning gates.
+v0.2.0 released. Trust signals Phase 1+2 shipped. Next: lib refactor (#61), then semver-checks + crates.io publish (#62). Also: BM25/Tantivy (#55), cross-platform vector index (#56), tracing/observability (#52).
