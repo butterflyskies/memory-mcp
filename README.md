@@ -32,7 +32,6 @@ cargo build --release
 # Or configure via environment variables
 MEMORY_MCP_BIND=0.0.0.0:9090 \
 MEMORY_MCP_REPO_PATH=/path/to/memories \
-MEMORY_MCP_EMBEDDING_MODEL=BGESmallENV15 \
 ./target/release/memory-mcp serve
 ```
 
@@ -91,7 +90,7 @@ Tool: recall
 ## How it works
 
 ```
-Agent ──MCP──▶ memory-mcp ──▶ fastembed (local embeddings)
+Agent ──MCP──▶ memory-mcp ──▶ candle (local BERT embeddings)
                     │                    │
                     ▼                    ▼
               git repo            usearch HNSW index
@@ -103,7 +102,7 @@ Agent ──MCP──▶ memory-mcp ──▶ fastembed (local embeddings)
 ```
 
 1. **Storage**: memories are markdown files with YAML frontmatter (tags, scope, timestamps) committed to a local git repository
-2. **Embeddings**: content is embedded locally using [fastembed](https://github.com/Anush008/fastembed-rs) — no external API calls
+2. **Embeddings**: content is embedded locally using [candle](https://github.com/huggingface/candle) with a BERT model — no external API calls
 3. **Search**: embeddings are indexed in an HNSW graph ([usearch](https://github.com/unum-cloud/usearch)) for fast approximate nearest-neighbor search
 4. **Sync**: the git repo can push/pull to a remote (GitHub, GitLab, etc.) for cross-device sync with automatic conflict resolution
 5. **Auth**: GitHub tokens via OAuth device flow (`memory-mcp auth login`), stored in the system keyring or a Kubernetes Secret
@@ -141,7 +140,6 @@ All options can be set via CLI flags or environment variables:
 |------|---------|---------|-------------|
 | `--bind` | `MEMORY_MCP_BIND` | `127.0.0.1:8080` | Address to bind the HTTP server |
 | `--repo-path` | `MEMORY_MCP_REPO_PATH` | `~/.memory-mcp` | Path to the git-backed memory repository |
-| `--embedding-model` | `MEMORY_MCP_EMBEDDING_MODEL` | `BGESmallENV15` | Embedding model name |
 | `--mcp-path` | `MEMORY_MCP_PATH` | `/mcp` | URL path for the MCP endpoint |
 | `--remote-url` | `MEMORY_MCP_REMOTE_URL` | *(none)* | Git remote URL. Omit for local-only mode. |
 | `--branch` | `MEMORY_MCP_BRANCH` | `main` | Branch for push/pull operations |
@@ -168,35 +166,9 @@ memory-mcp auth status
 
 Token resolution order: `MEMORY_MCP_GITHUB_TOKEN` env var → `~/.memory-mcp-token` file → system keyring.
 
-## Embedding models
+## Embedding model
 
-The default model (`BGESmallENV15`, 384 dimensions) is a good balance of quality and speed. All models run locally via ONNX Runtime — no API keys required.
-
-<details>
-<summary>Supported models</summary>
-
-| Model | Dimensions | Notes |
-|-------|-----------|-------|
-| BGESmallENV15 | 384 | **Default.** Best speed/quality tradeoff. |
-| BGESmallENV15Q | 384 | Quantised variant, faster inference. |
-| BGEBaseENV15 | 768 | Higher quality, larger model. |
-| BGELargeENV15 | 1024 | Highest quality BGE model. |
-| AllMiniLML6V2 | 384 | Popular lightweight model. |
-| AllMiniLML12V2 | 384 | 12-layer variant. |
-| NomicEmbedTextV1 | 768 | Good for long documents. |
-| NomicEmbedTextV15 | 768 | Updated Nomic model. |
-| MultilingualE5Small | 384 | Multilingual support. |
-| MultilingualE5Base | 768 | Multilingual, higher quality. |
-| MultilingualE5Large | 1024 | Multilingual, highest quality. |
-| MxbaiEmbedLargeV1 | 1024 | Strong general-purpose model. |
-| SnowflakeArcticEmbedXS | 384 | Compact Arctic model. |
-| SnowflakeArcticEmbedS | 384 | Small Arctic model. |
-| SnowflakeArcticEmbedM | 768 | Medium Arctic model. |
-| SnowflakeArcticEmbedL | 1024 | Large Arctic model. |
-
-Most models also have quantised (Q) variants for faster inference with slightly lower quality. Model names are case-insensitive.
-
-</details>
+Embeddings are computed locally using [candle](https://github.com/huggingface/candle) with [BGE-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) (384 dimensions). The model is downloaded from HuggingFace Hub on first run — no API keys required. Use `memory-mcp warmup` to pre-download.
 
 ## Deployment
 
@@ -245,7 +217,7 @@ This project documents significant decisions as Architecture Decision Records:
 | [0002](docs/adr/0002-git2-over-shell.md) | git2 bindings over shelling out to git CLI |
 | [0003](docs/adr/0003-usearch-vector-index.md) | usearch for HNSW vector indexing |
 | [0004](docs/adr/0004-no-tokens-in-cli-args.md) | No tokens in CLI arguments |
-| [0005](docs/adr/0005-fastembed-configurable-from-start.md) | fastembed configurable from day one |
+| [0005](docs/adr/0005-fastembed-configurable-from-start.md) | Local embedding engine (candle/BERT) |
 | [0006](docs/adr/0006-structured-observability-from-day-one.md) | Structured observability from day one |
 | [0007](docs/adr/0007-recency-based-conflict-resolution.md) | Recency-based conflict resolution for sync |
 | [0010](docs/adr/0010-keyring-based-token-storage.md) | Keyring-based token storage |

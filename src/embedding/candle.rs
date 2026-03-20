@@ -1,3 +1,4 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -78,10 +79,23 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
         let arc = Arc::clone(&self.inner);
         let texts = texts.to_vec();
         tokio::task::spawn_blocking(move || {
-            let guard = arc
-                .lock()
-                .expect("lock poisoned — prior panic corrupted state");
-            embed_batch(&guard, &texts)
+            let guard = arc.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!("embedding mutex was poisoned — clearing poison and continuing");
+                poisoned.into_inner()
+            });
+            catch_unwind(AssertUnwindSafe(|| embed_batch(&guard, &texts)))
+                .unwrap_or_else(|panic_payload| {
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic in embedding engine".to_string()
+                    };
+                    Err(MemoryError::Embedding(format!(
+                        "embedding engine panicked: {msg}"
+                    )))
+                })
         })
         .await
         .map_err(|e| MemoryError::Join(e.to_string()))?
@@ -174,6 +188,12 @@ fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, M
         .iter()
         .flat_map(|e| e.get_attention_mask().to_vec())
         .collect();
+
+    debug_assert_eq!(
+        all_ids.len(),
+        batch_size * seq_len,
+        "tokenizer padding produced unequal sequence lengths"
+    );
 
     let input_ids = Tensor::new(all_ids.as_slice(), &inner.device)
         .and_then(|t| t.reshape((batch_size, seq_len)))

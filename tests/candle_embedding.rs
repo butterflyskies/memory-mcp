@@ -111,3 +111,11 @@ async fn batch_single_consistency() {
         "long text: batch vs single similarity too low: {sim_long}"
     );
 }
+
+/// Embedding an empty batch must return an empty vec (not an error).
+#[tokio::test]
+async fn empty_batch_returns_empty() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+    let result = engine.embed(&[]).await.unwrap();
+    assert!(result.is_empty());
+}

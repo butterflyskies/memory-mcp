@@ -10,7 +10,7 @@ A semantic memory system for AI coding agents, exposed as an MCP server. Memorie
 - **MCP framework**: rmcp (v1.1) with streamable HTTP transport via Axum
 - **HTTP**: Axum 0.8
 - **Git**: git2 0.20 (libgit2 bindings, no CLI shelling)
-- **Embeddings**: fastembed 5 (local model, default BGESmallENV15)
+- **Embeddings**: candle direct (local BERT inference, BGE-small-en-v1.5)
 - **Vector index**: usearch 2 (HNSW with cosine metric)
 - **CLI**: clap with derive
 - **Auth**: GitHub token via env var → keyring → token file; OAuth device flow; k8s-secret backend (feature-gated)
@@ -22,13 +22,13 @@ Streamable HTTP only (no stdio, no SSE). Single binary serves both local dev and
 - `memory-mcp serve` (default) — runs the MCP server
 - `memory-mcp auth login [--store keyring|file|stdout|k8s-secret]` — OAuth device flow
 - `memory-mcp auth status` — show resolved token source
-- `memory-mcp warmup [--embedding-model]` — pre-download embedding model (used in Dockerfile)
+- `memory-mcp warmup` — pre-download embedding model (used in Dockerfile)
 
 ## Container & CI
 - **Registry**: ghcr.io/butterflyskies/memory-mcp
 - **Dockerfile**: multi-stage (rust:trixie → model warmup → debian:trixie-slim runtime)
-- **Trixie required**: ort_sys (ONNX Runtime) needs glibc ≥2.38; Bookworm only has 2.36
-- **FASTEMBED_CACHE_DIR**: must be pinned to absolute path in Docker (defaults to CWD-relative `.fastembed_cache`)
+- **Trixie used**: Debian Trixie base image (no longer required by glibc constraints since fastembed/ort-sys removal)
+- **HF_HOME**: HuggingFace Hub model cache directory; pinned to absolute path in Docker
 - **CI**: GitHub Actions — fmt, clippy, nextest, cargo audit, Docker build, cross-platform build (Linux + macOS)
 - **Cross-compile**: `cargo build --features k8s` on ubuntu-latest + macos-latest in PRs; Windows blocked by usearch (#42)
 - **OpenSSL**: vendored on non-Linux (macOS/Windows lack system headers); Linux uses system OpenSSL via pkg-config

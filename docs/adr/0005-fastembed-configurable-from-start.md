@@ -1,7 +1,10 @@
 # ADR-0005: fastembed Scaffolded and Configurable From the Start
 
 ## Status
-Accepted
+Superseded by ADR-0016
+
+> **Note:** This decision was superseded by the migration to candle direct for
+> pure-Rust embeddings (PR #51). See [ADR-0016](0016-candle-direct-embeddings.md).
 
 ## Context
 The TODO specifies "build embedding index alongside storage from the start." The embedding
