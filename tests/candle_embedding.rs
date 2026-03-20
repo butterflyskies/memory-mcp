@@ -141,13 +141,14 @@ async fn large_batch_is_chunked() {
         );
     }
 
-    // The last text lands alone in its own chunk. Verify it matches a
-    // single-item embed (no padding contamination from chunk boundaries).
-    let single = engine.embed_one("sentence number 64").await.unwrap();
-    let sim = cosine_similarity(&vecs[64], &single);
+    // Index 63 is the last text in the first 64-item chunk, padded alongside
+    // 63 other sequences. Compare against a standalone embed to verify the
+    // attention mask prevents padding contamination in a multi-item batch.
+    let single = engine.embed_one("sentence number 63").await.unwrap();
+    let sim = cosine_similarity(&vecs[63], &single);
     assert!(
         sim > 0.9999,
-        "chunk-boundary text differs from single embed: similarity = {sim}"
+        "chunked text differs from single embed: similarity = {sim}"
     );
 }
 
