@@ -22,7 +22,7 @@ The MSRV is declared in `Cargo.toml` (`rust-version`) and enforced by a CI job t
 
 ## Consequences
 - N-2 is not practical for this project — our deps already require N-4 at best
-- Downstream users embedding the library need a reasonably recent Rust (acceptable for
-  a project using bleeding-edge ML crates)
+- Anyone building from source or deriving from the project needs a reasonably recent
+  Rust (acceptable for a project using bleeding-edge ML crates)
 - MSRV bumps are driven by `cargo update`, not by our own code changes
 - CI catches MSRV regressions before they reach main
