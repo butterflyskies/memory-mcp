@@ -18,7 +18,7 @@ mod server;
 mod types;
 
 use auth::{AuthProvider, StoreBackend};
-use embedding::EmbeddingEngine;
+use embedding::{CandleEmbeddingEngine, EmbeddingBackend};
 use index::VectorIndex;
 use repo::MemoryRepo;
 use server::MemoryServer;
@@ -28,7 +28,7 @@ use types::{validate_branch_name, AppState};
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_EMBEDDING_MODEL: &str = "BGESmallENV15";
+const DEFAULT_EMBEDDING_MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -218,8 +218,11 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let repo = MemoryRepo::init_or_open(&repo_path, remote_url.as_deref())
         .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 
-    let embedding = EmbeddingEngine::new(&args.embedding_model)
-        .with_context(|| format!("failed to init embedding model '{}'", args.embedding_model))?;
+    let embedding: Box<dyn embedding::EmbeddingBackend> = Box::new(
+        CandleEmbeddingEngine::new(&args.embedding_model).with_context(|| {
+            format!("failed to init embedding model '{}'", args.embedding_model)
+        })?,
+    );
 
     let dimensions = embedding.dimensions();
 
@@ -309,7 +312,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 /// model cache, then exit. Intended for use as a Kubernetes init container.
 async fn run_warmup(args: WarmupArgs) -> anyhow::Result<()> {
     info!("warming up embedding model '{}'", args.embedding_model);
-    let engine = EmbeddingEngine::new(&args.embedding_model)
+    let engine = CandleEmbeddingEngine::new(&args.embedding_model)
         .with_context(|| format!("failed to init embedding model '{}'", args.embedding_model))?;
     // Run one dummy embed to ensure the model weights are fully loaded and any
     // cached files are written to disk.

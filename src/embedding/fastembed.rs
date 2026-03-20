@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
+use super::EmbeddingBackend;
 use crate::error::MemoryError;
 
 /// Wraps `fastembed::TextEmbedding` behind an `Arc<Mutex<...>>` and exposes a
@@ -10,12 +11,12 @@ use crate::error::MemoryError;
 /// `TextEmbedding::embed` takes `&mut self`, so interior mutability is
 /// required. We use `std::sync::Mutex` combined with `tokio::task::spawn_blocking`
 /// so blocking embed work doesn't occupy executor threads.
-pub struct EmbeddingEngine {
+pub struct FastEmbedEngine {
     inner: Arc<Mutex<TextEmbedding>>,
     dim: usize,
 }
 
-impl EmbeddingEngine {
+impl FastEmbedEngine {
     /// Initialise the embedding engine for the named model.
     ///
     /// `model_name` is matched case-insensitively against known
@@ -34,10 +35,11 @@ impl EmbeddingEngine {
             dim,
         })
     }
+}
 
-    /// Embed a batch of texts, returning one vector per input.
-    #[allow(dead_code)]
-    pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
+#[async_trait::async_trait]
+impl EmbeddingBackend for FastEmbedEngine {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
         let arc = Arc::clone(&self.inner);
         let texts = texts.to_vec();
         tokio::task::spawn_blocking(move || {
@@ -52,8 +54,7 @@ impl EmbeddingEngine {
         .map_err(|e| MemoryError::Join(e.to_string()))?
     }
 
-    /// Convenience: embed a single text.
-    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
+    async fn embed_one(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
         let arc = Arc::clone(&self.inner);
         let text = text.to_string();
         let mut results = tokio::task::spawn_blocking(move || {
@@ -72,8 +73,7 @@ impl EmbeddingEngine {
             .ok_or_else(|| MemoryError::Embedding("embedding returned no vectors".to_string()))
     }
 
-    /// Number of dimensions produced by this model.
-    pub fn dimensions(&self) -> usize {
+    fn dimensions(&self) -> usize {
         self.dim
     }
 }

@@ -9,7 +9,7 @@ use rmcp::{
 use tracing::{info, warn, Instrument};
 
 use crate::{
-    embedding::EmbeddingEngine,
+    embedding::EmbeddingBackend,
     error::MemoryError,
     index::VectorIndex,
     repo::MemoryRepo,
@@ -43,7 +43,7 @@ const MAX_CONTENT_SIZE: usize = 1_048_576;
 /// the same pull gets a fresh entry rather than a ghost.
 async fn incremental_reindex(
     repo: &Arc<MemoryRepo>,
-    embedding: &EmbeddingEngine,
+    embedding: &dyn EmbeddingBackend,
     index: &VectorIndex,
     changes: &ChangedMemories,
 ) -> ReindexStats {
@@ -747,7 +747,7 @@ impl MemoryServer {
                     if !changes.is_empty() {
                         let stats = incremental_reindex(
                             &state.repo,
-                            &state.embedding,
+                            state.embedding.as_ref(),
                             &state.index,
                             &changes,
                         )

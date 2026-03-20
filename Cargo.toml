@@ -6,13 +6,13 @@ license = "MIT OR Apache-2.0"
 
 [features]
 k8s = ["dep:kube", "dep:k8s-openapi"]
+legacy-fastembed = ["dep:fastembed"]
 
 [dependencies]
 rmcp = { version = "1.1", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 git2 = "0.20"
-fastembed = "5"
 usearch = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +29,17 @@ tokio-util = { version = "0.7", features = ["rt"] }
 libc = "0.2"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+
+# Candle direct — pure-Rust BERT inference for embeddings.
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokenizers = "0.22"
+hf-hub = "0.4"
+
+# Optional dependencies gated behind features.
+fastembed = { version = "5", optional = true }
 kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls"], optional = true }
 k8s-openapi = { version = "0.27", features = ["v1_31"], optional = true }
 

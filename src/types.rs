@@ -506,7 +506,9 @@ pub struct ReindexStats {
 
 use std::sync::Arc;
 
-use crate::{auth::AuthProvider, embedding::EmbeddingEngine, index::VectorIndex, repo::MemoryRepo};
+use crate::{
+    auth::AuthProvider, embedding::EmbeddingBackend, index::VectorIndex, repo::MemoryRepo,
+};
 
 /// Shared application state threaded through the Axum server.
 ///
@@ -514,7 +516,7 @@ use crate::{auth::AuthProvider, embedding::EmbeddingEngine, index::VectorIndex, 
 /// wrapped in its own `Arc` so it can be cloned into `spawn_blocking` closures.
 pub struct AppState {
     pub repo: Arc<MemoryRepo>,
-    pub embedding: EmbeddingEngine,
+    pub embedding: Box<dyn EmbeddingBackend>,
     pub index: VectorIndex,
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").

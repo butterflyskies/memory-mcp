@@ -1,18 +1,22 @@
 # Session Handoff — memory-mcp
 
-## Canonical tracking
-- **[TODO.md](https://github.com/butterflyskies/memory-mcp/blob/main/TODO.md)** — single source of truth for task status
-- **butterflyskies/tasks#80** — discussion thread, references TODO.md (keep reopening if auto-closed on PR merge)
+## What just shipped
+- PR #43: cross-platform CI (Linux + macOS `cargo build`) + vendored OpenSSL + Windows removed from matrices
+- PR #45: conditional OpenSSL vendoring (non-Linux only) + Node.js 24 opt-in for release-please
+- v0.1.5 release cut with `Release-As: 0.1.5` — check that release pipeline completed (draft → binaries → undraft)
 
-## Current state
-On `main`, Phase 2 roughly half complete (auth + sync done, migration + deployment remaining).
+## Open PRs
+- PR #47 (memory-mcp): project overview memory update — trivial, ready to merge
+- PR #4 (flight-log): evening flight log entry
+- PR #5 (rust-template): accumulated CI improvements — needs cross-platform CI ported from memory-mcp
 
-## Ordering intent
-Deploy to k8s first, then wire up as MCP server in Claude Code. The server needs to be running and reachable before pointing clients at it.
+## Pending items
+- **rust-template**: port the cross-compile job and conditional OpenSSL vendoring from memory-mcp
+- **v0.1.5 release verification**: confirm macOS binary was uploaded and release was undrafted
+- **Node.js 24 compatibility**: first real test happens on next release-please run — watch for failures
+- **cc-toolgate#19 / tasks#90**: config_env process environment fallback — on Friday Focus milestone
 
-## Context worth preserving
-- Review cycles take 2-3 passes — pre-flight checklist helped but P3s still emerge
-- IDE diagnostics are frequently stale — always verify with `cargo check`
-- Never amend commits — always add new commits on top
-- Never silently fall back to plaintext file storage for credentials
-- `capture_head_oid` used in fast_forward but NOT in merge_with_remote (defensive)
+## Context
+- Windows builds are blocked by usearch v2.24.0 MAP_FAILED incompatibility (#42) — no upstream fix available
+- Git identity must use AI account for all pushes (user can't approve their own PRs)
+- User prefers new commits over amend + force-push
