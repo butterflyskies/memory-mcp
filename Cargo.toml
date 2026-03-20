@@ -7,6 +7,7 @@ description = "MCP server for semantic memory — pure-Rust embeddings, vector s
 repository = "https://github.com/butterflyskies/memory-mcp"
 keywords = ["mcp", "memory", "embeddings", "semantic-search"]
 categories = ["command-line-utilities", "text-processing"]
+rust-version = "1.88"
 
 [features]
 k8s = ["dep:kube", "dep:k8s-openapi"]

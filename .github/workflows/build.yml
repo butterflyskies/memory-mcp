@@ -69,6 +69,23 @@ jobs:
           key: ${{ matrix.target }}
       - run: cargo build --features k8s
 
+  # Verify the declared MSRV (Cargo.toml rust-version) still compiles.
+  msrv:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: msrv
+      - run: cargo check --workspace --all-features
+
   audit:
     runs-on: ubuntu-latest
     permissions:
@@ -80,7 +97,7 @@ jobs:
           command: check
 
   build:
-    needs: [test, audit, cross-compile]
+    needs: [test, audit, cross-compile, msrv]
     runs-on: ubuntu-latest
     permissions:
       contents: read
