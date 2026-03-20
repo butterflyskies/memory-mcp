@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{api::sync::ApiBuilder, Cache, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
 use super::EmbeddingBackend;
@@ -97,13 +97,39 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
 // ---------------------------------------------------------------------------
 
 /// Download (or retrieve from cache) the model files from HuggingFace Hub.
+///
+/// On first run (cold start), this downloads ~130 MB of model files from
+/// HuggingFace Hub. Subsequent starts use the local cache (`HF_HOME`).
+/// Use the `warmup` subcommand or a k8s init container to pre-populate the
+/// cache and avoid blocking the first server startup.
 fn load_model_files() -> anyhow::Result<(BertConfig, Tokenizer, PathBuf)> {
-    let api = Api::new()?;
-    let repo = api.repo(Repo::new(MODEL_ID.to_string(), RepoType::Model));
+    let cache = Cache::default();
+    let hf_repo = Repo::new(MODEL_ID.to_string(), RepoType::Model);
 
+    // Check whether the heaviest file (model weights) is already cached.
+    let cached = cache.repo(hf_repo.clone()).get("model.safetensors");
+    if cached.is_none() {
+        tracing::warn!(
+            model = MODEL_ID,
+            "embedding model not found in cache — downloading from HuggingFace Hub \
+             (this may take a minute on first run; use `memory-mcp warmup` to pre-populate)"
+        );
+    } else {
+        tracing::info!(model = MODEL_ID, "loading embedding model from cache");
+    }
+
+    // Disable indicatif progress bars — we are a headless server.
+    let api = ApiBuilder::new().with_progress(false).build()?;
+    let repo = api.repo(hf_repo);
+
+    let start = std::time::Instant::now();
     let config_path = repo.get("config.json")?;
     let tokenizer_path = repo.get("tokenizer.json")?;
     let weights_path = repo.get("model.safetensors")?;
+    tracing::info!(
+        elapsed_ms = start.elapsed().as_millis(),
+        "model files ready"
+    );
 
     let config: BertConfig = serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
