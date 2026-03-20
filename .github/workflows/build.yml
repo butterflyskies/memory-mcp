@@ -75,13 +75,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Install cargo-audit
-        run: |
-          curl -fsSL "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.1/cargo-audit-x86_64-unknown-linux-musl-v0.22.1.tgz" \
-            -o /tmp/cargo-audit.tar.gz
-          echo "c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab  /tmp/cargo-audit.tar.gz" | sha256sum -c -
-          tar xzf /tmp/cargo-audit.tar.gz -C /usr/local/bin --strip-components=1
-      - run: cargo audit
+      - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2.0.15
+        with:
+          command: check
 
   build:
     needs: [test, audit, cross-compile]

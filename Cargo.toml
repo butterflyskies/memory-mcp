@@ -3,6 +3,10 @@ name = "memory-mcp"
 version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "MCP server for semantic memory — pure-Rust embeddings, vector search, git-backed storage"
+repository = "https://github.com/butterflyskies/memory-mcp"
+keywords = ["mcp", "memory", "embeddings", "semantic-search"]
+categories = ["command-line-utilities", "text-processing"]
 
 [features]
 k8s = ["dep:kube", "dep:k8s-openapi"]
