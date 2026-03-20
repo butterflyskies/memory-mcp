@@ -162,17 +162,36 @@ fn load_model_files() -> anyhow::Result<(BertConfig, Tokenizer, PathBuf)> {
 // Inference
 // ---------------------------------------------------------------------------
 
-/// Embed a batch of texts through the BERT model in a single forward pass.
+/// Maximum texts per forward pass. BERT attention is O(batch × seq²) in memory;
+/// capping the batch avoids OOM on large reindex operations. 64 is conservative
+/// enough for CPU inference while still amortising per-batch overhead.
+const MAX_BATCH_SIZE: usize = 64;
+
+/// Embed texts through the BERT model, chunking into bounded forward passes.
 ///
-/// Texts are tokenised with padding (to the longest sequence in the batch)
-/// and truncation (to 512 tokens), then passed through BERT together.
-/// An attention mask ensures padding tokens do not affect the output.
-/// CLS pooling extracts the first token's hidden state, which is then
-/// L2-normalised to produce unit vectors.
+/// Splits the input into chunks of at most [`MAX_BATCH_SIZE`] texts and runs
+/// each chunk through [`embed_chunk`], concatenating the results.
 fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
+
+    let mut results = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(MAX_BATCH_SIZE) {
+        results.extend(embed_chunk(inner, chunk)?);
+    }
+    Ok(results)
+}
+
+/// Embed a single chunk of texts through the BERT model in one forward pass.
+///
+/// Texts are tokenised with padding (to the longest sequence in the chunk)
+/// and truncation (to 512 tokens), then passed through BERT together.
+/// An attention mask ensures padding tokens do not affect the output.
+/// CLS pooling extracts the first token's hidden state, which is then
+/// L2-normalised to produce unit vectors.
+fn embed_chunk(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
+    debug_assert!(!texts.is_empty(), "embed_chunk called with empty texts");
 
     let encodings = inner
         .tokenizer
