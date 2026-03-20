@@ -25,12 +25,6 @@ use server::MemoryServer;
 use types::{validate_branch_name, AppState};
 
 // ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const DEFAULT_EMBEDDING_MODEL: &str = "BAAI/bge-small-en-v1.5";
-
-// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -95,14 +89,6 @@ struct ServeArgs {
     #[arg(long, default_value = "~/.memory-mcp", env = "MEMORY_MCP_REPO_PATH")]
     repo_path: String,
 
-    /// Embedding model name. Defaults to BGESmallENV15.
-    #[arg(
-        long,
-        default_value = DEFAULT_EMBEDDING_MODEL,
-        env = "MEMORY_MCP_EMBEDDING_MODEL"
-    )]
-    embedding_model: String,
-
     /// URL path at which the MCP service is mounted.
     #[arg(long, default_value = "/mcp", env = "MEMORY_MCP_PATH")]
     mcp_path: String,
@@ -118,15 +104,7 @@ struct ServeArgs {
 }
 
 #[derive(Args)]
-struct WarmupArgs {
-    /// Embedding model name to pre-warm.
-    #[arg(
-        long,
-        default_value = DEFAULT_EMBEDDING_MODEL,
-        env = "MEMORY_MCP_EMBEDDING_MODEL"
-    )]
-    embedding_model: String,
-}
+struct WarmupArgs {}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -218,11 +196,8 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let repo = MemoryRepo::init_or_open(&repo_path, remote_url.as_deref())
         .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 
-    let embedding: Box<dyn embedding::EmbeddingBackend> = Box::new(
-        CandleEmbeddingEngine::new(&args.embedding_model).with_context(|| {
-            format!("failed to init embedding model '{}'", args.embedding_model)
-        })?,
-    );
+    let embedding: Box<dyn embedding::EmbeddingBackend> =
+        Box::new(CandleEmbeddingEngine::new().context("failed to init embedding engine")?);
 
     let dimensions = embedding.dimensions();
 
@@ -310,14 +285,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
 /// Load the embedding model and run a single dummy embed to warm the on-disk
 /// model cache, then exit. Intended for use as a Kubernetes init container.
-async fn run_warmup(args: WarmupArgs) -> anyhow::Result<()> {
-    info!("warming up embedding model '{}'", args.embedding_model);
-    let engine = CandleEmbeddingEngine::new(&args.embedding_model)
-        .with_context(|| format!("failed to init embedding model '{}'", args.embedding_model))?;
+async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
+    info!("warming up embedding model '{}'", embedding::MODEL_ID);
+    let engine = CandleEmbeddingEngine::new().context("failed to init embedding engine")?;
     // Run one dummy embed to ensure the model weights are fully loaded and any
     // cached files are written to disk.
     let _ = engine
-        .embed_one("warmup")
+        .embed(&["warmup".to_string()])
         .await
         .context("warmup embed failed")?;
     info!("warmup complete");

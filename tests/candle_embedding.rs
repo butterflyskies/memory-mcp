@@ -1,82 +1,10 @@
 //! Integration tests for the candle BERT embedding pipeline.
 //!
-//! These tests validate the core embedding behaviour end-to-end:
-//! correct dimensions, normalisation, determinism, semantic similarity.
-//! They exercise the same model (BGE-small-en-v1.5) and inference path
-//! used by the production `CandleEmbeddingEngine`.
+//! These tests validate the production `CandleEmbeddingEngine` end-to-end:
+//! correct dimensions, normalisation, determinism, semantic similarity,
+//! and batch/single consistency (attention mask correctness).
 
-use candle_core::{Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::{api::sync::Api, Repo, RepoType};
-use tokenizers::Tokenizer;
-
-const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
-
-/// Minimal embedding helper that mirrors `CandleEmbeddingEngine` internals.
-struct TestEmbedder {
-    model: BertModel,
-    tokenizer: Tokenizer,
-    device: Device,
-}
-
-impl TestEmbedder {
-    fn new() -> Self {
-        let device = Device::Cpu;
-        let api = Api::new().expect("HF Hub API init");
-        let repo = api.repo(Repo::new(MODEL_ID.to_string(), RepoType::Model));
-
-        let config_path = repo.get("config.json").expect("config.json");
-        let tokenizer_path = repo.get("tokenizer.json").expect("tokenizer.json");
-        let weights_path = repo.get("model.safetensors").expect("model.safetensors");
-
-        let config: BertConfig =
-            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
-
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
-                .unwrap()
-        };
-        let model = BertModel::load(vb, &config).unwrap();
-
-        Self {
-            model,
-            tokenizer,
-            device,
-        }
-    }
-
-    fn embed_one(&self, text: &str) -> Vec<f32> {
-        let encoding = self.tokenizer.encode(text, true).unwrap();
-        let ids = encoding.get_ids();
-        let type_ids = encoding.get_type_ids();
-        let len = ids.len();
-
-        let input_ids = Tensor::new(ids, &self.device)
-            .and_then(|t| t.reshape((1, len)))
-            .unwrap();
-        let token_type_ids = Tensor::new(type_ids, &self.device)
-            .and_then(|t| t.reshape((1, len)))
-            .unwrap();
-
-        let embeddings = self
-            .model
-            .forward(&input_ids, &token_type_ids, None)
-            .unwrap();
-
-        // CLS pooling + L2 normalise.
-        let cls = embeddings.get(0).and_then(|seq| seq.get(0)).unwrap();
-        let norm = cls
-            .sqr()
-            .and_then(|s| s.sum_all())
-            .and_then(|s| s.sqrt())
-            .and_then(|n| cls.broadcast_div(&n))
-            .unwrap();
-
-        norm.to_vec1().unwrap()
-    }
-}
+use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend};
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
@@ -85,35 +13,48 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
-#[test]
-fn produces_384_dim_vectors() {
-    let engine = TestEmbedder::new();
-    let vec = engine.embed_one("hello world");
+/// The engine must produce 384-dimensional vectors for BGE-small-en-v1.5.
+#[tokio::test]
+async fn produces_384_dim_vectors() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+    assert_eq!(engine.dimensions(), 384);
+
+    let vec = engine.embed_one("hello world").await.unwrap();
     assert_eq!(vec.len(), 384);
 }
 
-#[test]
-fn vectors_are_normalised() {
-    let engine = TestEmbedder::new();
-    let vec = engine.embed_one("test normalisation");
+/// Vectors must be L2-normalised (unit length).
+#[tokio::test]
+async fn vectors_are_normalised() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+    let vec = engine.embed_one("test normalisation").await.unwrap();
     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!((norm - 1.0).abs() < 1e-4, "expected unit norm, got {norm}");
 }
 
-#[test]
-fn self_consistency() {
-    let engine = TestEmbedder::new();
-    let a = engine.embed_one("determinism check");
-    let b = engine.embed_one("determinism check");
+/// Same input must produce identical output (deterministic).
+#[tokio::test]
+async fn self_consistency() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+    let a = engine.embed_one("determinism check").await.unwrap();
+    let b = engine.embed_one("determinism check").await.unwrap();
     assert_eq!(a, b);
 }
 
-#[test]
-fn semantic_similarity() {
-    let engine = TestEmbedder::new();
-    let rust = engine.embed_one("Rust programming language");
-    let cargo = engine.embed_one("cargo build system for Rust");
-    let recipe = engine.embed_one("chocolate cake baking recipe");
+/// Semantically similar texts should cluster together.
+#[tokio::test]
+async fn semantic_similarity() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+
+    let rust = engine.embed_one("Rust programming language").await.unwrap();
+    let cargo = engine
+        .embed_one("cargo build system for Rust")
+        .await
+        .unwrap();
+    let recipe = engine
+        .embed_one("chocolate cake baking recipe")
+        .await
+        .unwrap();
 
     let sim_related = cosine_similarity(&rust, &cargo);
     let sim_unrelated = cosine_similarity(&rust, &recipe);
@@ -124,25 +65,49 @@ fn semantic_similarity() {
     );
 }
 
-#[test]
-fn batch_consistency() {
-    let engine = TestEmbedder::new();
-    // Embed individually and verify vectors match.
-    let a = engine.embed_one("first");
-    let b = engine.embed_one("second");
-    let c = engine.embed_one("third");
-
-    // All should be 384-dim and normalised.
-    for v in [&a, &b, &c] {
+/// Batch embed must return one vector per input, all normalised.
+#[tokio::test]
+async fn batch_embed() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+    let texts: Vec<String> = vec!["first".into(), "second".into(), "third".into()];
+    let vecs = engine.embed(&texts).await.unwrap();
+    assert_eq!(vecs.len(), 3);
+    for v in &vecs {
         assert_eq!(v.len(), 384);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4);
     }
+}
 
-    // Verify they're distinct vectors.
-    let sim_ab = cosine_similarity(&a, &b);
+/// Batch and single-item embedding must produce the same vectors.
+/// This validates that the attention mask correctly excludes padding tokens.
+#[tokio::test]
+async fn batch_single_consistency() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+
+    // Deliberately different lengths to force padding in the batch path.
+    let short = "hi";
+    let long = "this is a much longer sentence that will require more tokens to encode properly";
+
+    let single_short = engine.embed_one(short).await.unwrap();
+    let single_long = engine.embed_one(long).await.unwrap();
+
+    let batch = engine
+        .embed(&[short.to_string(), long.to_string()])
+        .await
+        .unwrap();
+
+    let sim_short = cosine_similarity(&single_short, &batch[0]);
+    let sim_long = cosine_similarity(&single_long, &batch[1]);
+
+    // With correct attention masking, batch and single should produce
+    // identical vectors. Allow tiny floating-point tolerance.
     assert!(
-        sim_ab < 1.0,
-        "distinct texts should produce distinct vectors"
+        sim_short > 0.9999,
+        "short text: batch vs single similarity too low: {sim_short}"
+    );
+    assert!(
+        sim_long > 0.9999,
+        "long text: batch vs single similarity too low: {sim_long}"
     );
 }
