@@ -41,5 +41,9 @@ Streamable HTTP only (no stdio, no SSE). Single binary serves both local dev and
 - All GHA actions pinned to commit SHAs
 - cargo audit in CI pipeline
 
+## Branch Protection
+- **Org ruleset** (`protect main branch`): deletion, no force-push, linear history, signed commits, 1 approving review, Copilot code review
+- **Repo ruleset** (`require CI checks`): test, build, audit, cross-compile (Linux + macOS), lint — all must pass before merge
+
 ## Status
-Phase 2 mostly complete. Next: migration tools, k8s cluster deployment (ArgoCD, HTTPRoute, certs), cosign signing, CVE scanning gates.
+Phase 2 mostly complete. candle direct embeddings shipped (PR #51, v0.1.6 pending release). Next: BM25/Tantivy (Phase 2 of retrieval plan), migration tools, k8s cluster deployment (ArgoCD, HTTPRoute, certs), cosign signing, CVE scanning gates.
