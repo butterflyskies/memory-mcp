@@ -117,7 +117,7 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
 /// Use the `warmup` subcommand or a k8s init container to pre-populate the
 /// cache and avoid blocking the first server startup.
 fn load_model_files() -> anyhow::Result<(BertConfig, Tokenizer, PathBuf)> {
-    let cache = Cache::default();
+    let cache = Cache::from_env();
     let hf_repo = Repo::new(MODEL_ID.to_string(), RepoType::Model);
 
     // Check whether the heaviest file (model weights) is already cached.
@@ -132,8 +132,9 @@ fn load_model_files() -> anyhow::Result<(BertConfig, Tokenizer, PathBuf)> {
         tracing::info!(model = MODEL_ID, "loading embedding model from cache");
     }
 
-    // Disable indicatif progress bars — we are a headless server.
-    let api = ApiBuilder::new().with_progress(false).build()?;
+    // Respect HF_HOME and HF_ENDPOINT env vars; disable indicatif progress
+    // bars since we are a headless server.
+    let api = ApiBuilder::from_env().with_progress(false).build()?;
     let repo = api.repo(hf_repo);
 
     let start = std::time::Instant::now();
@@ -189,11 +190,14 @@ fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, M
         .flat_map(|e| e.get_attention_mask().to_vec())
         .collect();
 
-    debug_assert_eq!(
-        all_ids.len(),
-        batch_size * seq_len,
-        "tokenizer padding produced unequal sequence lengths"
-    );
+    if all_ids.len() != batch_size * seq_len {
+        return Err(MemoryError::Embedding(format!(
+            "padding invariant violated: expected {} token ids, got {} \
+             (batch_size={batch_size}, seq_len={seq_len})",
+            batch_size * seq_len,
+            all_ids.len(),
+        )));
+    }
 
     let input_ids = Tensor::new(all_ids.as_slice(), &inner.device)
         .and_then(|t| t.reshape((batch_size, seq_len)))

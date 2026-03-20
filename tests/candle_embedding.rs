@@ -119,3 +119,14 @@ async fn empty_batch_returns_empty() {
     let result = engine.embed(&[]).await.unwrap();
     assert!(result.is_empty());
 }
+
+/// Text exceeding the 512-token limit must be truncated, not rejected.
+#[tokio::test]
+async fn long_text_is_truncated() {
+    let engine = CandleEmbeddingEngine::new().unwrap();
+    let long_text = "word ".repeat(600); // ~600 tokens, well over the 512 limit
+    let vec = engine.embed_one(&long_text).await.unwrap();
+    assert_eq!(vec.len(), 384);
+    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-4, "expected unit norm, got {norm}");
+}

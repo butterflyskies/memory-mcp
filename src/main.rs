@@ -181,6 +181,20 @@ async fn main() -> anyhow::Result<()> {
 
 /// Start and run the MCP HTTP server with the provided arguments.
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+    // Warn if the removed MEMORY_MCP_EMBEDDING_MODEL env var is set, so
+    // operators migrating from fastembed notice the change instead of silently
+    // getting a different model (and potentially mismatched vector dimensions).
+    if let Ok(model) = std::env::var("MEMORY_MCP_EMBEDDING_MODEL") {
+        tracing::warn!(
+            configured_model = %model,
+            active_model = embedding::MODEL_ID,
+            "MEMORY_MCP_EMBEDDING_MODEL is set but no longer supported — \
+             the embedding model is now fixed to {}. If your vector index was \
+             built with a different model, delete the index to trigger a rebuild.",
+            embedding::MODEL_ID,
+        );
+    }
+
     // Validate branch name early to prevent ref injection.
     validate_branch_name(&args.branch).context("invalid --branch value")?;
 

@@ -209,20 +209,7 @@ See [docs/deployment.md](docs/deployment.md) for the full guide.
 
 ## Architecture decisions
 
-This project documents significant decisions as Architecture Decision Records:
-
-| ADR | Decision |
-|-----|----------|
-| [0001](docs/adr/0001-streamable-http-only.md) | Streamable HTTP transport only (no stdio) |
-| [0002](docs/adr/0002-git2-over-shell.md) | git2 bindings over shelling out to git CLI |
-| [0003](docs/adr/0003-usearch-vector-index.md) | usearch for HNSW vector indexing |
-| [0004](docs/adr/0004-no-tokens-in-cli-args.md) | No tokens in CLI arguments |
-| [0005](docs/adr/0005-fastembed-configurable-from-start.md) | Local embedding engine (candle/BERT) |
-| [0006](docs/adr/0006-structured-observability-from-day-one.md) | Structured observability from day one |
-| [0007](docs/adr/0007-recency-based-conflict-resolution.md) | Recency-based conflict resolution for sync |
-| [0010](docs/adr/0010-keyring-based-token-storage.md) | Keyring-based token storage |
-| [0012](docs/adr/0012-oauth-device-flow-token-acquisition.md) | OAuth device flow for authentication |
-| [0014](docs/adr/0014-container-deployment-strategy.md) | Container deployment strategy |
+Significant design decisions are documented as Architecture Decision Records in [`docs/adr/`](docs/adr/). Each ADR captures the context, decision, and consequences of a choice — giving future contributors the "why" behind the codebase.
 
 ## Security
 
