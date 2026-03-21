@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0](https://github.com/butterflyskies/memory-mcp/compare/v0.2.0...v0.3.0) (2026-03-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* fat lib / thin binary — expose domain modules from lib.rs ([#64](https://github.com/butterflyskies/memory-mcp/issues/64))
+
+### Features
+
+* trust signals phase 1 — metadata, cargo-deny, rustdoc ([#59](https://github.com/butterflyskies/memory-mcp/issues/59)) ([6b8a217](https://github.com/butterflyskies/memory-mcp/commit/6b8a217f549b65a8365e973e70df7c6c7065e77f))
+
+
+### Bug Fixes
+
+* **ci:** use GitHub App token for release-please to trigger CI ([#57](https://github.com/butterflyskies/memory-mcp/issues/57)) ([7d44d95](https://github.com/butterflyskies/memory-mcp/commit/7d44d95c1a2d1f80bd6de06b87f769f59ffb8852))
+
+
+### Code Refactoring
+
+* fat lib / thin binary — expose domain modules from lib.rs ([#64](https://github.com/butterflyskies/memory-mcp/issues/64)) ([41353bf](https://github.com/butterflyskies/memory-mcp/commit/41353bffe38fb38f700a295cef1f6662ec190f58))
+
 ## [0.2.0](https://github.com/butterflyskies/memory-mcp/compare/v0.1.5...v0.2.0) (2026-03-20)
 
 
