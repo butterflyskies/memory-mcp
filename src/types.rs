@@ -553,10 +553,10 @@ impl AppState {
     /// Create a new application state from subsystem instances.
     pub fn new(
         repo: Arc<MemoryRepo>,
+        branch: String,
         embedding: Box<dyn EmbeddingBackend>,
         index: VectorIndex,
         auth: AuthProvider,
-        branch: String,
     ) -> Self {
         Self {
             repo,

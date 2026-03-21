@@ -210,10 +210,10 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let state = Arc::new(AppState::new(
         Arc::new(repo),
+        args.branch.clone(),
         embedding,
         index,
         auth,
-        args.branch.clone(),
     ));
 
     // Keep a reference for post-shutdown index persistence.

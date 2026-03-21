@@ -42,6 +42,12 @@ impl<T> Secret<T> {
     }
 }
 
+impl<T: Clone> Clone for Secret<T> {
+    fn clone(&self) -> Self {
+        Secret(self.0.clone())
+    }
+}
+
 impl<T> fmt::Debug for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[REDACTED]")
@@ -168,7 +174,7 @@ impl AuthProvider {
     pub fn resolve_token(&self) -> Result<Secret<String>, MemoryError> {
         // Return cached token if we already have one.
         if let Some(ref t) = self.token {
-            return Ok(Secret::new(t.expose().clone()));
+            return Ok(t.clone());
         }
         Self::try_resolve()
     }
@@ -335,7 +341,7 @@ pub async fn device_flow_login(
             .map_err(|e| MemoryError::OAuth(format!("failed to parse token response: {e}")))?;
 
         if let Some(tok) = resp.access_token.filter(|t| !t.trim().is_empty()) {
-            break tok;
+            break Secret::new(tok);
         }
 
         match resp.error.as_deref() {
@@ -398,20 +404,20 @@ pub async fn device_flow_login(
 ///
 /// Never logs the token value — only the chosen storage destination.
 async fn store_token(
-    token: &str,
+    token: &Secret<String>,
     backend: Option<StoreBackend>,
     #[cfg(feature = "k8s")] k8s_config: Option<K8sSecretConfig>,
 ) -> Result<(), MemoryError> {
     match backend {
         Some(StoreBackend::Stdout) => {
-            println!("{token}");
+            println!("{}", token.expose());
             debug!("token written to stdout");
         }
         Some(StoreBackend::Keyring) => {
-            store_in_keyring(token)?;
+            store_in_keyring(token.expose())?;
         }
         Some(StoreBackend::File) => {
-            store_in_file(token)?;
+            store_in_file(token.expose())?;
         }
         #[cfg(feature = "k8s")]
         Some(StoreBackend::K8sSecret) => {
@@ -420,11 +426,11 @@ async fn store_token(
                     "k8s-secret backend requires namespace and secret name".into(),
                 )
             })?;
-            store_in_k8s_secret(token, &config).await?;
+            store_in_k8s_secret(token.expose(), &config).await?;
         }
         None => {
             // No --store flag: try keyring ONLY. Do NOT fall back to file.
-            store_in_keyring(token).map_err(|e| {
+            store_in_keyring(token.expose()).map_err(|e| {
                 MemoryError::TokenStorage(format!(
                     "Keyring unavailable: {e}. Use --store file to write to \
                      ~/.config/memory-mcp/token, --store stdout to print the token\
