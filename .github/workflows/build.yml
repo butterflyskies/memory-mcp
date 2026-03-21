@@ -41,6 +41,7 @@ jobs:
       - run: cargo clippy --workspace --features k8s -- -D warnings
       - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo nextest run --workspace --no-fail-fast --features k8s
+      - run: cargo nextest run --workspace --no-fail-fast --features testing
 
   # Catch cross-platform compilation failures before they reach the release pipeline.
   # Mirrors the release.yml publish-binaries matrix (minus Windows — see #42).
