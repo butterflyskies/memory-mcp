@@ -102,6 +102,7 @@ fn build_auth_callbacks(token: String) -> git2::RemoteCallbacks<'static> {
     callbacks
 }
 
+/// Git-backed repository for persisting and syncing memory files.
 pub struct MemoryRepo {
     inner: Mutex<Repository>,
     root: PathBuf,

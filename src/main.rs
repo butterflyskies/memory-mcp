@@ -9,20 +9,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod auth;
-mod embedding;
-mod error;
-mod index;
-mod repo;
-mod server;
-mod types;
-
-use auth::{AuthProvider, StoreBackend};
-use embedding::{CandleEmbeddingEngine, EmbeddingBackend};
-use index::VectorIndex;
-use repo::MemoryRepo;
-use server::MemoryServer;
-use types::{validate_branch_name, AppState};
+use memory_mcp::auth::{self, AuthProvider, StoreBackend};
+use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend, MODEL_ID};
+use memory_mcp::index::VectorIndex;
+use memory_mcp::repo::MemoryRepo;
+use memory_mcp::server::MemoryServer;
+use memory_mcp::types::{validate_branch_name, AppState};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -196,7 +188,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let repo = MemoryRepo::init_or_open(&repo_path, remote_url.as_deref())
         .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 
-    let embedding: Box<dyn embedding::EmbeddingBackend> =
+    let embedding: Box<dyn EmbeddingBackend> =
         Box::new(CandleEmbeddingEngine::new().context("failed to init embedding engine")?);
 
     let dimensions = embedding.dimensions();
@@ -286,7 +278,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 /// Load the embedding model and run a single dummy embed to warm the on-disk
 /// model cache, then exit. Intended for use as a Kubernetes init container.
 async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
-    info!("warming up embedding model '{}'", embedding::MODEL_ID);
+    info!("warming up embedding model '{}'", MODEL_ID);
     let engine = CandleEmbeddingEngine::new().context("failed to init embedding engine")?;
     // Run one dummy embed to ensure the model weights are fully loaded and any
     // cached files are written to disk.

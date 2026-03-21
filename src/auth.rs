@@ -26,6 +26,7 @@ const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_tok
 pub struct Secret<T>(T);
 
 impl<T> Secret<T> {
+    /// Wrap a value in a `Secret`, redacting it from `Debug` and `Display`.
     pub fn new(value: T) -> Self {
         Self(value)
     }
@@ -77,10 +78,13 @@ pub enum StoreBackend {
 // K8sSecretConfig — configuration for Kubernetes Secret storage
 // ---------------------------------------------------------------------------
 
+/// Configuration for storing a token as a Kubernetes Secret.
 #[cfg(feature = "k8s")]
 #[derive(Debug)]
 pub struct K8sSecretConfig {
+    /// Kubernetes namespace in which to create or update the secret.
     pub namespace: String,
+    /// Name of the Kubernetes Secret resource.
     pub secret_name: String,
 }
 
@@ -133,6 +137,7 @@ struct AccessTokenResponse {
 // AuthProvider
 // ---------------------------------------------------------------------------
 
+/// Resolves and caches a GitHub personal access token from multiple sources.
 pub struct AuthProvider {
     /// Cached token, if resolved at startup.
     token: Option<Secret<String>>,
@@ -678,7 +683,8 @@ fn check_token_file_permissions(path: &std::path::Path) {
 // Platform-portable home directory helper (shared with main.rs)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+/// Returns the user's home directory, or `None` if `HOME` is not set.
+pub fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(std::path::PathBuf::from)
