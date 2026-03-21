@@ -1,5 +1,6 @@
 use std::fmt;
 
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
 
 use crate::error::MemoryError;
@@ -16,50 +17,12 @@ const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 
 // ---------------------------------------------------------------------------
-// Secret<T> — redacts sensitive values from Debug and Display output
-// ---------------------------------------------------------------------------
-
-/// A wrapper that redacts its inner value from `Debug` and `Display`.
-///
-/// Use `.expose()` to access the raw value when it is genuinely needed
-/// (e.g. to pass to an API call).
-pub struct Secret<T>(T);
-
-impl<T> Secret<T> {
-    pub fn new(value: T) -> Self {
-        Self(value)
-    }
-
-    /// Expose the inner value. Call sites make the exposure explicit.
-    pub fn expose(&self) -> &T {
-        &self.0
-    }
-
-    /// Consume the wrapper and return the inner value.
-    #[allow(dead_code)] // API surface for future callers needing to unwrap secrets
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-}
-
-impl<T> fmt::Debug for Secret<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-impl<T> fmt::Display for Secret<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-// ---------------------------------------------------------------------------
 // StoreBackend — where to persist a newly acquired token
 // ---------------------------------------------------------------------------
 
 /// Token storage backend selection for `memory-mcp auth login`.
 #[derive(Clone, Debug, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum StoreBackend {
     /// Store token in the system keyring.
     Keyring,
@@ -77,10 +40,13 @@ pub enum StoreBackend {
 // K8sSecretConfig — configuration for Kubernetes Secret storage
 // ---------------------------------------------------------------------------
 
+/// Configuration for storing a token as a Kubernetes Secret.
 #[cfg(feature = "k8s")]
 #[derive(Debug)]
 pub struct K8sSecretConfig {
+    /// Kubernetes namespace in which to create or update the secret.
     pub namespace: String,
+    /// Name of the Kubernetes Secret resource.
     pub secret_name: String,
 }
 
@@ -133,9 +99,10 @@ struct AccessTokenResponse {
 // AuthProvider
 // ---------------------------------------------------------------------------
 
+/// Resolves and caches a GitHub personal access token from multiple sources.
 pub struct AuthProvider {
     /// Cached token, if resolved at startup.
-    token: Option<Secret<String>>,
+    token: Option<SecretString>,
 }
 
 impl AuthProvider {
@@ -144,7 +111,7 @@ impl AuthProvider {
     /// Does not fail if no token is available — some deployments may not
     /// need remote sync. Call [`Self::resolve_token`] when a token is required.
     pub fn new() -> Self {
-        let token = Self::try_resolve().ok().map(Secret::new);
+        let token = Self::try_resolve().ok();
         if token.is_some() {
             debug!("AuthProvider: token resolved at startup");
         } else {
@@ -160,12 +127,12 @@ impl AuthProvider {
     /// 1. `MEMORY_MCP_GITHUB_TOKEN` env var
     /// 2. `~/.config/memory-mcp/token` file
     /// 3. System keyring (GNOME Keyring / KWallet / macOS Keychain)
-    pub fn resolve_token(&self) -> Result<Secret<String>, MemoryError> {
+    pub fn resolve_token(&self) -> Result<SecretString, MemoryError> {
         // Return cached token if we already have one.
         if let Some(ref t) = self.token {
-            return Ok(Secret::new(t.expose().clone()));
+            return Ok(t.clone());
         }
-        Self::try_resolve().map(Secret::new)
+        Self::try_resolve()
     }
 
     // -----------------------------------------------------------------------
@@ -173,11 +140,14 @@ impl AuthProvider {
     // -----------------------------------------------------------------------
 
     /// Resolve the token and return both the raw value and which source provided it.
-    fn try_resolve_with_source() -> Result<(String, TokenSource), MemoryError> {
+    fn try_resolve_with_source() -> Result<(SecretString, TokenSource), MemoryError> {
         // 1. Environment variable.
         if let Ok(tok) = std::env::var(ENV_VAR) {
             if !tok.trim().is_empty() {
-                return Ok((tok.trim().to_string(), TokenSource::EnvVar));
+                return Ok((
+                    SecretString::from(tok.trim().to_string()),
+                    TokenSource::EnvVar,
+                ));
             }
         }
 
@@ -191,7 +161,7 @@ impl AuthProvider {
                 let raw = std::fs::read_to_string(&path)?;
                 let tok = raw.trim().to_string();
                 if !tok.is_empty() {
-                    return Ok((tok, TokenSource::File));
+                    return Ok((SecretString::from(tok), TokenSource::File));
                 }
             }
         }
@@ -201,7 +171,10 @@ impl AuthProvider {
             Ok(entry) => match entry.get_password() {
                 Ok(tok) if !tok.trim().is_empty() => {
                     info!("resolved GitHub token from system keyring");
-                    return Ok((tok.trim().to_string(), TokenSource::Keyring));
+                    return Ok((
+                        SecretString::from(tok.trim().to_string()),
+                        TokenSource::Keyring,
+                    ));
                 }
                 Ok(_) => { /* empty password stored — fall through */ }
                 Err(keyring::Error::NoEntry) => { /* no entry — fall through */ }
@@ -225,17 +198,19 @@ impl AuthProvider {
         ))
     }
 
-    fn try_resolve() -> Result<String, MemoryError> {
+    fn try_resolve() -> Result<SecretString, MemoryError> {
         Self::try_resolve_with_source().map(|(tok, _)| tok)
     }
 }
 
 impl AuthProvider {
-    /// Create an `AuthProvider` with a pre-set token. For testing only.
-    #[cfg(test)]
-    pub(crate) fn with_token(token: &str) -> Self {
+    /// Create an `AuthProvider` with a pre-set token.
+    ///
+    /// Use this when you already have a token from your own auth flow
+    /// and want to skip the built-in resolution chain (env var → file → keyring).
+    pub fn with_token(token: &str) -> Self {
         Self {
-            token: Some(Secret::new(token.to_string())),
+            token: Some(SecretString::from(token.to_string())),
         }
     }
 }
@@ -330,7 +305,7 @@ pub async fn device_flow_login(
             .map_err(|e| MemoryError::OAuth(format!("failed to parse token response: {e}")))?;
 
         if let Some(tok) = resp.access_token.filter(|t| !t.trim().is_empty()) {
-            break tok;
+            break SecretString::from(tok);
         }
 
         match resp.error.as_deref() {
@@ -393,20 +368,20 @@ pub async fn device_flow_login(
 ///
 /// Never logs the token value — only the chosen storage destination.
 async fn store_token(
-    token: &str,
+    token: &SecretString,
     backend: Option<StoreBackend>,
     #[cfg(feature = "k8s")] k8s_config: Option<K8sSecretConfig>,
 ) -> Result<(), MemoryError> {
     match backend {
         Some(StoreBackend::Stdout) => {
-            println!("{token}");
+            println!("{}", token.expose_secret());
             debug!("token written to stdout");
         }
         Some(StoreBackend::Keyring) => {
-            store_in_keyring(token)?;
+            store_in_keyring(token.expose_secret())?;
         }
         Some(StoreBackend::File) => {
-            store_in_file(token)?;
+            store_in_file(token.expose_secret())?;
         }
         #[cfg(feature = "k8s")]
         Some(StoreBackend::K8sSecret) => {
@@ -415,11 +390,11 @@ async fn store_token(
                     "k8s-secret backend requires namespace and secret name".into(),
                 )
             })?;
-            store_in_k8s_secret(token, &config).await?;
+            store_in_k8s_secret(token.expose_secret(), &config).await?;
         }
         None => {
             // No --store flag: try keyring ONLY. Do NOT fall back to file.
-            store_in_keyring(token).map_err(|e| {
+            store_in_keyring(token.expose_secret()).map_err(|e| {
                 MemoryError::TokenStorage(format!(
                     "Keyring unavailable: {e}. Use --store file to write to \
                      ~/.config/memory-mcp/token, --store stdout to print the token\
@@ -627,8 +602,9 @@ fn map_kube_error(e: kube::Error, namespace: &str) -> MemoryError {
 pub fn print_auth_status() {
     match AuthProvider::try_resolve_with_source() {
         Ok((token, source)) => {
-            let preview = if token.len() >= 12 {
-                format!("{}...", &token[..4])
+            let raw = token.expose_secret();
+            let preview = if raw.len() >= 12 {
+                format!("{}...", &raw[..4])
             } else {
                 "****...".to_string()
             };
@@ -678,6 +654,7 @@ fn check_token_file_permissions(path: &std::path::Path) {
 // Platform-portable home directory helper (shared with main.rs)
 // ---------------------------------------------------------------------------
 
+/// Returns the user's home directory, or `None` if `HOME` is not set.
 pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var("HOME")
         .ok()
@@ -712,7 +689,7 @@ mod tests {
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok(), "expected Ok but got: {result:?}");
-        assert_eq!(result.unwrap(), token_value);
+        assert_eq!(result.unwrap().expose_secret(), token_value);
     }
 
     #[test]
@@ -724,7 +701,7 @@ mod tests {
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), token_value.trim());
+        assert_eq!(result.unwrap().expose_secret(), token_value.trim());
     }
 
     #[test]
@@ -745,7 +722,7 @@ mod tests {
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), env_token);
+        assert_eq!(result.unwrap().expose_secret(), env_token);
     }
 
     #[test]
@@ -758,7 +735,7 @@ mod tests {
 
         assert!(result.is_ok(), "expected Ok but got: {result:?}");
         let (tok, source) = result.unwrap();
-        assert_eq!(tok, token_value);
+        assert_eq!(tok.expose_secret(), token_value);
         assert!(
             matches!(source, TokenSource::EnvVar),
             "expected TokenSource::EnvVar, got: {source:?}"
@@ -820,7 +797,7 @@ mod tests {
         let result = AuthProvider::try_resolve();
         let _ = entry.delete_credential(); // cleanup before assert
         assert!(result.is_ok(), "expected token from keyring: {result:?}");
-        assert_eq!(result.unwrap(), test_token);
+        assert_eq!(result.unwrap().expose_secret(), test_token);
     }
 
     /// Device flow requires real GitHub interaction — skip in CI.

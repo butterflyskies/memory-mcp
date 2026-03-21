@@ -110,8 +110,11 @@ pub fn validate_branch_name(branch: &str) -> Result<(), MemoryError> {
 /// - `Project(name)`    → `projects/{name}/`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "name")]
+#[non_exhaustive]
 pub enum Scope {
+    /// Machine-wide memories, stored under `global/`.
     Global,
+    /// Project-scoped memories, stored under `projects/{name}/`.
     Project(String),
 }
 
@@ -171,17 +174,23 @@ impl FromStr for Scope {
 // MemoryMetadata
 // ---------------------------------------------------------------------------
 
+/// Metadata attached to every [`Memory`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryMetadata {
+    /// Free-form tags for categorisation and filtering.
     pub tags: Vec<String>,
+    /// Where this memory lives (global or project-scoped).
     pub scope: Scope,
+    /// When this memory was first created.
     pub created_at: DateTime<Utc>,
+    /// When this memory was last modified.
     pub updated_at: DateTime<Utc>,
     /// Optional hint about where this memory came from (e.g. a tool name).
     pub source: Option<String>,
 }
 
 impl MemoryMetadata {
+    /// Create new metadata with the current timestamp for both `created_at` and `updated_at`.
     pub fn new(scope: Scope, tags: Vec<String>, source: Option<String>) -> Self {
         let now = Utc::now();
         Self {
@@ -207,10 +216,12 @@ pub struct Memory {
     pub name: String,
     /// Markdown body (no frontmatter).
     pub content: String,
+    /// Associated metadata (tags, scope, timestamps, source).
     pub metadata: MemoryMetadata,
 }
 
 impl Memory {
+    /// Create a new memory with a random UUID.
     pub fn new(name: String, content: String, metadata: MemoryMetadata) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -449,6 +460,7 @@ pub struct SyncArgs {
 
 /// The outcome of a `pull()` operation.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PullResult {
     /// No `origin` remote is configured — running in local-only mode.
     NoRemote,
@@ -456,13 +468,18 @@ pub enum PullResult {
     UpToDate,
     /// The remote was ahead and the branch was fast-forwarded.
     FastForward {
+        /// Commit OID before the fast-forward.
         old_head: [u8; 20],
+        /// Commit OID after the fast-forward.
         new_head: [u8; 20],
     },
     /// A merge was performed; `conflicts_resolved` counts auto-resolved files.
     Merged {
+        /// Number of conflicting files that were auto-resolved.
         conflicts_resolved: usize,
+        /// Commit OID before the merge.
         old_head: [u8; 20],
+        /// Commit OID after the merge.
         new_head: [u8; 20],
     },
 }
@@ -494,9 +511,13 @@ impl ChangedMemories {
 /// Statistics from an incremental reindex operation.
 #[derive(Debug, Default)]
 pub struct ReindexStats {
+    /// Number of newly indexed memories.
     pub added: usize,
+    /// Number of memories whose embeddings were refreshed.
     pub updated: usize,
+    /// Number of memories removed from the index.
     pub removed: usize,
+    /// Number of memories that failed to index.
     pub errors: usize,
 }
 
@@ -514,13 +535,37 @@ use crate::{
 ///
 /// Wrapped in a single outer `Arc` at the call site. `repo` is additionally
 /// wrapped in its own `Arc` so it can be cloned into `spawn_blocking` closures.
+#[non_exhaustive]
 pub struct AppState {
+    /// Git-backed memory repository.
     pub repo: Arc<MemoryRepo>,
+    /// Backend used to compute text embeddings.
     pub embedding: Box<dyn EmbeddingBackend>,
+    /// In-memory vector index for semantic search.
     pub index: VectorIndex,
+    /// Authentication provider for API access control.
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").
     pub branch: String,
+}
+
+impl AppState {
+    /// Create a new application state from subsystem instances.
+    pub fn new(
+        repo: Arc<MemoryRepo>,
+        branch: String,
+        embedding: Box<dyn EmbeddingBackend>,
+        index: VectorIndex,
+        auth: AuthProvider,
+    ) -> Self {
+        Self {
+            repo,
+            embedding,
+            index,
+            auth,
+            branch,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

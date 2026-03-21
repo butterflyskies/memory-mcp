@@ -179,6 +179,7 @@ async fn incremental_reindex(
 
 #[tool_router]
 impl MemoryServer {
+    /// Create a new MCP server backed by the given application state.
     pub fn new(state: Arc<AppState>) -> Self {
         Self {
             state,
