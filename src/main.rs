@@ -161,7 +161,8 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
             AuthAction::Status => {
-                auth::print_auth_status();
+                let provider = AuthProvider::default();
+                auth::print_auth_status(&provider);
             }
         },
     }
@@ -180,7 +181,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // Expand `~` in repo_path, failing loudly if HOME is not set and the
     // path requires it (i.e. the user did not provide --repo-path explicitly).
-    let repo_path = expand_tilde(&args.repo_path)?;
+    let repo_path = expand_path(&args.repo_path)?;
     info!("repo path: {}", repo_path.display());
 
     // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
@@ -296,23 +297,15 @@ async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn expand_tilde(path: &str) -> anyhow::Result<PathBuf> {
-    let home_dir = || -> anyhow::Result<PathBuf> {
-        std::env::var("HOME").map(PathBuf::from).map_err(|_| {
-            anyhow::anyhow!(
-                "HOME environment variable is not set; \
-                     please provide --repo-path explicitly or set HOME"
-            )
-        })
-    };
-
-    if let Some(rest) = path.strip_prefix("~/") {
-        Ok(home_dir()?.join(rest))
-    } else if path == "~" {
-        home_dir()
-    } else {
-        Ok(PathBuf::from(path))
+fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
+    let expanded = shellexpand::tilde(path);
+    if expanded.starts_with('~') {
+        anyhow::bail!(
+            "could not expand '~': home directory could not be determined; \
+             please provide --repo-path explicitly or set HOME"
+        );
     }
+    Ok(PathBuf::from(expanded.as_ref()))
 }
 
 // ---------------------------------------------------------------------------

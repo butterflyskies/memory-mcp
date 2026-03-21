@@ -55,11 +55,17 @@ pub struct K8sSecretConfig {
 // ---------------------------------------------------------------------------
 
 /// Indicates which source produced the resolved token.
-#[derive(Debug)]
-enum TokenSource {
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TokenSource {
+    /// Token was read from the `MEMORY_MCP_GITHUB_TOKEN` environment variable.
     EnvVar,
+    /// Token was read from the `~/.config/memory-mcp/token` file.
     File,
+    /// Token was read from the system keyring (GNOME Keyring / KWallet / macOS Keychain).
     Keyring,
+    /// Token was provided directly via constructor.
+    Explicit,
 }
 
 impl fmt::Display for TokenSource {
@@ -68,6 +74,7 @@ impl fmt::Display for TokenSource {
             TokenSource::EnvVar => write!(f, "environment variable ({})", ENV_VAR),
             TokenSource::File => write!(f, "token file (~/.config/memory-mcp/token)"),
             TokenSource::Keyring => write!(f, "system keyring"),
+            TokenSource::Explicit => write!(f, "explicit token"),
         }
     }
 }
@@ -101,8 +108,8 @@ struct AccessTokenResponse {
 
 /// Resolves and caches a GitHub personal access token from multiple sources.
 pub struct AuthProvider {
-    /// Cached token, if resolved at startup.
-    token: Option<SecretString>,
+    /// Cached token and its source, if resolved at startup.
+    token: Option<(SecretString, TokenSource)>,
 }
 
 impl AuthProvider {
@@ -111,7 +118,7 @@ impl AuthProvider {
     /// Does not fail if no token is available — some deployments may not
     /// need remote sync. Call [`Self::resolve_token`] when a token is required.
     pub fn new() -> Self {
-        let token = Self::try_resolve().ok();
+        let token = Self::try_resolve_with_source().ok();
         if token.is_some() {
             debug!("AuthProvider: token resolved at startup");
         } else {
@@ -121,18 +128,26 @@ impl AuthProvider {
     }
 
     /// Resolve a GitHub personal access token, returning it wrapped in
-    /// [`Secret`] so it cannot accidentally appear in logs or error chains.
+    /// [`SecretString`] so it cannot accidentally appear in logs or error chains.
     ///
     /// Checks (in order):
     /// 1. `MEMORY_MCP_GITHUB_TOKEN` env var
     /// 2. `~/.config/memory-mcp/token` file
     /// 3. System keyring (GNOME Keyring / KWallet / macOS Keychain)
     pub fn resolve_token(&self) -> Result<SecretString, MemoryError> {
-        // Return cached token if we already have one.
-        if let Some(ref t) = self.token {
-            return Ok(t.clone());
+        self.resolve_with_source().map(|(tok, _)| tok)
+    }
+
+    /// Resolve the token and return which source provided it.
+    ///
+    /// Like [`resolve_token`](Self::resolve_token), returns the cached token if
+    /// one was resolved at startup. Falls back to the resolution chain
+    /// (env var → file → keyring) if no cached token exists.
+    pub fn resolve_with_source(&self) -> Result<(SecretString, TokenSource), MemoryError> {
+        if let Some((ref t, ref s)) = self.token {
+            return Ok((t.clone(), s.clone()));
         }
-        Self::try_resolve()
+        Self::try_resolve_with_source()
     }
 
     // -----------------------------------------------------------------------
@@ -197,10 +212,6 @@ impl AuthProvider {
                 .to_string(),
         ))
     }
-
-    fn try_resolve() -> Result<SecretString, MemoryError> {
-        Self::try_resolve_with_source().map(|(tok, _)| tok)
-    }
 }
 
 impl AuthProvider {
@@ -210,7 +221,7 @@ impl AuthProvider {
     /// and want to skip the built-in resolution chain (env var → file → keyring).
     pub fn with_token(token: &str) -> Self {
         Self {
-            token: Some(SecretString::from(token.to_string())),
+            token: Some((SecretString::from(token.to_string()), TokenSource::Explicit)),
         }
     }
 }
@@ -599,14 +610,14 @@ fn map_kube_error(e: kube::Error, namespace: &str) -> MemoryError {
 ///
 /// Shows the source of the resolved token and a redacted preview.
 /// Never prints the full token value.
-pub fn print_auth_status() {
-    match AuthProvider::try_resolve_with_source() {
+pub fn print_auth_status(provider: &AuthProvider) {
+    match provider.resolve_with_source() {
         Ok((token, source)) => {
             let raw = token.expose_secret();
-            let preview = if raw.len() >= 12 {
-                format!("{}...", &raw[..4])
+            let preview = if raw.len() >= 8 {
+                format!("...{}", &raw[raw.len() - 4..])
             } else {
-                "****...".to_string()
+                "****".to_string()
             };
             println!("Authenticated via {source}");
             println!("Token: {preview}");
@@ -651,19 +662,15 @@ fn check_token_file_permissions(path: &std::path::Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Platform-portable home directory helper (shared with main.rs)
+// Platform-portable home directory helper
 // ---------------------------------------------------------------------------
 
-/// Returns the user's home directory, or `None` if `HOME` is not set.
-pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            // Fallback for unusual environments
-            #[allow(deprecated)]
-            std::env::home_dir()
-        })
+/// Returns the user's home directory using the platform-native mechanism.
+///
+/// Delegates to [`homedir::my_home`], which checks `HOME` on Unix and the
+/// Windows profile directory on Windows — no deprecated `std::env::home_dir`.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    homedir::my_home().ok().flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -685,7 +692,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let token_value = "ghp_test_env_token_abc123";
         std::env::set_var(ENV_VAR, token_value);
-        let result = AuthProvider::try_resolve();
+        let result = AuthProvider::try_resolve_with_source().map(|(tok, _)| tok);
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok(), "expected Ok but got: {result:?}");
@@ -697,7 +704,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let token_value = "  ghp_padded_token  ";
         std::env::set_var(ENV_VAR, token_value);
-        let result = AuthProvider::try_resolve();
+        let result = AuthProvider::try_resolve_with_source().map(|(tok, _)| tok);
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok());
@@ -718,7 +725,7 @@ mod tests {
         // Override HOME so the file lookup would pick up our temp file if env
         // were not consulted first.  We rely on env taking precedence, so
         // this primarily tests ordering rather than actual file resolution.
-        let result = AuthProvider::try_resolve();
+        let result = AuthProvider::try_resolve_with_source().map(|(tok, _)| tok);
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok());
@@ -794,7 +801,7 @@ mod tests {
             .set_password(test_token)
             .expect("storing token should succeed");
 
-        let result = AuthProvider::try_resolve();
+        let result = AuthProvider::try_resolve_with_source().map(|(tok, _)| tok);
         let _ = entry.delete_credential(); // cleanup before assert
         assert!(result.is_ok(), "expected token from keyring: {result:?}");
         assert_eq!(result.unwrap().expose_secret(), test_token);

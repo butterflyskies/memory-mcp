@@ -620,7 +620,7 @@ impl MemoryRepo {
     /// Qualified names are returned without the `.md` suffix (e.g. `"global/foo"`).
     ///
     /// Must be called from within `spawn_blocking` since it uses git2.
-    pub(crate) fn diff_changed_memories(
+    pub fn diff_changed_memories(
         &self,
         old_oid: [u8; 20],
         new_oid: [u8; 20],
