@@ -1,3 +1,5 @@
+//! Thin CLI wrapper around the [`memory_mcp`] library crate.
+
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
@@ -206,13 +208,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let auth = AuthProvider::new();
 
-    let state = Arc::new(AppState {
-        repo: Arc::new(repo),
+    let state = Arc::new(AppState::new(
+        Arc::new(repo),
         embedding,
         index,
         auth,
-        branch: args.branch.clone(),
-    });
+        args.branch.clone(),
+    ));
 
     // Keep a reference for post-shutdown index persistence.
     let state_for_shutdown = Arc::clone(&state);
@@ -295,22 +297,19 @@ async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn expand_tilde(path: &str) -> anyhow::Result<PathBuf> {
+    let home_dir = || -> anyhow::Result<PathBuf> {
+        std::env::var("HOME").map(PathBuf::from).map_err(|_| {
+            anyhow::anyhow!(
+                "HOME environment variable is not set; \
+                     please provide --repo-path explicitly or set HOME"
+            )
+        })
+    };
+
     if let Some(rest) = path.strip_prefix("~/") {
-        let home = auth::home_dir().ok_or_else(|| {
-            anyhow::anyhow!(
-                "HOME environment variable is not set; \
-                 please provide --repo-path explicitly or set HOME"
-            )
-        })?;
-        Ok(home.join(rest))
+        Ok(home_dir()?.join(rest))
     } else if path == "~" {
-        let home = auth::home_dir().ok_or_else(|| {
-            anyhow::anyhow!(
-                "HOME environment variable is not set; \
-                 please provide --repo-path explicitly or set HOME"
-            )
-        })?;
-        Ok(home)
+        home_dir()
     } else {
         Ok(PathBuf::from(path))
     }

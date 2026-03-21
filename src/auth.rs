@@ -37,7 +37,6 @@ impl<T> Secret<T> {
     }
 
     /// Consume the wrapper and return the inner value.
-    #[allow(dead_code)] // API surface for future callers needing to unwrap secrets
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -61,6 +60,7 @@ impl<T> fmt::Display for Secret<T> {
 
 /// Token storage backend selection for `memory-mcp auth login`.
 #[derive(Clone, Debug, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum StoreBackend {
     /// Store token in the system keyring.
     Keyring,
@@ -149,7 +149,7 @@ impl AuthProvider {
     /// Does not fail if no token is available — some deployments may not
     /// need remote sync. Call [`Self::resolve_token`] when a token is required.
     pub fn new() -> Self {
-        let token = Self::try_resolve().ok().map(Secret::new);
+        let token = Self::try_resolve().ok();
         if token.is_some() {
             debug!("AuthProvider: token resolved at startup");
         } else {
@@ -170,7 +170,7 @@ impl AuthProvider {
         if let Some(ref t) = self.token {
             return Ok(Secret::new(t.expose().clone()));
         }
-        Self::try_resolve().map(Secret::new)
+        Self::try_resolve()
     }
 
     // -----------------------------------------------------------------------
@@ -178,11 +178,11 @@ impl AuthProvider {
     // -----------------------------------------------------------------------
 
     /// Resolve the token and return both the raw value and which source provided it.
-    fn try_resolve_with_source() -> Result<(String, TokenSource), MemoryError> {
+    fn try_resolve_with_source() -> Result<(Secret<String>, TokenSource), MemoryError> {
         // 1. Environment variable.
         if let Ok(tok) = std::env::var(ENV_VAR) {
             if !tok.trim().is_empty() {
-                return Ok((tok.trim().to_string(), TokenSource::EnvVar));
+                return Ok((Secret::new(tok.trim().to_string()), TokenSource::EnvVar));
             }
         }
 
@@ -196,7 +196,7 @@ impl AuthProvider {
                 let raw = std::fs::read_to_string(&path)?;
                 let tok = raw.trim().to_string();
                 if !tok.is_empty() {
-                    return Ok((tok, TokenSource::File));
+                    return Ok((Secret::new(tok), TokenSource::File));
                 }
             }
         }
@@ -206,7 +206,7 @@ impl AuthProvider {
             Ok(entry) => match entry.get_password() {
                 Ok(tok) if !tok.trim().is_empty() => {
                     info!("resolved GitHub token from system keyring");
-                    return Ok((tok.trim().to_string(), TokenSource::Keyring));
+                    return Ok((Secret::new(tok.trim().to_string()), TokenSource::Keyring));
                 }
                 Ok(_) => { /* empty password stored — fall through */ }
                 Err(keyring::Error::NoEntry) => { /* no entry — fall through */ }
@@ -230,7 +230,7 @@ impl AuthProvider {
         ))
     }
 
-    fn try_resolve() -> Result<String, MemoryError> {
+    fn try_resolve() -> Result<Secret<String>, MemoryError> {
         Self::try_resolve_with_source().map(|(tok, _)| tok)
     }
 }
@@ -632,8 +632,9 @@ fn map_kube_error(e: kube::Error, namespace: &str) -> MemoryError {
 pub fn print_auth_status() {
     match AuthProvider::try_resolve_with_source() {
         Ok((token, source)) => {
-            let preview = if token.len() >= 12 {
-                format!("{}...", &token[..4])
+            let raw = token.expose();
+            let preview = if raw.len() >= 12 {
+                format!("{}...", &raw[..4])
             } else {
                 "****...".to_string()
             };
@@ -684,7 +685,7 @@ fn check_token_file_permissions(path: &std::path::Path) {
 // ---------------------------------------------------------------------------
 
 /// Returns the user's home directory, or `None` if `HOME` is not set.
-pub fn home_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(std::path::PathBuf::from)
@@ -718,7 +719,7 @@ mod tests {
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok(), "expected Ok but got: {result:?}");
-        assert_eq!(result.unwrap(), token_value);
+        assert_eq!(result.unwrap().expose(), token_value);
     }
 
     #[test]
@@ -730,7 +731,7 @@ mod tests {
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), token_value.trim());
+        assert_eq!(result.unwrap().expose(), token_value.trim());
     }
 
     #[test]
@@ -751,7 +752,7 @@ mod tests {
         std::env::remove_var(ENV_VAR);
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), env_token);
+        assert_eq!(result.unwrap().expose(), env_token);
     }
 
     #[test]
@@ -764,7 +765,7 @@ mod tests {
 
         assert!(result.is_ok(), "expected Ok but got: {result:?}");
         let (tok, source) = result.unwrap();
-        assert_eq!(tok, token_value);
+        assert_eq!(tok.expose(), token_value);
         assert!(
             matches!(source, TokenSource::EnvVar),
             "expected TokenSource::EnvVar, got: {source:?}"
@@ -826,7 +827,7 @@ mod tests {
         let result = AuthProvider::try_resolve();
         let _ = entry.delete_credential(); // cleanup before assert
         assert!(result.is_ok(), "expected token from keyring: {result:?}");
-        assert_eq!(result.unwrap(), test_token);
+        assert_eq!(result.unwrap().expose(), test_token);
     }
 
     /// Device flow requires real GitHub interaction — skip in CI.

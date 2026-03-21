@@ -110,6 +110,7 @@ pub fn validate_branch_name(branch: &str) -> Result<(), MemoryError> {
 /// - `Project(name)`    → `projects/{name}/`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "name")]
+#[non_exhaustive]
 pub enum Scope {
     /// Machine-wide memories, stored under `global/`.
     Global,
@@ -459,6 +460,7 @@ pub struct SyncArgs {
 
 /// The outcome of a `pull()` operation.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PullResult {
     /// No `origin` remote is configured — running in local-only mode.
     NoRemote,
@@ -533,6 +535,7 @@ use crate::{
 ///
 /// Wrapped in a single outer `Arc` at the call site. `repo` is additionally
 /// wrapped in its own `Arc` so it can be cloned into `spawn_blocking` closures.
+#[non_exhaustive]
 pub struct AppState {
     /// Git-backed memory repository.
     pub repo: Arc<MemoryRepo>,
@@ -544,6 +547,25 @@ pub struct AppState {
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").
     pub branch: String,
+}
+
+impl AppState {
+    /// Create a new application state from subsystem instances.
+    pub fn new(
+        repo: Arc<MemoryRepo>,
+        embedding: Box<dyn EmbeddingBackend>,
+        index: VectorIndex,
+        auth: AuthProvider,
+        branch: String,
+    ) -> Self {
+        Self {
+            repo,
+            embedding,
+            index,
+            auth,
+            branch,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
