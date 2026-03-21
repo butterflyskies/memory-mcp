@@ -1,3 +1,5 @@
+//! Thin CLI wrapper around the [`memory_mcp`] library crate.
+
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
@@ -9,20 +11,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod auth;
-mod embedding;
-mod error;
-mod index;
-mod repo;
-mod server;
-mod types;
-
-use auth::{AuthProvider, StoreBackend};
-use embedding::{CandleEmbeddingEngine, EmbeddingBackend};
-use index::VectorIndex;
-use repo::MemoryRepo;
-use server::MemoryServer;
-use types::{validate_branch_name, AppState};
+use memory_mcp::auth::{self, AuthProvider, StoreBackend};
+use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend, MODEL_ID};
+use memory_mcp::index::VectorIndex;
+use memory_mcp::repo::MemoryRepo;
+use memory_mcp::server::MemoryServer;
+use memory_mcp::types::{validate_branch_name, AppState};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -167,7 +161,8 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
             AuthAction::Status => {
-                auth::print_auth_status();
+                let provider = AuthProvider::default();
+                auth::print_auth_status(&provider);
             }
         },
     }
@@ -186,7 +181,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // Expand `~` in repo_path, failing loudly if HOME is not set and the
     // path requires it (i.e. the user did not provide --repo-path explicitly).
-    let repo_path = expand_tilde(&args.repo_path)?;
+    let repo_path = expand_path(&args.repo_path)?;
     info!("repo path: {}", repo_path.display());
 
     // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
@@ -196,7 +191,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let repo = MemoryRepo::init_or_open(&repo_path, remote_url.as_deref())
         .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 
-    let embedding: Box<dyn embedding::EmbeddingBackend> =
+    let embedding: Box<dyn EmbeddingBackend> =
         Box::new(CandleEmbeddingEngine::new().context("failed to init embedding engine")?);
 
     let dimensions = embedding.dimensions();
@@ -214,13 +209,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let auth = AuthProvider::new();
 
-    let state = Arc::new(AppState {
-        repo: Arc::new(repo),
+    let state = Arc::new(AppState::new(
+        Arc::new(repo),
+        args.branch.clone(),
         embedding,
         index,
         auth,
-        branch: args.branch.clone(),
-    });
+    ));
 
     // Keep a reference for post-shutdown index persistence.
     let state_for_shutdown = Arc::clone(&state);
@@ -286,7 +281,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 /// Load the embedding model and run a single dummy embed to warm the on-disk
 /// model cache, then exit. Intended for use as a Kubernetes init container.
 async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
-    info!("warming up embedding model '{}'", embedding::MODEL_ID);
+    info!("warming up embedding model '{}'", MODEL_ID);
     let engine = CandleEmbeddingEngine::new().context("failed to init embedding engine")?;
     // Run one dummy embed to ensure the model weights are fully loaded and any
     // cached files are written to disk.
@@ -302,26 +297,15 @@ async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn expand_tilde(path: &str) -> anyhow::Result<PathBuf> {
-    if let Some(rest) = path.strip_prefix("~/") {
-        let home = auth::home_dir().ok_or_else(|| {
-            anyhow::anyhow!(
-                "HOME environment variable is not set; \
-                 please provide --repo-path explicitly or set HOME"
-            )
-        })?;
-        Ok(home.join(rest))
-    } else if path == "~" {
-        let home = auth::home_dir().ok_or_else(|| {
-            anyhow::anyhow!(
-                "HOME environment variable is not set; \
-                 please provide --repo-path explicitly or set HOME"
-            )
-        })?;
-        Ok(home)
-    } else {
-        Ok(PathBuf::from(path))
+fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
+    let expanded = shellexpand::tilde(path);
+    if expanded.starts_with('~') {
+        anyhow::bail!(
+            "could not expand '~': home directory could not be determined; \
+             please provide --repo-path explicitly or set HOME"
+        );
     }
+    Ok(PathBuf::from(expanded.as_ref()))
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,8 @@ use std::{
 use git2::{build::CheckoutBuilder, ErrorCode, MergeOptions, Repository, Signature};
 use tracing::{info, warn};
 
+use secrecy::{ExposeSecret, SecretString};
+
 use crate::{
     auth::AuthProvider,
     error::MemoryError,
@@ -94,14 +96,15 @@ fn fast_forward(
 /// Build a `RemoteCallbacks` that authenticates with the given token.
 ///
 /// The callbacks live for `'static` because the token is moved in.
-fn build_auth_callbacks(token: String) -> git2::RemoteCallbacks<'static> {
+fn build_auth_callbacks(token: SecretString) -> git2::RemoteCallbacks<'static> {
     let mut callbacks = git2::RemoteCallbacks::new();
     callbacks.credentials(move |_url, _username, _allowed| {
-        git2::Cred::userpass_plaintext("x-access-token", &token)
+        git2::Cred::userpass_plaintext("x-access-token", token.expose_secret())
     });
     callbacks
 }
 
+/// Git-backed repository for persisting and syncing memory files.
 pub struct MemoryRepo {
     inner: Mutex<Repository>,
     root: PathBuf,
@@ -414,10 +417,10 @@ impl MemoryRepo {
         auth: &AuthProvider,
         branch: &str,
     ) -> Result<(), MemoryError> {
-        // Resolve the token as a Result<String> so we can move it (Send) into
-        // the closure. We defer actually failing until after we've confirmed
+        // Resolve the token early so we can move it (Send) into the
+        // spawn_blocking closure. We defer failing until after we've confirmed
         // that origin exists — local-only mode needs no token at all.
-        let token_result = auth.resolve_token().map(|t| t.into_inner());
+        let token_result = auth.resolve_token();
         let arc = Arc::clone(self);
         let branch = branch.to_string();
 
@@ -533,10 +536,10 @@ impl MemoryRepo {
         auth: &AuthProvider,
         branch: &str,
     ) -> Result<PullResult, MemoryError> {
-        // Resolve the token as a Result<String> so we can move it (Send) into
-        // the closure. We defer actually failing until after we've confirmed
+        // Resolve the token early so we can move it (Send) into the
+        // spawn_blocking closure. We defer failing until after we've confirmed
         // that origin exists — local-only mode needs no token at all.
-        let token_result = auth.resolve_token().map(|t| t.into_inner());
+        let token_result = auth.resolve_token();
         let arc = Arc::clone(self);
         let branch = branch.to_string();
 
@@ -617,7 +620,7 @@ impl MemoryRepo {
     /// Qualified names are returned without the `.md` suffix (e.g. `"global/foo"`).
     ///
     /// Must be called from within `spawn_blocking` since it uses git2.
-    pub(crate) fn diff_changed_memories(
+    pub fn diff_changed_memories(
         &self,
         old_oid: [u8; 20],
         new_oid: [u8; 20],
