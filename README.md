@@ -44,7 +44,12 @@ MEMORY_MCP_REPO_PATH=/path/to/memories \
 memory-mcp serve
 ```
 
-### Connect Claude Code
+### Connect your editor
+
+memory-mcp uses [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports) transport. Most MCP clients support it natively.
+
+<details>
+<summary><strong>Claude Code</strong></summary>
 
 Add to `~/.claude.json` or your project's `.mcp.json`:
 
@@ -58,6 +63,117 @@ Add to `~/.claude.json` or your project's `.mcp.json`:
   }
 }
 ```
+
+</details>
+
+<details>
+<summary><strong>Cursor</strong></summary>
+
+Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>VS Code (GitHub Copilot)</strong></summary>
+
+Add to `.vscode/mcp.json` in your workspace:
+
+```json
+{
+  "servers": {
+    "memory": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+Note: VS Code uses `"servers"` as the root key, not `"mcpServers"`.
+
+</details>
+
+<details>
+<summary><strong>Windsurf</strong></summary>
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "serverUrl": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+Note: Windsurf uses `"serverUrl"`, not `"url"`.
+
+</details>
+
+<details>
+<summary><strong>Continue.dev</strong></summary>
+
+Add to `.continue/mcpServers/memory.yaml`:
+
+```yaml
+mcpServers:
+  - name: memory
+    type: streamable-http
+    url: http://localhost:8080/mcp
+```
+
+</details>
+
+<details>
+<summary><strong>Claude Desktop</strong></summary>
+
+Add via **Settings > Connectors > Add custom server** with URL `http://localhost:8080/mcp`.
+
+Alternatively, use `mcp-remote` as a stdio bridge in `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "npx",
+      "args": ["mcp-remote", "http://localhost:8080/mcp"]
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Zed</strong></summary>
+
+Zed does not yet support Streamable HTTP natively. Use `mcp-remote` as a stdio bridge in `~/.config/zed/settings.json`:
+
+```json
+{
+  "context_servers": {
+    "memory": {
+      "source": "custom",
+      "command": "npx",
+      "args": ["mcp-remote", "http://localhost:8080/mcp"]
+    }
+  }
+}
+```
+
+</details>
 
 The agent can now use `remember`, `recall`, `read`, `edit`, `forget`, `list`, and `sync` as tools.
 
