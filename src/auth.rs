@@ -242,9 +242,12 @@ impl AuthProvider {
 }
 
 impl AuthProvider {
-    /// Create an `AuthProvider` with a pre-set token. For testing only.
-    #[cfg(test)]
-    pub(crate) fn with_token(token: &str) -> Self {
+    /// Create an `AuthProvider` with a pre-set token.
+    ///
+    /// Intended for testing — allows injecting a known token without
+    /// environment variables or keyring access.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_token(token: &str) -> Self {
         Self {
             token: Some(Secret::new(token.to_string())),
         }

@@ -7,7 +7,7 @@ use git2::{build::CheckoutBuilder, ErrorCode, MergeOptions, Repository, Signatur
 use tracing::{info, warn};
 
 use crate::{
-    auth::AuthProvider,
+    auth::{AuthProvider, Secret},
     error::MemoryError,
     types::{validate_name, ChangedMemories, Memory, PullResult, Scope},
 };
@@ -94,10 +94,11 @@ fn fast_forward(
 /// Build a `RemoteCallbacks` that authenticates with the given token.
 ///
 /// The callbacks live for `'static` because the token is moved in.
-fn build_auth_callbacks(token: String) -> git2::RemoteCallbacks<'static> {
+fn build_auth_callbacks(token: Secret<String>) -> git2::RemoteCallbacks<'static> {
     let mut callbacks = git2::RemoteCallbacks::new();
+    let raw = token.into_inner();
     callbacks.credentials(move |_url, _username, _allowed| {
-        git2::Cred::userpass_plaintext("x-access-token", &token)
+        git2::Cred::userpass_plaintext("x-access-token", &raw)
     });
     callbacks
 }
@@ -415,10 +416,10 @@ impl MemoryRepo {
         auth: &AuthProvider,
         branch: &str,
     ) -> Result<(), MemoryError> {
-        // Resolve the token as a Result<String> so we can move it (Send) into
-        // the closure. We defer actually failing until after we've confirmed
+        // Resolve the token early so we can move it (Send) into the
+        // spawn_blocking closure. We defer failing until after we've confirmed
         // that origin exists — local-only mode needs no token at all.
-        let token_result = auth.resolve_token().map(|t| t.into_inner());
+        let token_result = auth.resolve_token();
         let arc = Arc::clone(self);
         let branch = branch.to_string();
 
@@ -534,10 +535,10 @@ impl MemoryRepo {
         auth: &AuthProvider,
         branch: &str,
     ) -> Result<PullResult, MemoryError> {
-        // Resolve the token as a Result<String> so we can move it (Send) into
-        // the closure. We defer actually failing until after we've confirmed
+        // Resolve the token early so we can move it (Send) into the
+        // spawn_blocking closure. We defer failing until after we've confirmed
         // that origin exists — local-only mode needs no token at all.
-        let token_result = auth.resolve_token().map(|t| t.into_inner());
+        let token_result = auth.resolve_token();
         let arc = Arc::clone(self);
         let branch = branch.to_string();
 
