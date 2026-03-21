@@ -15,7 +15,13 @@ AI coding agents are stateless between sessions. They lose context about your pr
 
 ## Quick start
 
-### From source
+### Install from crates.io
+
+```bash
+cargo install memory-mcp
+```
+
+### Or from source
 
 ```bash
 git clone https://github.com/butterflyskies/memory-mcp.git
@@ -25,14 +31,17 @@ cargo build --release
 
 ### Run the server
 
+On first run, the embedding model (~130MB) is downloaded from HuggingFace Hub.
+You can pre-download it with `memory-mcp warmup`.
+
 ```bash
 # Starts on 127.0.0.1:8080 with a local git repo at ~/.memory-mcp
-./target/release/memory-mcp serve
+memory-mcp serve
 
 # Or configure via environment variables
 MEMORY_MCP_BIND=0.0.0.0:9090 \
 MEMORY_MCP_REPO_PATH=/path/to/memories \
-./target/release/memory-mcp serve
+memory-mcp serve
 ```
 
 ### Connect Claude Code
@@ -154,7 +163,7 @@ memory-mcp auth login
 
 # Or specify storage explicitly
 memory-mcp auth login --store keyring   # system keyring (default)
-memory-mcp auth login --store file      # ~/.memory-mcp-token
+memory-mcp auth login --store file      # ~/.config/memory-mcp/token
 memory-mcp auth login --store stdout    # print token, pipe to your own storage
 
 # Kubernetes deployments (requires --features k8s)
@@ -164,7 +173,7 @@ memory-mcp auth login --store k8s-secret
 memory-mcp auth status
 ```
 
-Token resolution order: `MEMORY_MCP_GITHUB_TOKEN` env var → `~/.memory-mcp-token` file → system keyring.
+Token resolution order: `MEMORY_MCP_GITHUB_TOKEN` env var → `~/.config/memory-mcp/token` file → system keyring.
 
 ## Embedding model
 
@@ -218,6 +227,18 @@ Significant design decisions are documented as Architecture Decision Records in 
 - **Input validation**: memory names, content size, and nesting depth are validated. Path traversal and symlink attacks are blocked.
 - **Container hardening**: non-root user, read-only filesystem, dropped capabilities, seccomp profile.
 - **Supply chain**: CI pins all GitHub Actions to commit SHAs. Container images include SLSA provenance and SBOM attestations. Dependencies are audited with `cargo audit` on every build.
+
+## Roadmap
+
+The core memory engine is stable — store, search, sync, and authenticate all work today. Planned next:
+
+- **BM25 keyword search** alongside semantic search ([#55](https://github.com/butterflyskies/memory-mcp/issues/55))
+- **Cross-platform vector index** with brute-force fallback for Windows ([#56](https://github.com/butterflyskies/memory-mcp/issues/56))
+- **Deduplication** on remember (semantic similarity threshold)
+- **Tag-based filtering** in recall
+- **Richer observability** with structured tracing across all subsystems ([#52](https://github.com/butterflyskies/memory-mcp/issues/52))
+
+See [TODO.md](TODO.md) for the full plan and [open issues](https://github.com/butterflyskies/memory-mcp/issues) for what's in flight.
 
 ## Development
 
