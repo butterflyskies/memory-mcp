@@ -2045,6 +2045,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "schemars 0.8.22",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",

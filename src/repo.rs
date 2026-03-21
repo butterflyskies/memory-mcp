@@ -6,8 +6,10 @@ use std::{
 use git2::{build::CheckoutBuilder, ErrorCode, MergeOptions, Repository, Signature};
 use tracing::{info, warn};
 
+use secrecy::{ExposeSecret, SecretString};
+
 use crate::{
-    auth::{AuthProvider, Secret},
+    auth::AuthProvider,
     error::MemoryError,
     types::{validate_name, ChangedMemories, Memory, PullResult, Scope},
 };
@@ -94,11 +96,10 @@ fn fast_forward(
 /// Build a `RemoteCallbacks` that authenticates with the given token.
 ///
 /// The callbacks live for `'static` because the token is moved in.
-fn build_auth_callbacks(token: Secret<String>) -> git2::RemoteCallbacks<'static> {
+fn build_auth_callbacks(token: SecretString) -> git2::RemoteCallbacks<'static> {
     let mut callbacks = git2::RemoteCallbacks::new();
-    let raw = token.into_inner();
     callbacks.credentials(move |_url, _username, _allowed| {
-        git2::Cred::userpass_plaintext("x-access-token", &raw)
+        git2::Cred::userpass_plaintext("x-access-token", token.expose_secret())
     });
     callbacks
 }
