@@ -1,8 +1,8 @@
-//! Integration tests exercising the `testing` feature gate.
+//! Integration tests for the memory repository — save, read, list, pull, delete.
 //!
-//! These tests use `AuthProvider::with_token` (available only via the `testing`
-//! feature) to construct an authenticated provider without real credentials,
-//! then exercise code paths that require auth.
+//! Uses `AuthProvider::with_token` to inject a known token without needing
+//! real credentials. Pull exercises the auth path but hits the NoRemote
+//! early-return since no origin is configured.
 
 use std::sync::Arc;
 

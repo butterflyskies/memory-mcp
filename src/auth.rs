@@ -244,9 +244,8 @@ impl AuthProvider {
 impl AuthProvider {
     /// Create an `AuthProvider` with a pre-set token.
     ///
-    /// Intended for testing — allows injecting a known token without
-    /// environment variables or keyring access.
-    #[cfg(any(test, feature = "testing"))]
+    /// Use this when you already have a token from your own auth flow
+    /// and want to skip the built-in resolution chain (env var → file → keyring).
     pub fn with_token(token: &str) -> Self {
         Self {
             token: Some(Secret::new(token.to_string())),
