@@ -4,6 +4,7 @@
 A semantic memory system for AI coding agents, exposed as an MCP server. Memories are stored as markdown files in a git repository, synced across devices via GitHub, and indexed for semantic retrieval using local embeddings.
 
 **Repo**: https://github.com/butterflyskies/memory-mcp (public, MIT OR Apache-2.0)
+**crates.io**: https://crates.io/crates/memory-mcp (published v0.3.0, 2026-03-21)
 
 ## Tech Stack
 - **Language**: Rust (edition 2021)
@@ -14,6 +15,8 @@ A semantic memory system for AI coding agents, exposed as an MCP server. Memorie
 - **Vector index**: usearch 2 (HNSW with cosine metric)
 - **CLI**: clap with derive
 - **Auth**: GitHub token via env var → keyring → token file; OAuth device flow; k8s-secret backend (feature-gated)
+- **Credentials**: secrecy crate (SecretString, zeroize-on-drop)
+- **Path resolution**: homedir + shellexpand
 
 ## Transport
 Streamable HTTP only (no stdio, no SSE). Single binary serves both local dev and k8s.
@@ -21,39 +24,27 @@ Streamable HTTP only (no stdio, no SSE). Single binary serves both local dev and
 ## CLI Structure
 - `memory-mcp serve` (default) — runs the MCP server
 - `memory-mcp auth login [--store keyring|file|stdout|k8s-secret]` — OAuth device flow
-- `memory-mcp auth status` — show resolved token source
+- `memory-mcp auth status` — show resolved token source and provenance
 - `memory-mcp warmup` — pre-download embedding model (used in Dockerfile)
 
 ## Container & CI
 - **Registry**: ghcr.io/butterflyskies/memory-mcp
 - **Dockerfile**: multi-stage (rust:trixie → model warmup → debian:trixie-slim runtime)
-- **Trixie used**: Debian Trixie base image (no longer required by glibc constraints since fastembed/ort-sys removal)
-- **HF_HOME**: HuggingFace Hub model cache directory; pinned to absolute path in Docker
-- **CI**: GitHub Actions — fmt, clippy, nextest, cargo audit, Docker build, cross-platform build (Linux + macOS)
-- **Cross-compile**: `cargo build --features k8s` on ubuntu-latest + macos-latest in PRs; Windows blocked by usearch (#42)
-- **OpenSSL**: vendored on non-Linux (macOS/Windows lack system headers); Linux uses system OpenSSL via pkg-config
+- **CI**: GitHub Actions — fmt, clippy, nextest, cargo-deny, cargo-semver-checks, Docker build, cross-platform build (Linux + macOS)
+- **Cross-compile**: `cargo build --features k8s` on ubuntu-latest + macos-latest; Windows blocked by usearch (#42)
 - **Attestations**: SLSA provenance + SBOM on every image push
-- **Release**: release-please (draft → upload assets → undraft) with conventional commits, Node.js 24 opt-in
+- **Release**: release-please with conventional commits
 
 ## Security
-- Process-wide umask 0o077, atomic token writes, no silent credential fallback
-- Container: non-root user, readOnlyRootFilesystem, drop ALL capabilities, seccomp RuntimeDefault
+- Process-wide umask 0o077, no silent credential fallback
+- SecretString (secrecy crate) for all token handling — zeroize-on-drop
+- Container: non-root user, readOnlyRootFilesystem, drop ALL caps, seccomp RuntimeDefault
 - All GHA actions pinned to commit SHAs
-- cargo audit in CI pipeline
+- cargo-deny in CI pipeline
 
 ## Branch Protection
-- **Org ruleset** (`protect main branch`): deletion, no force-push, linear history, signed commits, 1 approving review, Copilot code review
-- **Repo ruleset** (`require CI checks`): test, build, audit, msrv, cross-compile (Linux + macOS), lint — all must pass before merge
-
-## Trust Signals
-- **Shipped**: Cargo.toml metadata (description, repository, keywords, categories incl. artificial-intelligence), cargo-deny replacing cargo-audit, `#![warn(missing_docs)]` on lib crate, MSRV 1.88 declared + CI enforced
-- **ADRs**: 0017 (MSRV match-deps policy), 0018 (dedicated GitHub App for release-please)
-- **Deferred**: cargo-auditable (#60, blocked on upstream action support), cargo-semver-checks (#61 prereq: lib refactor), crates.io publish (#62, blocked on #61)
-
-## Release Infrastructure
-- **GitHub App**: `butterflyskies-release-manager-bot` (app ID 3144639) generates tokens for release-please so its PRs trigger CI workflows
-- **Org secrets**: `RELEASE_BOT_APP_ID`, `RELEASE_BOT_PRIVATE_KEY`
-- **deny.toml**: license allowlist tuned to actual transitive deps; webpki-roots CDLA-Permissive-2.0 as scoped exception; unmaintained transitive deps (number_prefix, paste) ignored
+- **Org ruleset**: deletion, no force-push, linear history, signed commits, 1 review, Copilot review
+- **Repo ruleset**: test, build, audit, msrv, semver-checks, cross-compile (Linux + macOS), lint
 
 ## Status
-v0.2.0 released. Trust signals Phase 1+2 shipped. Next: lib refactor (#61), then semver-checks + crates.io publish (#62). Also: BM25/Tantivy (#55), cross-platform vector index (#56), tracing/observability (#52).
+v0.3.0 published to crates.io. Trust signals Phase 2.5 complete. Next: k8s deployment workstream (see docs/deployment-workstream.md), then Serena memory migration.
