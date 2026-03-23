@@ -4,9 +4,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-};
+use mcp_session::{BoundedSessionManager, SessionConfig};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -95,6 +94,31 @@ struct ServeArgs {
     /// Branch name used for push/pull operations.
     #[arg(long, default_value = "main", env = "MEMORY_MCP_BRANCH")]
     branch: String,
+
+    /// Maximum number of concurrent MCP sessions. Oldest session is evicted
+    /// when the limit is reached. Must be at least 1.
+    #[arg(
+        long,
+        default_value_t = 100,
+        env = "MEMORY_MCP_MAX_SESSIONS",
+        value_parser = parse_nonzero_usize
+    )]
+    max_sessions: usize,
+
+    /// Maximum number of new sessions allowed within the rate-limit window.
+    /// Set to 0 to disable rate limiting.
+    #[arg(long, default_value_t = 10, env = "MEMORY_MCP_SESSION_RATE_LIMIT")]
+    session_rate_limit: usize,
+
+    /// Duration of the session creation rate-limit window, in seconds.
+    /// Set to 0 to disable rate limiting (treated the same as setting
+    /// `--session-rate-limit 0`).
+    #[arg(
+        long,
+        default_value_t = 60,
+        env = "MEMORY_MCP_SESSION_RATE_WINDOW_SECS"
+    )]
+    session_rate_window_secs: u64,
 }
 
 #[derive(Args)]
@@ -226,7 +250,23 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let service = StreamableHttpService::new(
         move || Ok(MemoryServer::new(Arc::clone(&state))),
-        LocalSessionManager::default().into(),
+        Arc::new({
+            let mgr = BoundedSessionManager::new(
+                SessionConfig {
+                    keep_alive: Some(std::time::Duration::from_secs(4 * 60 * 60)),
+                    ..Default::default()
+                },
+                args.max_sessions,
+            );
+            if args.session_rate_limit > 0 && args.session_rate_window_secs > 0 {
+                mgr.with_rate_limit(
+                    args.session_rate_limit,
+                    std::time::Duration::from_secs(args.session_rate_window_secs),
+                )
+            } else {
+                mgr
+            }
+        }),
         StreamableHttpServerConfig {
             cancellation_token: ct_child,
             ..Default::default()
@@ -296,6 +336,17 @@ async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Parse a `usize` that must be at least 1. Used as a clap `value_parser`.
+fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid integer"))?;
+    if n == 0 {
+        return Err("value must be at least 1".to_owned());
+    }
+    Ok(n)
+}
 
 fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
     let expanded = shellexpand::tilde(path);
@@ -385,6 +436,26 @@ mod tests {
             },
             _ => panic!("expected Auth command"),
         }
+    }
+
+    #[test]
+    fn test_parse_nonzero_usize_zero_is_err() {
+        assert!(parse_nonzero_usize("0").is_err());
+    }
+
+    #[test]
+    fn test_parse_nonzero_usize_non_numeric_is_err() {
+        assert!(parse_nonzero_usize("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_nonzero_usize_one_is_ok() {
+        assert_eq!(parse_nonzero_usize("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_parse_nonzero_usize_hundred_is_ok() {
+        assert_eq!(parse_nonzero_usize("100").unwrap(), 100);
     }
 
     #[cfg(feature = "k8s")]
