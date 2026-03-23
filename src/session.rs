@@ -31,6 +31,59 @@ pub enum BoundedSessionError {
 }
 
 // ---------------------------------------------------------------------------
+// RateLimiter
+// ---------------------------------------------------------------------------
+
+/// Sliding-window rate limiter for session creation.
+struct RateLimiter {
+    max_creates: usize,
+    window: Duration,
+    tracker: tokio::sync::Mutex<VecDeque<Instant>>,
+}
+
+impl RateLimiter {
+    fn new(max_creates: usize, window: Duration) -> Self {
+        Self {
+            max_creates,
+            window,
+            tracker: tokio::sync::Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Reserve a slot. Returns `Err(BoundedSessionError::RateLimited)` if the
+    /// window is full. On success, the caller **must** eventually call
+    /// [`rollback`](Self::rollback) if session creation subsequently fails, to
+    /// return the slot.
+    async fn reserve(&self) -> Result<Instant, BoundedSessionError> {
+        let mut tracker = self.tracker.lock().await;
+        let now = Instant::now();
+        // Prune entries that have fallen outside the window.
+        while tracker
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > self.window)
+        {
+            tracker.pop_front();
+        }
+        if tracker.len() >= self.max_creates {
+            return Err(BoundedSessionError::RateLimited);
+        }
+        tracker.push_back(now);
+        Ok(now)
+    }
+
+    /// Roll back a previously reserved slot (identified by its timestamp) when
+    /// session creation fails after [`reserve`](Self::reserve) succeeds.
+    async fn rollback(&self, reserved_at: Instant) {
+        let mut tracker = self.tracker.lock().await;
+        // The reserved timestamp is the most recently pushed entry; remove it.
+        // We compare by value to be safe against concurrent interleaving.
+        if tracker.back() == Some(&reserved_at) {
+            tracker.pop_back();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BoundedSessionManager
 // ---------------------------------------------------------------------------
 
@@ -42,15 +95,20 @@ pub enum BoundedSessionError {
 ///
 /// Optionally, a rate limit can be applied to session creation via
 /// [`BoundedSessionManager::with_rate_limit`].
+///
+/// # Concurrency note
+///
+/// Under concurrent session creation, the live count may transiently exceed
+/// `max_sessions` by at most the number of concurrent callers. The limit is
+/// best-effort under contention; use a semaphore if exact enforcement is
+/// required.
 pub struct BoundedSessionManager {
     inner: LocalSessionManager,
     max_sessions: usize,
     /// Tracks session IDs in creation order for FIFO eviction.
     creation_order: tokio::sync::Mutex<VecDeque<SessionId>>,
-    /// Ring buffer of recent creation timestamps for rate limiting.
-    rate_tracker: tokio::sync::Mutex<VecDeque<Instant>>,
-    /// Optional rate limit: (max_creates, window_duration).
-    rate_limit: Option<(usize, Duration)>,
+    /// Optional sliding-window rate limiter for session creation.
+    rate_limiter: Option<RateLimiter>,
 }
 
 impl BoundedSessionManager {
@@ -73,8 +131,7 @@ impl BoundedSessionManager {
             },
             max_sessions,
             creation_order: tokio::sync::Mutex::new(VecDeque::new()),
-            rate_tracker: tokio::sync::Mutex::new(VecDeque::new()),
-            rate_limit: None,
+            rate_limiter: None,
         }
     }
 
@@ -83,9 +140,18 @@ impl BoundedSessionManager {
     /// At most `max_creates` sessions may be created within any rolling
     /// `window` duration. If exceeded, [`BoundedSessionError::RateLimited`] is
     /// returned and no eviction is performed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_creates` is 0. Pass no rate limit instead of 0 — a limit
+    /// of zero would silently block all session creation.
     #[must_use]
     pub fn with_rate_limit(mut self, max_creates: usize, window: Duration) -> Self {
-        self.rate_limit = Some((max_creates, window));
+        assert!(
+            max_creates >= 1,
+            "max_creates must be at least 1; pass no rate limit instead of 0"
+        );
+        self.rate_limiter = Some(RateLimiter::new(max_creates, window));
         self
     }
 }
@@ -98,21 +164,11 @@ impl SessionManager for BoundedSessionManager {
         // ----------------------------------------------------------------
         // Critical section 1: rate-limit check.
         // ----------------------------------------------------------------
-        if let Some((max_creates, window)) = self.rate_limit {
-            let mut rate = self.rate_tracker.lock().await;
-            let now = Instant::now();
-            // Prune entries that have fallen outside the window.
-            while rate
-                .front()
-                .is_some_and(|t| now.duration_since(*t) > window)
-            {
-                rate.pop_front();
-            }
-            if rate.len() >= max_creates {
-                return Err(BoundedSessionError::RateLimited);
-            }
-            rate.push_back(now);
-        }
+        let rate_reserved_at = if let Some(ref limiter) = self.rate_limiter {
+            Some(limiter.reserve().await?)
+        } else {
+            None
+        };
 
         // ----------------------------------------------------------------
         // Determine eviction candidate (short critical section).
@@ -141,7 +197,16 @@ impl SessionManager for BoundedSessionManager {
         // ----------------------------------------------------------------
         // Create new session (no lock held across this await).
         // ----------------------------------------------------------------
-        let (id, transport) = self.inner.create_session().await?;
+        let result = self.inner.create_session().await;
+
+        // Roll back the rate-limit slot if creation failed.
+        if result.is_err() {
+            if let (Some(ref limiter), Some(reserved_at)) = (&self.rate_limiter, rate_reserved_at) {
+                limiter.rollback(reserved_at).await;
+            }
+        }
+
+        let (id, transport) = result?;
 
         // ----------------------------------------------------------------
         // Critical section 2: update the creation-order deque.

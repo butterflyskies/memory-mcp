@@ -52,6 +52,61 @@ fn build_router(session_config: SessionConfig, max_sessions: usize) -> (Router, 
     (router, ct)
 }
 
+/// Build a test axum [`Router`] backed by a [`BoundedSessionManager`] with a
+/// rate limit applied.
+fn build_router_with_rate_limit(
+    session_config: SessionConfig,
+    max_sessions: usize,
+    max_creates: usize,
+    window: Duration,
+) -> (Router, CancellationToken) {
+    let ct = CancellationToken::new();
+    let ct_child = ct.child_token();
+
+    let mgr = BoundedSessionManager::new(session_config, max_sessions)
+        .with_rate_limit(max_creates, window);
+
+    let service = StreamableHttpService::new(
+        || Ok(NoopServer),
+        Arc::new(mgr),
+        StreamableHttpServerConfig {
+            cancellation_token: ct_child,
+            ..Default::default()
+        },
+    );
+
+    let router = Router::new().nest_service("/mcp", service);
+    (router, ct)
+}
+
+/// Spawn a server with a rate limit on a random port and return the base URL
+/// and cancellation token.
+async fn spawn_server_with_rate_limit(
+    session_config: SessionConfig,
+    max_sessions: usize,
+    max_creates: usize,
+    window: Duration,
+) -> (String, CancellationToken) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to random port");
+    let addr = listener.local_addr().expect("get local addr");
+    let base_url = format!("http://{}", addr);
+
+    let (router, ct) =
+        build_router_with_rate_limit(session_config, max_sessions, max_creates, window);
+    let ct_child = ct.child_token();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(ct_child.cancelled_owned())
+            .await
+            .expect("server error");
+    });
+
+    (base_url, ct)
+}
+
 /// Spawn a server on a random port and return the base URL and cancellation
 /// token. The server task runs until the token is cancelled.
 async fn spawn_server(
@@ -150,11 +205,12 @@ async fn test_session_idle_timeout() {
     // Wait longer than the keep_alive timeout.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // The session should have expired; the server must not return 200.
+    // The session should have expired; rmcp returns 404 for unknown sessions.
     let (status, _) = post_mcp(&client, &base_url, Some(&session_id), &tools_list_body()).await;
-    assert!(
-        !status.is_success(),
-        "expired session should be rejected, got {status}"
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "expired session should be rejected with 404, got {status}"
     );
 }
 
@@ -184,11 +240,12 @@ async fn test_max_sessions_eviction() {
     assert!(status.is_success(), "session 3 initialize failed: {status}");
     let sid3 = sid3.expect("session 3 must have Mcp-Session-Id");
 
-    // Session 1 should be gone.
+    // Session 1 should be gone; rmcp returns 404 for unknown sessions.
     let (status, _) = post_mcp(&client, &base_url, Some(&sid1), &tools_list_body()).await;
-    assert!(
-        !status.is_success(),
-        "evicted session 1 should be rejected, got {status}"
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "evicted session 1 should be rejected with 404, got {status}"
     );
 
     // Session 2 should still be alive (only session 1 was evicted).
@@ -230,11 +287,12 @@ async fn test_expired_session_does_not_consume_capacity() {
     // Wait for session 1 to expire.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Session 1 should be expired.
+    // Session 1 should be expired; rmcp returns 404 for unknown sessions.
     let (status, _) = post_mcp(&client, &base_url, Some(&sid1), &tools_list_body()).await;
-    assert!(
-        !status.is_success(),
-        "session 1 should have expired, got {status}"
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "session 1 should have expired with 404, got {status}"
     );
 
     // Now create sessions 2 and 3. Both should succeed because the expired
@@ -265,5 +323,42 @@ async fn test_expired_session_does_not_consume_capacity() {
     assert!(
         status.is_success(),
         "session 3 should be active, got {status}"
+    );
+}
+
+/// Rate limiting must reject a 3rd session creation when the limit is 2 per
+/// window. The first two sessions must succeed; the third must be rejected.
+#[tokio::test]
+async fn test_rate_limit_enforcement() {
+    let config = SessionConfig {
+        keep_alive: Some(Duration::from_secs(300)),
+        ..Default::default()
+    };
+    // max_sessions=10 so the capacity limit is not the bottleneck;
+    // rate limit is 2 creates per 60 seconds.
+    let (base_url, _ct) =
+        spawn_server_with_rate_limit(config, 10, 2, Duration::from_secs(60)).await;
+    let client = reqwest::Client::new();
+
+    // First session — should succeed.
+    let (status, _) = post_mcp(&client, &base_url, None, &initialize_body()).await;
+    assert!(
+        status.is_success(),
+        "first session should succeed, got {status}"
+    );
+
+    // Second session — should succeed.
+    let (status, _) = post_mcp(&client, &base_url, None, &initialize_body()).await;
+    assert!(
+        status.is_success(),
+        "second session should succeed, got {status}"
+    );
+
+    // Third session — should be rejected (rate limit exceeded).
+    // rmcp maps session manager errors to 500 Internal Server Error.
+    let (status, _) = post_mcp(&client, &base_url, None, &initialize_body()).await;
+    assert!(
+        !status.is_success(),
+        "third session should be rejected by rate limit, got {status}"
     );
 }

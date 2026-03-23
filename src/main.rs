@@ -113,6 +113,8 @@ struct ServeArgs {
     session_rate_limit: usize,
 
     /// Duration of the session creation rate-limit window, in seconds.
+    /// Set to 0 to disable rate limiting (treated the same as setting
+    /// `--session-rate-limit 0`).
     #[arg(
         long,
         default_value_t = 60,
@@ -258,7 +260,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
                 },
                 args.max_sessions,
             );
-            if args.session_rate_limit > 0 {
+            if args.session_rate_limit > 0 && args.session_rate_window_secs > 0 {
                 mgr.with_rate_limit(
                     args.session_rate_limit,
                     std::time::Duration::from_secs(args.session_rate_window_secs),
@@ -436,6 +438,26 @@ mod tests {
             },
             _ => panic!("expected Auth command"),
         }
+    }
+
+    #[test]
+    fn test_parse_nonzero_usize_zero_is_err() {
+        assert!(parse_nonzero_usize("0").is_err());
+    }
+
+    #[test]
+    fn test_parse_nonzero_usize_non_numeric_is_err() {
+        assert!(parse_nonzero_usize("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_nonzero_usize_one_is_ok() {
+        assert_eq!(parse_nonzero_usize("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_parse_nonzero_usize_hundred_is_ok() {
+        assert_eq!(parse_nonzero_usize("100").unwrap(), 100);
     }
 
     #[cfg(feature = "k8s")]
