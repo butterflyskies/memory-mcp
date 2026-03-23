@@ -34,7 +34,7 @@ libc = "0.2"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
-mcp-session = { git = "https://github.com/butterflyskies/mcp-session.git", branch = "feat/initial-release" }
+mcp-session = "0.1"
 
 # Candle direct — pure-Rust BERT inference for embeddings.
 candle-core = "0.9"
