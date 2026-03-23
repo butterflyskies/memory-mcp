@@ -570,11 +570,16 @@ impl ScopedIndex {
     /// Missing subdirectories are treated as empty — those scopes will be
     /// rebuilt incrementally on next use.
     pub fn load(dir: &Path, dimensions: usize) -> Result<Self, MemoryError> {
-        // If a previous save was interrupted, clear commit SHAs to force a
-        // fresh rebuild on next startup. The marker is removed after we finish
-        // loading so subsequent loads are unaffected.
+        // If a previous save was interrupted, the on-disk state may be
+        // inconsistent (some indexes from current state, others from prior).
+        // Rather than loading mixed data, start fresh — indexes are a cache
+        // that can always be rebuilt from the source-of-truth markdown files.
         let dirty_marker = dir.join(".save-in-progress");
-        let dirty = dirty_marker.exists();
+        if dirty_marker.exists() {
+            tracing::warn!("detected interrupted index save — discarding indexes");
+            let _ = std::fs::remove_file(&dirty_marker);
+            return Self::new(dimensions);
+        }
 
         // Load all-index.
         let all_path = dir.join("all").join("index.usearch");
@@ -629,19 +634,11 @@ impl ScopedIndex {
             }
         }
 
-        let result = Self {
+        Ok(Self {
             scopes: RwLock::new(scopes),
             all,
             dimensions,
-        };
-
-        if dirty {
-            // Clear all commit SHAs so the next startup will force a fresh rebuild.
-            result.set_commit_sha(None);
-            let _ = std::fs::remove_file(&dirty_marker);
-        }
-
-        Ok(result)
+        })
     }
 
     /// Read the commit SHA from the all-index metadata.
@@ -891,19 +888,26 @@ mod tests {
     }
 
     #[test]
-    fn scoped_index_dirty_marker_clears_commit_sha() {
+    fn scoped_index_dirty_marker_discards_indexes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let si = ScopedIndex::new(8).expect("create");
+        si.add(&Scope::Global, &vec_a(), "global/test-mem".to_string())
+            .expect("add");
         si.set_commit_sha(Some("abc123"));
         si.save(dir.path()).expect("save");
 
         // Simulate interrupted save by re-creating the marker.
         std::fs::write(dir.path().join(".save-in-progress"), b"").unwrap();
 
+        // Load should discard all indexes and return fresh empty ones.
         let loaded = ScopedIndex::load(dir.path(), 8).expect("load");
         assert!(
             loaded.commit_sha().is_none(),
-            "dirty marker should clear SHA"
+            "dirty marker should result in no SHA"
+        );
+        assert!(
+            loaded.find_key_by_name("global/test-mem").is_none(),
+            "dirty marker should discard all indexed data"
         );
         assert!(
             !dir.path().join(".save-in-progress").exists(),

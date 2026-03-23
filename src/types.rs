@@ -334,25 +334,6 @@ pub enum ScopeFilter {
     All,
 }
 
-impl ScopeFilter {
-    /// Returns `true` if `scope` passes this filter.
-    ///
-    /// This is the canonical definition of scope-filter semantics, used by
-    /// unit tests and available for future code paths. The `recall` handler
-    /// delegates filtering to [`ScopedIndex::search`](crate::index::ScopedIndex::search)
-    /// which applies the same logic at the index level.
-    pub fn matches(&self, scope: &Scope) -> bool {
-        match self {
-            ScopeFilter::GlobalOnly => *scope == Scope::Global,
-            ScopeFilter::ProjectAndGlobal(name) => match scope {
-                Scope::Global => true,
-                Scope::Project(p) => p == name,
-            },
-            ScopeFilter::All => true,
-        }
-    }
-}
-
 /// Parse a scope string into a [`ScopeFilter`] for use in `recall` and `list`.
 ///
 /// | Input | Result |
@@ -900,29 +881,5 @@ mod tests {
     #[test]
     fn scope_filter_invalid_returns_error() {
         assert!(parse_scope_filter(Some("bogus")).is_err());
-    }
-
-    // ScopeFilter::matches tests
-
-    #[test]
-    fn scope_filter_matches_global_only() {
-        let f = ScopeFilter::GlobalOnly;
-        assert!(f.matches(&Scope::Global));
-        assert!(!f.matches(&Scope::Project("x".into())));
-    }
-
-    #[test]
-    fn scope_filter_matches_project_and_global() {
-        let f = ScopeFilter::ProjectAndGlobal("myproj".into());
-        assert!(f.matches(&Scope::Global));
-        assert!(f.matches(&Scope::Project("myproj".into())));
-        assert!(!f.matches(&Scope::Project("other".into())));
-    }
-
-    #[test]
-    fn scope_filter_matches_all() {
-        let f = ScopeFilter::All;
-        assert!(f.matches(&Scope::Global));
-        assert!(f.matches(&Scope::Project("anything".into())));
     }
 }
