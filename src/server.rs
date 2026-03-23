@@ -310,6 +310,8 @@ impl MemoryServer {
             let mut skipped_errors: usize = 0;
 
             for (_key, qualified_name, distance) in results {
+                // The index returns at most `limit` candidates; this guard is a safety
+                // net that only activates if more candidates arrive than expected.
                 if results_vec.len() >= limit {
                     break;
                 }

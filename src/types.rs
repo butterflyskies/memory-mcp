@@ -337,9 +337,10 @@ pub enum ScopeFilter {
 impl ScopeFilter {
     /// Returns `true` if `scope` passes this filter.
     ///
-    /// - [`GlobalOnly`](ScopeFilter::GlobalOnly) → true only if scope is `Global`
-    /// - [`ProjectAndGlobal(name)`](ScopeFilter::ProjectAndGlobal) → true if scope is `Global` or `Project(name)`
-    /// - [`All`](ScopeFilter::All) → always true
+    /// This is the canonical definition of scope-filter semantics, used by
+    /// unit tests and available for future code paths. The `recall` handler
+    /// delegates filtering to [`ScopedIndex::search`](crate::index::ScopedIndex::search)
+    /// which applies the same logic at the index level.
     pub fn matches(&self, scope: &Scope) -> bool {
         match self {
             ScopeFilter::GlobalOnly => *scope == Scope::Global,

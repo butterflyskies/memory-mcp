@@ -948,4 +948,24 @@ mod tests {
         assert!(names.contains(&"global/rt-global"));
         assert!(names.contains(&"projects/rtrip/rt-proj"));
     }
+
+    #[test]
+    fn scoped_index_same_short_name_different_scopes_coexist() {
+        let si = make_scoped();
+        si.add(&Scope::Global, &vec_a(), "global/foo".to_string())
+            .unwrap();
+        si.add(
+            &Scope::Project("p".into()),
+            &vec_b(),
+            "projects/p/foo".to_string(),
+        )
+        .unwrap();
+        assert!(si.find_key_by_name("global/foo").is_some());
+        assert!(si.find_key_by_name("projects/p/foo").is_some());
+        assert_ne!(
+            si.find_key_by_name("global/foo"),
+            si.find_key_by_name("projects/p/foo"),
+            "different scopes should have distinct keys"
+        );
+    }
 }

@@ -231,7 +231,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         let keys_file = index_dir.join("index.usearch.keys.json");
         if let Err(e) = std::fs::remove_file(&keys_file) {
-            tracing::warn!(error = %e, "failed to remove legacy index keys file");
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, "failed to remove legacy index keys file");
+            }
         }
         info!("removed legacy single-index files");
     }
