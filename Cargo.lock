@@ -2020,6 +2020,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "mcp-session"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "rmcp",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2047,7 +2057,6 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "clap",
- "futures-core",
  "git2",
  "hf-hub",
  "homedir",
@@ -2055,6 +2064,7 @@ dependencies = [
  "keyring",
  "kube",
  "libc",
+ "mcp-session",
  "openssl",
  "reqwest",
  "rmcp",

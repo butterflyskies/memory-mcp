@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use memory_mcp::session::BoundedSessionManager;
+use mcp_session::BoundedSessionManager;
 use rmcp::transport::streamable_http_server::{
     session::local::SessionConfig, StreamableHttpServerConfig, StreamableHttpService,
 };

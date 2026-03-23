@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use memory_mcp::session::BoundedSessionManager;
+use mcp_session::BoundedSessionManager;
 use rmcp::transport::streamable_http_server::{
     session::local::SessionConfig, StreamableHttpServerConfig, StreamableHttpService,
 };

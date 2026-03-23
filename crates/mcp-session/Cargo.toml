@@ -1,0 +1,16 @@
+[package]
+name = "mcp-session"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Bounded session management for MCP servers — max sessions, FIFO eviction, rate limiting"
+repository = "https://github.com/butterflyskies/memory-mcp"
+keywords = ["mcp", "session", "rate-limiting", "security"]
+categories = ["web-programming", "network-programming"]
+rust-version = "1.88"
+
+[dependencies]
+rmcp = { version = "1.1", features = ["server", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["sync", "time"] }
+futures-core = { version = "0.3", default-features = false }
+thiserror = "2"
