@@ -4,10 +4,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use mcp_session::BoundedSessionManager;
-use rmcp::transport::streamable_http_server::{
-    session::local::SessionConfig, StreamableHttpServerConfig, StreamableHttpService,
-};
+use mcp_session::{BoundedSessionManager, SessionConfig};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

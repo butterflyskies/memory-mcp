@@ -1,6 +1,36 @@
-//! [`BoundedSessionManager`] — a [`SessionManager`] wrapper that enforces a
-//! maximum concurrent session count with FIFO eviction and optional rate
-//! limiting on session creation.
+//! Bounded session management for MCP servers.
+//!
+//! This crate provides [`BoundedSessionManager`], a wrapper around rmcp's
+//! [`LocalSessionManager`] that enforces:
+//!
+//! - **Maximum concurrent sessions** with FIFO eviction of the oldest session
+//!   when the limit is reached.
+//! - **Optional rate limiting** on session creation via a sliding-window
+//!   counter.
+//! - **Idle timeout** via rmcp's `keep_alive` configuration (passed through).
+//!
+//! # Quick start
+//!
+//! ```rust,ignore
+//! use std::sync::Arc;
+//! use mcp_session::BoundedSessionManager;
+//! use mcp_session::SessionConfig;
+//!
+//! let manager = Arc::new(
+//!     BoundedSessionManager::new(
+//!         SessionConfig {
+//!             keep_alive: Some(std::time::Duration::from_secs(4 * 60 * 60)),
+//!             ..Default::default()
+//!         },
+//!         100, // max concurrent sessions
+//!     )
+//!     .with_rate_limit(10, std::time::Duration::from_secs(60)),
+//! );
+//!
+//! // Pass `manager` to `StreamableHttpService::new(factory, manager, config)`
+//! ```
+
+#![warn(missing_docs)]
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -9,11 +39,16 @@ use futures_core::Stream;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::{
     streamable_http_server::session::{
-        local::{LocalSessionManager, LocalSessionManagerError, LocalSessionWorker, SessionConfig},
-        ServerSseMessage, SessionId, SessionManager,
+        local::{LocalSessionManager, LocalSessionManagerError, LocalSessionWorker},
+        ServerSseMessage, SessionManager,
     },
     WorkerTransport,
 };
+
+// Re-export types that consumers need so they don't have to depend on rmcp
+// directly for basic session configuration.
+pub use rmcp::transport::streamable_http_server::session::local::SessionConfig;
+pub use rmcp::transport::streamable_http_server::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // Error type

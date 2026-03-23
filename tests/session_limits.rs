@@ -9,10 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use mcp_session::BoundedSessionManager;
-use rmcp::transport::streamable_http_server::{
-    session::local::SessionConfig, StreamableHttpServerConfig, StreamableHttpService,
-};
+use mcp_session::{BoundedSessionManager, SessionConfig};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::ServerHandler;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
