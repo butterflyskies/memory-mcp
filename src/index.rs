@@ -1,8 +1,15 @@
-use std::{collections::HashMap, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Mutex, RwLock},
+};
 
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-use crate::error::MemoryError;
+use crate::{
+    error::MemoryError,
+    types::{validate_name, Scope, ScopeFilter},
+};
 
 // ---------------------------------------------------------------------------
 // VectorIndex
@@ -17,6 +24,8 @@ struct VectorState {
     name_map: HashMap<String, u64>,
     /// Monotonic counter used to assign unique vector keys.
     next_key: u64,
+    /// Commit SHA at the time this index was last saved/loaded.
+    commit_sha: Option<String>,
 }
 
 /// Wraps `usearch::Index` and a key-map behind a single `std::sync::Mutex`.
@@ -51,6 +60,7 @@ impl VectorIndex {
                 key_map: HashMap::new(),
                 name_map: HashMap::new(),
                 next_key: 0,
+                commit_sha: None,
             }),
         })
     }
@@ -73,7 +83,6 @@ impl VectorIndex {
     }
 
     /// Ensure the index has capacity for at least `additional` more vectors.
-    #[allow(dead_code)]
     pub fn grow_if_needed(&self, additional: usize) -> Result<(), MemoryError> {
         let state = self
             .state
@@ -83,7 +92,7 @@ impl VectorIndex {
     }
 
     /// Atomically increment and return the next unique vector key.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn next_key(&self) -> u64 {
         let mut state = self
             .state
@@ -104,7 +113,7 @@ impl VectorIndex {
     }
 
     /// Add a vector under the given key, growing the index if necessary.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn add(&self, key: u64, vector: &[f32], name: String) -> Result<(), MemoryError> {
         let mut state = self
             .state
@@ -193,7 +202,28 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Return the commit SHA stored in the index metadata (if any).
+    pub fn commit_sha(&self) -> Option<String> {
+        let state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        state.commit_sha.clone()
+    }
+
+    /// Set the commit SHA in the index metadata.
+    pub fn set_commit_sha(&self, sha: Option<&str>) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        state.commit_sha = sha.map(|s| s.to_owned());
+    }
+
     /// Persist the index to `path`. Also writes `<path>.keys.json`.
+    ///
+    /// If `commit_sha` is `Some`, it is written to the metadata alongside the
+    /// key map so the next load can verify freshness.
     pub fn save(&self, path: &Path) -> Result<(), MemoryError> {
         let path_str = path.to_str().ok_or_else(|| MemoryError::InvalidInput {
             reason: "non-UTF-8 index path".to_string(),
@@ -213,6 +243,7 @@ impl VectorIndex {
         let payload = serde_json::json!({
             "key_map": &state.key_map,
             "next_key": state.next_key,
+            "commit_sha": state.commit_sha,
         });
         let json = serde_json::to_string(&payload)
             .map_err(|e| MemoryError::Index(format!("keymap serialise: {}", e)))?;
@@ -244,7 +275,7 @@ impl VectorIndex {
 
         // Load the key map and counter.
         let keys_path = format!("{}.keys.json", path_str);
-        let (key_map, next_key): (HashMap<u64, String>, u64) =
+        let (key_map, next_key, commit_sha): (HashMap<u64, String>, u64, Option<String>) =
             if std::path::Path::new(&keys_path).exists() {
                 let json = std::fs::read_to_string(&keys_path)?;
                 // Support both old format (bare HashMap) and new format ({key_map, next_key}).
@@ -256,24 +287,30 @@ impl VectorIndex {
                     let nk: u64 = value["next_key"]
                         .as_u64()
                         .unwrap_or_else(|| km.keys().max().map(|k| k + 1).unwrap_or(0));
-                    (km, nk)
+                    let sha: Option<String> = value
+                        .get("commit_sha")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    (km, nk, sha)
                 } else {
                     // Legacy format: bare HashMap.
                     let km: HashMap<u64, String> = serde_json::from_value(value)
                         .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
                     let nk = km.keys().max().map(|k| k + 1).unwrap_or(0);
-                    (km, nk)
+                    (km, nk, None)
                 }
             } else {
-                (HashMap::new(), 0)
+                (HashMap::new(), 0, None)
             };
 
         let name_map: HashMap<String, u64> = key_map.iter().map(|(&k, v)| (v.clone(), k)).collect();
-        debug_assert_eq!(
-            key_map.len(),
-            name_map.len(),
-            "key_map and name_map size mismatch — duplicate names in key_map"
-        );
+        if key_map.len() != name_map.len() {
+            tracing::warn!(
+                key_map_len = key_map.len(),
+                name_map_len = name_map.len(),
+                "key_map and name_map have different sizes; index may contain duplicate names"
+            );
+        }
 
         Ok(Self {
             state: Mutex::new(VectorState {
@@ -281,10 +318,343 @@ impl VectorIndex {
                 key_map,
                 name_map,
                 next_key,
+                commit_sha,
             }),
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// ScopedIndex
+// ---------------------------------------------------------------------------
+
+/// Manages multiple `VectorIndex` instances — one per scope (global, each
+/// project) plus a combined "all" index. Every memory exists in exactly two
+/// indexes: its scope-specific index + the "all" index.
+///
+/// `ScopedIndex` is `Send + Sync` because all inner state is protected by
+/// `RwLock` / `Mutex`.
+pub struct ScopedIndex {
+    /// Per-scope indexes (global + each project).
+    scopes: RwLock<HashMap<Scope, VectorIndex>>,
+    /// Combined index containing all vectors.
+    all: VectorIndex,
+    /// Embedding dimensions (needed to create new scope indexes).
+    dimensions: usize,
+}
+
+impl ScopedIndex {
+    /// Create a new `ScopedIndex` with empty global + all indexes.
+    pub fn new(dimensions: usize) -> Result<Self, MemoryError> {
+        let global = VectorIndex::new(dimensions)?;
+        let all = VectorIndex::new(dimensions)?;
+        let mut scopes = HashMap::new();
+        scopes.insert(Scope::Global, global);
+        Ok(Self {
+            scopes: RwLock::new(scopes),
+            all,
+            dimensions,
+        })
+    }
+
+    /// Ensure the scope's index exists, creating it if missing.
+    pub fn ensure_scope(&self, scope: &Scope) -> Result<(), MemoryError> {
+        // Fast path: check with a read lock first.
+        {
+            let scopes = self.scopes.read().expect("scopes lock poisoned");
+            if scopes.contains_key(scope) {
+                return Ok(());
+            }
+        }
+        // Slow path: acquire write lock and create.
+        let mut scopes = self.scopes.write().expect("scopes lock poisoned");
+        // Re-check after acquiring write lock (another thread may have inserted).
+        if !scopes.contains_key(scope) {
+            scopes.insert(scope.clone(), VectorIndex::new(self.dimensions)?);
+        }
+        Ok(())
+    }
+
+    /// Insert `vector` into both the scope-specific index and the all-index.
+    ///
+    /// Handles upserts: if `qualified_name` already exists in either index, the
+    /// old entry is removed after the new one is successfully inserted.
+    ///
+    /// Returns the key assigned in the all-index.
+    pub fn add(
+        &self,
+        scope: &Scope,
+        vector: &[f32],
+        qualified_name: String,
+    ) -> Result<u64, MemoryError> {
+        self.ensure_scope(scope)?;
+
+        let scopes = self.scopes.read().expect("scopes lock poisoned");
+        let scope_idx = scopes
+            .get(scope)
+            .expect("scope index must exist after ensure_scope");
+
+        // Capture old keys before inserting new ones.
+        let old_scope_key = scope_idx.find_key_by_name(&qualified_name);
+        let old_all_key = self.all.find_key_by_name(&qualified_name);
+
+        // Insert into scope index first.
+        let new_scope_key = scope_idx.add_with_next_key(vector, qualified_name.clone())?;
+
+        // Insert into all-index; if this fails, roll back scope insert.
+        let all_key = match self.all.add_with_next_key(vector, qualified_name) {
+            Ok(key) => key,
+            Err(e) => {
+                let _ = scope_idx.remove(new_scope_key);
+                return Err(e);
+            }
+        };
+
+        // Both succeeded — now clean up old entries.
+        if let Some(key) = old_scope_key {
+            let _ = scope_idx.remove(key);
+        }
+        if let Some(key) = old_all_key {
+            let _ = self.all.remove(key);
+        }
+
+        Ok(all_key)
+    }
+
+    /// Remove a memory by qualified name from both the scope-specific index
+    /// and the all-index.
+    ///
+    /// Both removals are best-effort: an error in one does not prevent the
+    /// other from running. Returns `Ok(())` regardless of individual failures.
+    pub fn remove(&self, scope: &Scope, qualified_name: &str) -> Result<(), MemoryError> {
+        // Remove from scope index (best-effort).
+        {
+            let scopes = self.scopes.read().expect("scopes lock poisoned");
+            if let Some(scope_idx) = scopes.get(scope) {
+                if let Some(key) = scope_idx.find_key_by_name(qualified_name) {
+                    if let Err(e) = scope_idx.remove(key) {
+                        tracing::warn!(
+                            qualified_name = %qualified_name,
+                            error = %e,
+                            "scope index removal failed; continuing to all-index"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Remove from all-index (best-effort).
+        if let Some(key) = self.all.find_key_by_name(qualified_name) {
+            if let Err(e) = self.all.remove(key) {
+                tracing::warn!(
+                    qualified_name = %qualified_name,
+                    error = %e,
+                    "all-index removal failed"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Search for the nearest neighbours of `query`, routing to the correct
+    /// indexes based on `filter`.
+    ///
+    /// | `filter`               | Indexes searched          | Merge strategy             |
+    /// |------------------------|---------------------------|----------------------------|
+    /// | `GlobalOnly`           | `global`                  | Direct top-k               |
+    /// | `ProjectAndGlobal(p)`  | `global` + `projects/p`   | Merge by distance, top-k   |
+    /// | `All`                  | `all` combined index       | Direct top-k               |
+    pub fn search(
+        &self,
+        filter: &ScopeFilter,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(u64, String, f32)>, MemoryError> {
+        match filter {
+            ScopeFilter::All => self.all.search(query, limit),
+
+            ScopeFilter::GlobalOnly => {
+                let scopes = self.scopes.read().expect("scopes lock poisoned");
+                match scopes.get(&Scope::Global) {
+                    Some(global_idx) => global_idx.search(query, limit),
+                    None => Ok(Vec::new()),
+                }
+            }
+
+            ScopeFilter::ProjectAndGlobal(project_name) => {
+                let scopes = self.scopes.read().expect("scopes lock poisoned");
+                let project_scope = Scope::Project(project_name.clone());
+
+                let mut combined: Vec<(u64, String, f32)> = Vec::new();
+
+                if let Some(global_idx) = scopes.get(&Scope::Global) {
+                    let mut global_results = global_idx.search(query, limit)?;
+                    combined.append(&mut global_results);
+                }
+
+                if let Some(proj_idx) = scopes.get(&project_scope) {
+                    let mut proj_results = proj_idx.search(query, limit)?;
+                    combined.append(&mut proj_results);
+                }
+
+                // Merge by ascending distance, deduplicate by name, then take top-k.
+                combined.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+                combined.dedup_by(|a, b| a.1 == b.1);
+                combined.truncate(limit);
+                Ok(combined)
+            }
+        }
+    }
+
+    /// Find the key in the all-index for a given qualified name.
+    pub fn find_key_by_name(&self, qualified_name: &str) -> Option<u64> {
+        self.all.find_key_by_name(qualified_name)
+    }
+
+    /// Grow all indexes to accommodate `additional` more vectors.
+    pub fn grow_if_needed(&self, additional: usize) -> Result<(), MemoryError> {
+        self.all.grow_if_needed(additional)?;
+        let scopes = self.scopes.read().expect("scopes lock poisoned");
+        for idx in scopes.values() {
+            idx.grow_if_needed(additional)?;
+        }
+        Ok(())
+    }
+
+    /// Persist all indexes to subdirectories under `dir`.
+    ///
+    /// Layout:
+    /// ```text
+    /// dir/
+    ///   all/index.usearch  (+ .keys.json)
+    ///   global/index.usearch
+    ///   projects/foo/index.usearch
+    /// ```
+    pub fn save(&self, dir: &Path) -> Result<(), MemoryError> {
+        std::fs::create_dir_all(dir)?;
+
+        // Write a dirty marker — if we crash mid-save, the next load will see
+        // this and ignore commit SHAs (forcing a fresh rebuild).
+        let marker = dir.join(".save-in-progress");
+        std::fs::write(&marker, b"")?;
+
+        // Persist all-index.
+        let all_dir = dir.join("all");
+        std::fs::create_dir_all(&all_dir)?;
+        self.all.save(&all_dir.join("index.usearch"))?;
+
+        // Persist per-scope indexes.
+        let scopes = self.scopes.read().expect("scopes lock poisoned");
+        for (scope, idx) in scopes.iter() {
+            let scope_dir = dir.join(scope.dir_prefix());
+            std::fs::create_dir_all(&scope_dir)?;
+            idx.save(&scope_dir.join("index.usearch"))?;
+        }
+
+        // Remove marker — save completed successfully.
+        let _ = std::fs::remove_file(&marker);
+
+        Ok(())
+    }
+
+    /// Load all indexes from subdirectories under `dir`.
+    ///
+    /// Missing subdirectories are treated as empty — those scopes will be
+    /// rebuilt incrementally on next use.
+    pub fn load(dir: &Path, dimensions: usize) -> Result<Self, MemoryError> {
+        // If a previous save was interrupted, clear commit SHAs to force a
+        // fresh rebuild on next startup. The marker is removed after we finish
+        // loading so subsequent loads are unaffected.
+        let dirty_marker = dir.join(".save-in-progress");
+        let dirty = dirty_marker.exists();
+
+        // Load all-index.
+        let all_path = dir.join("all").join("index.usearch");
+        let all = if all_path.exists() {
+            VectorIndex::load(&all_path)?
+        } else {
+            VectorIndex::new(dimensions)?
+        };
+
+        let mut scopes: HashMap<Scope, VectorIndex> = HashMap::new();
+
+        // Load global index.
+        let global_path = dir.join("global").join("index.usearch");
+        let global = if global_path.exists() {
+            VectorIndex::load(&global_path)?
+        } else {
+            VectorIndex::new(dimensions)?
+        };
+        scopes.insert(Scope::Global, global);
+
+        // Scan for project indexes under projects/*/
+        let projects_dir = dir.join("projects");
+        if projects_dir.is_dir() {
+            let entries = std::fs::read_dir(&projects_dir)
+                .map_err(|e| MemoryError::Index(format!("read projects dir: {}", e)))?;
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| MemoryError::Index(format!("read dir entry: {}", e)))?;
+                let path = entry.path();
+                if path.is_dir() {
+                    let project_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| {
+                            MemoryError::Index("non-UTF-8 project directory name".to_string())
+                        })?;
+                    if let Err(e) = validate_name(&project_name) {
+                        tracing::warn!(
+                            project_name = %project_name,
+                            error = %e,
+                            "skipping project index with invalid name"
+                        );
+                        continue;
+                    }
+                    let index_path = path.join("index.usearch");
+                    if index_path.exists() {
+                        let idx = VectorIndex::load(&index_path)?;
+                        scopes.insert(Scope::Project(project_name), idx);
+                    }
+                }
+            }
+        }
+
+        let result = Self {
+            scopes: RwLock::new(scopes),
+            all,
+            dimensions,
+        };
+
+        if dirty {
+            // Clear all commit SHAs so the next startup will force a fresh rebuild.
+            result.set_commit_sha(None);
+            let _ = std::fs::remove_file(&dirty_marker);
+        }
+
+        Ok(result)
+    }
+
+    /// Read the commit SHA from the all-index metadata.
+    pub fn commit_sha(&self) -> Option<String> {
+        self.all.commit_sha()
+    }
+
+    /// Set the commit SHA on all sub-indexes.
+    pub fn set_commit_sha(&self, sha: Option<&str>) {
+        self.all.set_commit_sha(sha);
+        let scopes = self.scopes.read().expect("scopes lock poisoned");
+        for idx in scopes.values() {
+            idx.set_commit_sha(sha);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -350,5 +720,204 @@ mod tests {
             None,
             "name_map entry should have been cleared"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ScopedIndex tests
+    // -----------------------------------------------------------------------
+
+    fn make_scoped() -> ScopedIndex {
+        ScopedIndex::new(8).expect("failed to create scoped index")
+    }
+
+    fn vec_a() -> Vec<f32> {
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn vec_b() -> Vec<f32> {
+        vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn vec_c() -> Vec<f32> {
+        vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    }
+
+    #[test]
+    fn scoped_index_add_inserts_into_scope_and_all() {
+        let si = make_scoped();
+        let scope = Scope::Global;
+        let name = "global/memory-a".to_string();
+
+        si.add(&scope, &vec_a(), name.clone()).expect("add failed");
+
+        // Should be findable in the all-index via find_key_by_name.
+        assert!(
+            si.find_key_by_name(&name).is_some(),
+            "should be in all-index"
+        );
+
+        // Should also be in scope-specific index — verify via search.
+        let results = si
+            .search(&ScopeFilter::GlobalOnly, &vec_a(), 5)
+            .expect("search failed");
+        assert!(
+            results.iter().any(|(_, n, _)| n == &name),
+            "should be found in global search"
+        );
+    }
+
+    #[test]
+    fn scoped_index_remove_removes_from_both() {
+        let si = make_scoped();
+        let scope = Scope::Global;
+        let name = "global/memory-rm".to_string();
+
+        si.add(&scope, &vec_a(), name.clone()).expect("add failed");
+        assert!(si.find_key_by_name(&name).is_some(), "should exist");
+
+        si.remove(&scope, &name).expect("remove failed");
+
+        assert!(
+            si.find_key_by_name(&name).is_none(),
+            "should be gone from all-index"
+        );
+
+        let results = si
+            .search(&ScopeFilter::GlobalOnly, &vec_a(), 5)
+            .expect("search failed");
+        assert!(
+            !results.iter().any(|(_, n, _)| n == &name),
+            "should not appear in global search after removal"
+        );
+    }
+
+    #[test]
+    fn scoped_index_search_global_only() {
+        let si = make_scoped();
+        let proj = Scope::Project("myproj".to_string());
+
+        si.add(&Scope::Global, &vec_a(), "global/mem-global".to_string())
+            .expect("add global failed");
+        si.add(&proj, &vec_b(), "projects/myproj/mem-proj".to_string())
+            .expect("add project failed");
+
+        let results = si
+            .search(&ScopeFilter::GlobalOnly, &vec_a(), 5)
+            .expect("search failed");
+
+        let names: Vec<&str> = results.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"global/mem-global"),
+            "should contain global"
+        );
+        assert!(
+            !names.contains(&"projects/myproj/mem-proj"),
+            "should NOT contain project memory"
+        );
+    }
+
+    #[test]
+    fn scoped_index_search_project_and_global() {
+        let si = make_scoped();
+        let proj_a = Scope::Project("alpha".to_string());
+        let proj_b = Scope::Project("beta".to_string());
+
+        si.add(&Scope::Global, &vec_a(), "global/g1".to_string())
+            .expect("add global failed");
+        si.add(&proj_a, &vec_b(), "projects/alpha/a1".to_string())
+            .expect("add alpha failed");
+        si.add(&proj_b, &vec_c(), "projects/beta/b1".to_string())
+            .expect("add beta failed");
+
+        let results = si
+            .search(
+                &ScopeFilter::ProjectAndGlobal("alpha".to_string()),
+                &vec_a(),
+                10,
+            )
+            .expect("search failed");
+
+        let names: Vec<&str> = results.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(names.contains(&"global/g1"), "should contain global");
+        assert!(names.contains(&"projects/alpha/a1"), "should contain alpha");
+        assert!(
+            !names.contains(&"projects/beta/b1"),
+            "should NOT contain beta"
+        );
+    }
+
+    #[test]
+    fn scoped_index_search_all() {
+        let si = make_scoped();
+        let proj = Scope::Project("foo".to_string());
+
+        si.add(&Scope::Global, &vec_a(), "global/x".to_string())
+            .expect("add global");
+        si.add(&proj, &vec_b(), "projects/foo/y".to_string())
+            .expect("add project");
+
+        let results = si
+            .search(&ScopeFilter::All, &vec_a(), 10)
+            .expect("search failed");
+
+        let names: Vec<&str> = results.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(names.contains(&"global/x"), "all should include global");
+        assert!(
+            names.contains(&"projects/foo/y"),
+            "all should include project"
+        );
+    }
+
+    #[test]
+    fn scoped_index_upsert_replaces_old_entry() {
+        let si = make_scoped();
+        let name = "global/memo".to_string();
+        si.add(&Scope::Global, &vec_a(), name.clone()).unwrap();
+        si.add(&Scope::Global, &vec_b(), name.clone()).unwrap();
+        // Should have exactly one entry in all-index search.
+        let results = si.search(&ScopeFilter::All, &vec_b(), 10).unwrap();
+        assert_eq!(
+            results.iter().filter(|(_, n, _)| n == &name).count(),
+            1,
+            "upsert should leave exactly one entry for the name"
+        );
+    }
+
+    #[test]
+    fn scoped_index_save_load_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let si = ScopedIndex::new(8).expect("create");
+        let proj = Scope::Project("rtrip".to_string());
+
+        si.add(&Scope::Global, &vec_a(), "global/rt-global".to_string())
+            .expect("add global");
+        si.add(&proj, &vec_b(), "projects/rtrip/rt-proj".to_string())
+            .expect("add project");
+
+        si.save(dir.path()).expect("save failed");
+
+        let loaded = ScopedIndex::load(dir.path(), 8).expect("load failed");
+
+        // Verify all-index finds both memories.
+        assert!(
+            loaded.find_key_by_name("global/rt-global").is_some(),
+            "global memory should survive round-trip"
+        );
+        assert!(
+            loaded.find_key_by_name("projects/rtrip/rt-proj").is_some(),
+            "project memory should survive round-trip"
+        );
+
+        // Verify search still works after reload.
+        let results = loaded
+            .search(
+                &ScopeFilter::ProjectAndGlobal("rtrip".to_string()),
+                &vec_a(),
+                10,
+            )
+            .expect("search failed");
+        let names: Vec<&str> = results.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(names.contains(&"global/rt-global"));
+        assert!(names.contains(&"projects/rtrip/rt-proj"));
     }
 }

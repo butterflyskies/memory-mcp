@@ -108,7 +108,7 @@ pub fn validate_branch_name(branch: &str) -> Result<(), MemoryError> {
 ///
 /// - `Global`           → `global/`
 /// - `Project(name)`    → `projects/{name}/`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "name")]
 #[non_exhaustive]
 pub enum Scope {
@@ -588,7 +588,7 @@ pub struct ReindexStats {
 use std::sync::Arc;
 
 use crate::{
-    auth::AuthProvider, embedding::EmbeddingBackend, index::VectorIndex, repo::MemoryRepo,
+    auth::AuthProvider, embedding::EmbeddingBackend, index::ScopedIndex, repo::MemoryRepo,
 };
 
 /// Shared application state threaded through the Axum server.
@@ -601,8 +601,8 @@ pub struct AppState {
     pub repo: Arc<MemoryRepo>,
     /// Backend used to compute text embeddings.
     pub embedding: Box<dyn EmbeddingBackend>,
-    /// In-memory vector index for semantic search.
-    pub index: VectorIndex,
+    /// In-memory vector index for semantic search (scope-partitioned).
+    pub index: ScopedIndex,
     /// Authentication provider for API access control.
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").
@@ -615,7 +615,7 @@ impl AppState {
         repo: Arc<MemoryRepo>,
         branch: String,
         embedding: Box<dyn EmbeddingBackend>,
-        index: VectorIndex,
+        index: ScopedIndex,
         auth: AuthProvider,
     ) -> Self {
         Self {

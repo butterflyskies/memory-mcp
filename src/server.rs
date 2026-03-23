@@ -11,7 +11,7 @@ use tracing::{info, warn, Instrument};
 use crate::{
     embedding::EmbeddingBackend,
     error::MemoryError,
-    index::VectorIndex,
+    index::ScopedIndex,
     repo::MemoryRepo,
     types::{
         parse_qualified_name, parse_scope, parse_scope_filter, validate_name, AppState,
@@ -44,26 +44,36 @@ const MAX_CONTENT_SIZE: usize = 1_048_576;
 async fn incremental_reindex(
     repo: &Arc<MemoryRepo>,
     embedding: &dyn EmbeddingBackend,
-    index: &VectorIndex,
+    index: &ScopedIndex,
     changes: &ChangedMemories,
 ) -> ReindexStats {
     let mut stats = ReindexStats::default();
 
     // ---- 1. Removals --------------------------------------------------------
     for name in &changes.removed {
-        if let Some(key) = index.find_key_by_name(name) {
-            if let Err(e) = index.remove(key) {
+        match parse_qualified_name(name) {
+            Ok((scope, _)) => {
+                if let Err(e) = index.remove(&scope, name) {
+                    warn!(
+                        qualified_name = %name,
+                        error = %e,
+                        "incremental_reindex: failed to remove vector; skipping"
+                    );
+                    stats.errors += 1;
+                } else {
+                    stats.removed += 1;
+                }
+            }
+            Err(e) => {
                 warn!(
                     qualified_name = %name,
                     error = %e,
-                    "incremental_reindex: failed to remove vector; skipping"
+                    "incremental_reindex: cannot parse qualified name for removal; skipping"
                 );
-                stats.errors += 1;
-            } else {
-                stats.removed += 1;
+                // If we can't parse the name, we can't look it up — not an indexing error.
             }
         }
-        // If not in index, nothing to do — not an error.
+        // If not in index, remove is a no-op — not an error.
     }
 
     // ---- 2. Resolve (scope, name) pairs for upserts -------------------------
@@ -85,10 +95,9 @@ async fn incremental_reindex(
     }
 
     // ---- 3. Read memories from disk -----------------------------------------
-    // (qualified_name, content, old_key_if_exists)
-    let mut to_embed: Vec<(String, String, Option<u64>)> = Vec::new();
+    // (scope, qualified_name, content)
+    let mut to_embed: Vec<(Scope, String, String)> = Vec::new();
     for (scope, name, qualified) in &pairs {
-        let old_key = index.find_key_by_name(qualified);
         let memory = match repo.read_memory(name, scope).await {
             Ok(m) => m,
             Err(e) => {
@@ -101,7 +110,7 @@ async fn incremental_reindex(
                 continue;
             }
         };
-        to_embed.push((qualified.clone(), memory.content, old_key));
+        to_embed.push((scope.clone(), qualified.clone(), memory.content));
     }
 
     if to_embed.is_empty() {
@@ -109,7 +118,7 @@ async fn incremental_reindex(
     }
 
     // ---- 4. Batch embed all content -----------------------------------------
-    let contents: Vec<String> = to_embed.iter().map(|(_, c, _)| c.clone()).collect();
+    let contents: Vec<String> = to_embed.iter().map(|(_, _, c)| c.clone()).collect();
     let vectors = match embedding.embed(&contents).await {
         Ok(v) => v,
         Err(batch_err) => {
@@ -122,7 +131,7 @@ async fn incremental_reindex(
                     Err(e) => {
                         warn!(
                             error = %e,
-                            qualified_name = %to_embed[i].0,
+                            qualified_name = %to_embed[i].1,
                             "incremental_reindex: per-item embed failed; skipping"
                         );
                         failed.push(i);
@@ -139,31 +148,19 @@ async fn incremental_reindex(
     };
 
     // ---- 5. Update index entries --------------------------------------------
-    for ((qualified_name, _, old_key), vector) in to_embed.iter().zip(vectors.iter()) {
-        let is_update = old_key.is_some();
+    for ((scope, qualified_name, _), vector) in to_embed.iter().zip(vectors.iter()) {
+        let is_update = index.find_key_by_name(qualified_name).is_some();
 
-        // Add new entry first — if this fails, leave the old entry intact.
-        match index.add_with_next_key(vector, qualified_name.clone()) {
+        match index.add(scope, vector, qualified_name.clone()) {
             Ok(_) => {}
             Err(e) => {
                 warn!(
                     qualified_name = %qualified_name,
                     error = %e,
-                    "incremental_reindex: add_with_next_key failed; skipping"
+                    "incremental_reindex: add failed; skipping"
                 );
                 stats.errors += 1;
                 continue;
-            }
-        }
-
-        // Now remove the old entry (new one already in the index).
-        if let Some(key) = old_key {
-            if let Err(e) = index.remove(*key) {
-                warn!(
-                    qualified_name = %qualified_name,
-                    error = %e,
-                    "incremental_reindex: old vector removal failed; continuing"
-                );
             }
         }
 
@@ -221,7 +218,7 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
-            let metadata = MemoryMetadata::new(scope, args.tags, args.source);
+            let metadata = MemoryMetadata::new(scope.clone(), args.tags, args.source);
             let memory = Memory::new(args.name, args.content, metadata);
 
             // Order: (1) embed, (2) add to index, (3) save to repo.
@@ -237,26 +234,10 @@ impl MemoryServer {
 
             let qualified_name = format!("{}/{}", memory.metadata.scope.dir_prefix(), memory.name);
 
-            // Look up any existing key BEFORE adding — we remove it only after
-            // the new entry is successfully inserted, so a failure in
-            // add_with_next_key never leaves the memory orphaned.
-            let old_key = state.index.find_key_by_name(&qualified_name);
-
             state
                 .index
-                .add_with_next_key(&vector, qualified_name)
+                .add(&scope, &vector, qualified_name)
                 .map_err(ErrorData::from)?;
-
-            // Now safe to remove the old entry (new one is already in the index).
-            if let Some(old_key) = old_key {
-                if let Err(e) = state.index.remove(old_key) {
-                    warn!(
-                        name = %memory.name,
-                        error = %e,
-                        "old vector removal failed during remember; continuing"
-                    );
-                }
-            }
 
             let start = Instant::now();
             state
@@ -304,8 +285,6 @@ impl MemoryServer {
                 parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let limit = args.limit.unwrap_or(5).min(100);
-            // Over-fetch to compensate for scope filtering.
-            let fetch_limit = limit.saturating_mul(3);
 
             let start = Instant::now();
             let query_vector = state
@@ -318,7 +297,7 @@ impl MemoryServer {
             let start = Instant::now();
             let results = state
                 .index
-                .search(&query_vector, fetch_limit)
+                .search(&scope_filter, &query_vector, limit)
                 .map_err(ErrorData::from)?;
             info!(
                 search_ms = start.elapsed().as_millis(),
@@ -328,7 +307,6 @@ impl MemoryServer {
 
             let pre_filter_count = results.len();
             let mut results_vec = Vec::new();
-            let mut scope_filtered: usize = 0;
             let mut skipped_errors: usize = 0;
 
             for (_key, qualified_name, distance) in results {
@@ -347,12 +325,6 @@ impl MemoryServer {
                         continue;
                     }
                 };
-
-                // Apply scope filter.
-                if !scope_filter.matches(&scope) {
-                    scope_filtered += 1;
-                    continue;
-                }
 
                 // Read the memory; if it was deleted but still in the index, skip it.
                 let memory = match state.repo.read_memory(&name, &scope).await {
@@ -383,7 +355,7 @@ impl MemoryServer {
 
             info!(
                 returned = results_vec.len(),
-                scope_filtered, skipped_errors, "recall complete"
+                skipped_errors, "recall complete"
             );
 
             Ok(serde_json::json!({
@@ -391,7 +363,6 @@ impl MemoryServer {
                 "count": results_vec.len(),
                 "limit": limit,
                 "pre_filter_count": pre_filter_count,
-                "scope_filtered": scope_filtered,
                 "skipped_errors": skipped_errors,
             })
             .to_string())
@@ -427,23 +398,12 @@ impl MemoryServer {
 
             let qualified_name = format!("{}/{}", scope.dir_prefix(), args.name);
 
-            // Look up the vector key by name instead of deriving it from UUID.
-            match state.index.find_key_by_name(&qualified_name) {
-                Some(key) => {
-                    if let Err(e) = state.index.remove(key) {
-                        warn!(
-                            name = %args.name,
-                            error = %e,
-                            "vector removal failed during forget; continuing"
-                        );
-                    }
-                }
-                None => {
-                    warn!(
-                        name = %args.name,
-                        "vector key not found in index during forget; continuing"
-                    );
-                }
+            if let Err(e) = state.index.remove(&scope, &qualified_name) {
+                warn!(
+                    name = %args.name,
+                    error = %e,
+                    "vector removal failed during forget; continuing"
+                );
             }
 
             state
@@ -522,7 +482,7 @@ impl MemoryServer {
             memory.metadata.updated_at = Utc::now();
 
             // Only re-embed and re-index when content changed.
-            // Order: (1) embed, (2) remove old + add new index entry, (3) save to repo.
+            // Order: (1) embed, (2) upsert index entry, (3) save to repo.
             if content_changed {
                 let qualified_name =
                     format!("{}/{}", memory.metadata.scope.dir_prefix(), memory.name);
@@ -534,24 +494,10 @@ impl MemoryServer {
                     .await
                     .map_err(ErrorData::from)?;
 
-                // Add new entry first, then remove old — so a failure in
-                // add_with_next_key never leaves the memory orphaned.
-                let old_key = state.index.find_key_by_name(&qualified_name);
-
                 state
                     .index
-                    .add_with_next_key(&vector, qualified_name)
+                    .add(&scope, &vector, qualified_name)
                     .map_err(ErrorData::from)?;
-
-                if let Some(old_key) = old_key {
-                    if let Err(e) = state.index.remove(old_key) {
-                        warn!(
-                            name = %args.name,
-                            error = %e,
-                            "old vector key removal failed during edit; continuing"
-                        );
-                    }
-                }
             }
 
             // Persist to repo (last, so partial failures leave recoverable state).

@@ -12,7 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use memory_mcp::auth::{self, AuthProvider, StoreBackend};
 use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend, MODEL_ID};
-use memory_mcp::index::VectorIndex;
+use memory_mcp::index::ScopedIndex;
 use memory_mcp::repo::MemoryRepo;
 use memory_mcp::server::MemoryServer;
 use memory_mcp::types::{validate_branch_name, AppState};
@@ -220,16 +220,26 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let dimensions = embedding.dimensions();
 
-    // Attempt to load existing index; create fresh if missing.
-    let index_path = repo_path.join(".memory-mcp-index").join("index.usearch");
-    let index = if index_path.exists() {
-        VectorIndex::load(&index_path).unwrap_or_else(|e| {
-            tracing::warn!("could not load index ({}), creating fresh", e);
-            VectorIndex::new(dimensions).expect("failed to create vector index")
-        })
-    } else {
-        VectorIndex::new(dimensions).context("failed to create vector index")?
-    };
+    // Attempt to load the scoped index; create fresh if missing or corrupt.
+    let index_dir = repo_path.join(".memory-mcp-index");
+
+    // Remove legacy single-index files if they still exist from an old install.
+    let old_index = index_dir.join("index.usearch");
+    if old_index.exists() {
+        if let Err(e) = std::fs::remove_file(&old_index) {
+            tracing::warn!(error = %e, "failed to remove legacy index file");
+        }
+        let keys_file = index_dir.join("index.usearch.keys.json");
+        if let Err(e) = std::fs::remove_file(&keys_file) {
+            tracing::warn!(error = %e, "failed to remove legacy index keys file");
+        }
+        info!("removed legacy single-index files");
+    }
+
+    let index = ScopedIndex::load(&index_dir, dimensions).unwrap_or_else(|e| {
+        tracing::warn!("could not load scoped index ({}), creating fresh", e);
+        ScopedIndex::new(dimensions).expect("failed to create scoped index")
+    });
 
     let auth = AuthProvider::new();
 
@@ -304,15 +314,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         .await
         .context("server error")?;
 
-    // Persist the vector index so the next startup can skip a full reindex.
-    let index_dir = repo_path.join(".memory-mcp-index");
+    // Persist the scoped vector index so the next startup can skip a full reindex.
     std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
-    let index_path = index_dir.join("index.usearch");
-    if let Err(e) = state_for_shutdown.index.save(&index_path) {
+    if let Err(e) = state_for_shutdown.index.save(&index_dir) {
         tracing::warn!("failed to persist vector index on shutdown: {}", e);
     } else {
-        info!("vector index saved to {}", index_path.display());
+        info!("vector index saved to {}", index_dir.display());
     }
 
     Ok(())
