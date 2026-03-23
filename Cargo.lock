@@ -2022,6 +2022,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcp-session"
 version = "0.1.0"
+source = "git+https://github.com/butterflyskies/mcp-session.git?branch=feat%2Finitial-release#3f252817a20374ae669c259bf59551e1bb923200"
 dependencies = [
  "futures-core",
  "rmcp",
