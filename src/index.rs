@@ -343,6 +343,12 @@ pub struct ScopedIndex {
     dimensions: usize,
 }
 
+// Locking order: `scopes` (RwLock) is always acquired before any
+// `VectorIndex::state` (Mutex). Never hold a VectorIndex Mutex while
+// acquiring `scopes`. The `all` index is accessed directly (not through
+// `scopes`), but always while `scopes` is already held or after it has
+// been released — never in the reverse order.
+
 impl ScopedIndex {
     /// Create a new `ScopedIndex` with empty global + all indexes.
     pub fn new(dimensions: usize) -> Result<Self, MemoryError> {
@@ -355,24 +361,6 @@ impl ScopedIndex {
             all,
             dimensions,
         })
-    }
-
-    /// Ensure the scope's index exists, creating it if missing.
-    pub fn ensure_scope(&self, scope: &Scope) -> Result<(), MemoryError> {
-        // Fast path: check with a read lock first.
-        {
-            let scopes = self.scopes.read().expect("scopes lock poisoned");
-            if scopes.contains_key(scope) {
-                return Ok(());
-            }
-        }
-        // Slow path: acquire write lock and create.
-        let mut scopes = self.scopes.write().expect("scopes lock poisoned");
-        // Re-check after acquiring write lock (another thread may have inserted).
-        if !scopes.contains_key(scope) {
-            scopes.insert(scope.clone(), VectorIndex::new(self.dimensions)?);
-        }
-        Ok(())
     }
 
     /// Insert `vector` into both the scope-specific index and the all-index.
@@ -409,6 +397,10 @@ impl ScopedIndex {
         let new_scope_key = scope_idx.add_with_next_key(vector, qualified_name.clone())?;
 
         // Insert into all-index; if this fails, roll back scope insert.
+        // Note: the rollback path is not unit-tested because usearch allocation
+        // failures are not injectable without a mock layer. The logic is simple
+        // (remove the key we just inserted) and covered by VectorIndex::remove's
+        // existing tests.
         let all_key = match self.all.add_with_next_key(vector, qualified_name) {
             Ok(key) => key,
             Err(e) => {
