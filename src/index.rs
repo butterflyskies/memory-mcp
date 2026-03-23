@@ -387,12 +387,19 @@ impl ScopedIndex {
         vector: &[f32],
         qualified_name: String,
     ) -> Result<u64, MemoryError> {
-        self.ensure_scope(scope)?;
+        // Write lock serialises the full find→insert→remove composite so
+        // concurrent upserts for the same name cannot interleave. Reads
+        // (via `search`) use a read lock and are not blocked by other reads.
+        let mut scopes = self.scopes.write().expect("scopes lock poisoned");
 
-        let scopes = self.scopes.read().expect("scopes lock poisoned");
+        // Ensure scope index exists (inline, since we already hold write lock).
+        if !scopes.contains_key(scope) {
+            scopes.insert(scope.clone(), VectorIndex::new(self.dimensions)?);
+        }
+
         let scope_idx = scopes
             .get(scope)
-            .expect("scope index must exist after ensure_scope");
+            .expect("scope index must exist after insert");
 
         // Capture old keys before inserting new ones.
         let old_scope_key = scope_idx.find_key_by_name(&qualified_name);
@@ -427,18 +434,18 @@ impl ScopedIndex {
     /// Both removals are best-effort: an error in one does not prevent the
     /// other from running. Returns `Ok(())` regardless of individual failures.
     pub fn remove(&self, scope: &Scope, qualified_name: &str) -> Result<(), MemoryError> {
+        // Write lock serialises with concurrent adds for the same name.
+        let scopes = self.scopes.write().expect("scopes lock poisoned");
+
         // Remove from scope index (best-effort).
-        {
-            let scopes = self.scopes.read().expect("scopes lock poisoned");
-            if let Some(scope_idx) = scopes.get(scope) {
-                if let Some(key) = scope_idx.find_key_by_name(qualified_name) {
-                    if let Err(e) = scope_idx.remove(key) {
-                        tracing::warn!(
-                            qualified_name = %qualified_name,
-                            error = %e,
-                            "scope index removal failed; continuing to all-index"
-                        );
-                    }
+        if let Some(scope_idx) = scopes.get(scope) {
+            if let Some(key) = scope_idx.find_key_by_name(qualified_name) {
+                if let Err(e) = scope_idx.remove(key) {
+                    tracing::warn!(
+                        qualified_name = %qualified_name,
+                        error = %e,
+                        "scope index removal failed; continuing to all-index"
+                    );
                 }
             }
         }
