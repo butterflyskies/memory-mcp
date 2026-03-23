@@ -834,8 +834,8 @@ impl ServerHandler for MemoryServer {
             `list` to browse, and `sync` to push/pull the remote.\n\n\
             Scope convention: always pass scope='project:<basename-of-your-cwd>' when working within \
             a project. This returns project memories alongside global ones. Omitting scope defaults to \
-            global-only for queries (recall, list) and global storage for mutations (remember, edit, \
-            read, forget). Use scope='all' to search across all projects."
+            global-only for queries (recall, list) and targets a single memory for point operations \
+            (remember, edit, read, forget). Use scope='all' to search across all projects."
                 .to_string(),
         )
     }

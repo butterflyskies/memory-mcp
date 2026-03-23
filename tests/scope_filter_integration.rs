@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use memory_mcp::repo::MemoryRepo;
-use memory_mcp::types::{Memory, MemoryMetadata, Scope, ScopeFilter};
+use memory_mcp::types::{Memory, MemoryMetadata, Scope};
 
 /// Helper: initialise a fresh in-memory repo in a temp directory.
 async fn make_repo() -> (Arc<MemoryRepo>, tempfile::TempDir) {
@@ -97,7 +97,7 @@ async fn list_scope_filter_all() {
 }
 
 // ---------------------------------------------------------------------------
-// Server-layer pattern: list_memories(None) then filter for Global or Project
+// Production path: two targeted list_memories calls merged (ProjectAndGlobal)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -113,21 +113,24 @@ async fn list_scope_filter_project_and_global() {
     )
     .await;
 
-    // Use the production ScopeFilter::matches() to validate the actual filter logic.
-    let filter = ScopeFilter::ProjectAndGlobal("test-proj".to_string());
-    let all_memories = repo.list_memories(None).await.expect("list should succeed");
-
-    let filtered: Vec<_> = all_memories
-        .into_iter()
-        .filter(|m| filter.matches(&m.metadata.scope))
-        .collect();
+    // Mirror the production code path in server.rs: two targeted calls merged.
+    let project_scope = Scope::Project("test-proj".to_string());
+    let mut memories = repo
+        .list_memories(Some(&Scope::Global))
+        .await
+        .expect("global list should succeed");
+    memories.extend(
+        repo.list_memories(Some(&project_scope))
+            .await
+            .expect("project list should succeed"),
+    );
 
     assert_eq!(
-        filtered.len(),
+        memories.len(),
         2,
         "expected global + test-proj memories, not other-proj"
     );
-    let names: Vec<&str> = filtered.iter().map(|m| m.name.as_str()).collect();
+    let names: Vec<&str> = memories.iter().map(|m| m.name.as_str()).collect();
     assert!(names.contains(&"global-mem"), "missing global-mem");
     assert!(names.contains(&"proj-mem"), "missing proj-mem");
     assert!(

@@ -11,7 +11,7 @@ Change the default scope behavior for query operations (`recall`, `list`):
 - Omitting scope returns global-only (was: everything)
 - Passing `project:<name>` returns that project's memories **plus** global (compound filter)
 - A new `"all"` sentinel explicitly opts into cross-project search
-- Write operations (`remember`, `edit`, `read`, `forget`) are unchanged — scope targets a single storage location
+- Point operations (`remember`, `edit`, `read`, `forget`) are unchanged — scope targets a single memory
 
 Tool descriptions guide agents to derive the project name from the basename of their working directory.
 
