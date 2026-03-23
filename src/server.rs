@@ -14,9 +14,9 @@ use crate::{
     index::VectorIndex,
     repo::MemoryRepo,
     types::{
-        parse_qualified_name, parse_scope, validate_name, AppState, ChangedMemories, EditArgs,
-        ForgetArgs, ListArgs, Memory, MemoryMetadata, PullResult, ReadArgs, RecallArgs,
-        ReindexStats, RememberArgs, Scope, SyncArgs,
+        parse_qualified_name, parse_scope, parse_scope_filter, validate_name, AppState,
+        ChangedMemories, EditArgs, ForgetArgs, ListArgs, Memory, MemoryMetadata, PullResult,
+        ReadArgs, RecallArgs, ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
     },
 };
 
@@ -195,8 +195,9 @@ impl MemoryServer {
     /// Returns the assigned memory ID on success.
     #[tool(
         name = "remember",
-        description = "Store a new memory. Saves the content to the git-backed repository \
-        and indexes it for semantic search. Returns the assigned memory ID."
+        description = "Store a new memory. Saves the content to the git-backed repository and \
+        indexes it for semantic search. Use scope 'project:<basename-of-your-cwd>' for \
+        project-specific memories or omit for global. Returns the assigned memory ID."
     )]
     async fn remember(
         &self,
@@ -284,8 +285,10 @@ impl MemoryServer {
     /// Returns a JSON array of matching memories sorted by relevance.
     #[tool(
         name = "recall",
-        description = "Search memories by semantic similarity. Embeds the query and returns \
-        the top matching memories as a JSON array with name, scope, tags, and content snippet."
+        description = "Search memories by semantic similarity. Returns the top matching memories as a JSON array \
+        with name, scope, tags, and content snippet.\n\n\
+        Scope: pass 'project:<basename-of-your-cwd>' to search your current project + global memories, \
+        'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> Result<String, ErrorData> {
         let span = tracing::info_span!(
@@ -297,12 +300,8 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             // Parse optional scope filter.
-            let scope_filter: Option<Scope> = args
-                .scope
-                .as_deref()
-                .map(|s| s.parse::<Scope>())
-                .transpose()
-                .map_err(ErrorData::from)?;
+            let scope_filter =
+                parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let limit = args.limit.unwrap_or(5).min(100);
             // Over-fetch to compensate for scope filtering.
@@ -349,12 +348,10 @@ impl MemoryServer {
                     }
                 };
 
-                // Apply scope filter if present.
-                if let Some(ref filter) = scope_filter {
-                    if &scope != filter {
-                        scope_filtered += 1;
-                        continue;
-                    }
+                // Apply scope filter.
+                if !scope_filter.matches(&scope) {
+                    scope_filtered += 1;
+                    continue;
                 }
 
                 // Read the memory; if it was deleted but still in the index, skip it.
@@ -411,8 +408,9 @@ impl MemoryServer {
     /// Returns `"ok"` on success.
     #[tool(
         name = "forget",
-        description = "Delete a memory by name. Removes the file from git and the vector from \
-        the search index. Returns 'ok' on success."
+        description = "Delete a memory by name. Use scope 'project:<basename-of-your-cwd>' for project-scoped \
+        memories or omit for global. Removes the file from git and the vector from the search index. \
+        Returns 'ok' on success."
     )]
     async fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
@@ -477,7 +475,8 @@ impl MemoryServer {
     #[tool(
         name = "edit",
         description = "Edit an existing memory. Supports partial updates — omit content or \
-        tags to preserve existing values. Re-embeds and re-indexes the memory. Returns the memory ID."
+        tags to preserve existing values. Re-embeds and re-indexes the memory. Use scope \
+        'project:<basename-of-your-cwd>' for project-scoped memories. Returns the memory ID."
     )]
     async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
@@ -586,27 +585,45 @@ impl MemoryServer {
     /// created_at, updated_at). Full content bodies are omitted for brevity.
     #[tool(
         name = "list",
-        description = "List stored memories. Optionally filter by scope ('global' or \
-        'project:<name>'). Returns a JSON array of memory summaries without full content."
+        description = "List stored memories. Pass 'project:<basename-of-your-cwd>' for project + global memories, \
+        'global' for global-only, or 'all' for everything. Omitting scope defaults to global-only. \
+        Returns a JSON array of memory summaries without full content."
     )]
     async fn list(&self, Parameters(args): Parameters<ListArgs>) -> Result<String, ErrorData> {
         let span = tracing::info_span!("list", scope = ?args.scope);
         let state = Arc::clone(&self.state);
         async move {
-            // None means all scopes.
-            let scope_filter: Option<Scope> = args
-                .scope
-                .as_deref()
-                .map(|s| s.parse::<Scope>())
-                .transpose()
-                .map_err(ErrorData::from)?;
+            let scope_filter =
+                parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
-            let memories = state
-                .repo
-                .list_memories(scope_filter.as_ref())
-                .await
-                .map_err(ErrorData::from)?;
+            let memories = match &scope_filter {
+                ScopeFilter::GlobalOnly => state
+                    .repo
+                    .list_memories(Some(&Scope::Global))
+                    .await
+                    .map_err(ErrorData::from)?,
+                ScopeFilter::All => state
+                    .repo
+                    .list_memories(None)
+                    .await
+                    .map_err(ErrorData::from)?,
+                ScopeFilter::ProjectAndGlobal(project_name) => {
+                    let project_scope = Scope::Project(project_name.clone());
+                    let mut global = state
+                        .repo
+                        .list_memories(Some(&Scope::Global))
+                        .await
+                        .map_err(ErrorData::from)?;
+                    let project = state
+                        .repo
+                        .list_memories(Some(&project_scope))
+                        .await
+                        .map_err(ErrorData::from)?;
+                    global.extend(project);
+                    global
+                }
+            };
             info!(
                 ms = start.elapsed().as_millis(),
                 count = memories.len(),
@@ -643,8 +660,9 @@ impl MemoryServer {
     /// metadata (id, scope, tags, timestamps) as a JSON object.
     #[tool(
         name = "read",
-        description = "Read a specific memory by name. Returns the full markdown content and \
-        metadata (id, scope, tags, timestamps) as a JSON object."
+        description = "Read a specific memory by name. Use scope 'project:<basename-of-your-cwd>' for \
+        project-scoped memories or omit for global. Returns the full markdown content and metadata \
+        (id, scope, tags, timestamps) as a JSON object."
     )]
     async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
@@ -810,11 +828,14 @@ impl MemoryServer {
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "A semantic memory system for AI coding agents. Memories are stored as \
-                 markdown files in a git repository and indexed for semantic retrieval. \
-                 Use `remember` to store, `recall` to search, `read` to fetch a specific \
-                 memory, `edit` to update, `forget` to delete, `list` to browse, and \
-                 `sync` to push/pull the remote."
+            "A semantic memory system for AI coding agents. Memories are stored as markdown files \
+            in a git repository and indexed for semantic retrieval. Use `remember` to store, `recall` \
+            to search, `read` to fetch a specific memory, `edit` to update, `forget` to delete, \
+            `list` to browse, and `sync` to push/pull the remote.\n\n\
+            Scope convention: always pass scope='project:<basename-of-your-cwd>' when working within \
+            a project. This returns project memories alongside global ones. Omitting scope defaults to \
+            global-only for queries (recall, list) and global storage for mutations (remember, edit, \
+            read, forget). Use scope='all' to search across all projects."
                 .to_string(),
         )
     }
