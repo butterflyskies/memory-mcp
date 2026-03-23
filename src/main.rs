@@ -5,7 +5,8 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    session::local::{LocalSessionManager, SessionConfig},
+    StreamableHttpServerConfig, StreamableHttpService,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -226,7 +227,14 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let service = StreamableHttpService::new(
         move || Ok(MemoryServer::new(Arc::clone(&state))),
-        LocalSessionManager::default().into(),
+        LocalSessionManager {
+            session_config: SessionConfig {
+                keep_alive: Some(std::time::Duration::from_secs(30 * 60)),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into(),
         StreamableHttpServerConfig {
             cancellation_token: ct_child,
             ..Default::default()
