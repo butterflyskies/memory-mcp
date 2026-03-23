@@ -317,6 +317,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Persist the scoped vector index so the next startup can skip a full reindex.
     std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
+    // TODO: set commit_sha to repo HEAD before saving so the next startup
+    // can use SHA-based freshness to skip reindexing unchanged scopes.
+    // For now, indexes are always rebuilt from scratch on startup if missing.
     if let Err(e) = state_for_shutdown.index.save(&index_dir) {
         tracing::warn!("failed to persist vector index on shutdown: {}", e);
     } else {

@@ -396,21 +396,18 @@ impl MemoryServer {
 
             let start = Instant::now();
 
-            let qualified_name = format!("{}/{}", scope.dir_prefix(), args.name);
-
-            if let Err(e) = state.index.remove(&scope, &qualified_name) {
-                warn!(
-                    name = %args.name,
-                    error = %e,
-                    "vector removal failed during forget; continuing"
-                );
-            }
-
+            // Delete from repo first — if this fails, index is untouched, memory stays functional.
             state
                 .repo
                 .delete_memory(&args.name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
+
+            // Remove from index (best-effort — stale entries are skipped at recall time).
+            let qualified_name = format!("{}/{}", scope.dir_prefix(), args.name);
+            if let Err(e) = state.index.remove(&scope, &qualified_name) {
+                warn!(name = %args.name, error = %e, "vector removal failed during forget; stale entry will be skipped at recall");
+            }
 
             info!(
                 ms = start.elapsed().as_millis(),

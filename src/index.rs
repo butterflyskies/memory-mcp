@@ -498,21 +498,28 @@ impl ScopedIndex {
                     combined.append(&mut proj_results);
                 }
 
-                // Merge by ascending distance, deduplicate by name, then take top-k.
+                // Deduplicate by qualified name (HashSet ensures non-adjacent dupes are caught).
+                let mut seen = std::collections::HashSet::new();
+                combined.retain(|(_, name, _)| seen.insert(name.clone()));
+                // Sort by ascending distance and take top-k.
                 combined.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-                combined.dedup_by(|a, b| a.1 == b.1);
                 combined.truncate(limit);
                 Ok(combined)
             }
         }
     }
 
-    /// Find the key in the all-index for a given qualified name.
+    /// Find the key for a given qualified name in the **all-index** (not scope-specific).
+    ///
+    /// This is the canonical lookup — the all-index contains every memory regardless of scope.
     pub fn find_key_by_name(&self, qualified_name: &str) -> Option<u64> {
         self.all.find_key_by_name(qualified_name)
     }
 
     /// Grow all indexes to accommodate `additional` more vectors.
+    ///
+    /// Reserved for future batch-insert operations; no production callers currently exist.
+    #[allow(dead_code)]
     pub fn grow_if_needed(&self, additional: usize) -> Result<(), MemoryError> {
         self.all.grow_if_needed(additional)?;
         let scopes = self.scopes.read().expect("scopes lock poisoned");
@@ -880,6 +887,27 @@ mod tests {
             results.iter().filter(|(_, n, _)| n == &name).count(),
             1,
             "upsert should leave exactly one entry for the name"
+        );
+    }
+
+    #[test]
+    fn scoped_index_dirty_marker_clears_commit_sha() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let si = ScopedIndex::new(8).expect("create");
+        si.set_commit_sha(Some("abc123"));
+        si.save(dir.path()).expect("save");
+
+        // Simulate interrupted save by re-creating the marker.
+        std::fs::write(dir.path().join(".save-in-progress"), b"").unwrap();
+
+        let loaded = ScopedIndex::load(dir.path(), 8).expect("load");
+        assert!(
+            loaded.commit_sha().is_none(),
+            "dirty marker should clear SHA"
+        );
+        assert!(
+            !dir.path().join(".save-in-progress").exists(),
+            "marker should be cleaned up"
         );
     }
 
