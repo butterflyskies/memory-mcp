@@ -18,5 +18,7 @@ pub mod index;
 pub mod repo;
 /// MCP server implementation — tool handlers for the memory protocol.
 pub mod server;
+/// Bounded session manager with FIFO eviction for limiting concurrent sessions.
+pub mod session;
 /// Domain types: memories, scopes, metadata, validation, and application state.
 pub mod types;

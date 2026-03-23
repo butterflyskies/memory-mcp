@@ -34,6 +34,7 @@ libc = "0.2"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
+futures-core = { version = "0.3", default-features = false }
 
 # Candle direct — pure-Rust BERT inference for embeddings.
 candle-core = "0.9"

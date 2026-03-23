@@ -2047,6 +2047,7 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "clap",
+ "futures-core",
  "git2",
  "hf-hub",
  "homedir",
