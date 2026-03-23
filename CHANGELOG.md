@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/butterflyskies/memory-mcp/compare/v0.3.0...v0.3.1) (2026-03-23)
+
+
+### Features
+
+* bounded session management via mcp-session ([#82](https://github.com/butterflyskies/memory-mcp/issues/82)) ([9fb5895](https://github.com/butterflyskies/memory-mcp/commit/9fb589586419b680517573dbd2a4eb3a1741d248))
+
 ## [0.3.0](https://github.com/butterflyskies/memory-mcp/compare/v0.2.0...v0.3.0) (2026-03-21)
 
 
