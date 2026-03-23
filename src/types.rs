@@ -900,4 +900,28 @@ mod tests {
     fn scope_filter_invalid_returns_error() {
         assert!(parse_scope_filter(Some("bogus")).is_err());
     }
+
+    // ScopeFilter::matches tests
+
+    #[test]
+    fn scope_filter_matches_global_only() {
+        let f = ScopeFilter::GlobalOnly;
+        assert!(f.matches(&Scope::Global));
+        assert!(!f.matches(&Scope::Project("x".into())));
+    }
+
+    #[test]
+    fn scope_filter_matches_project_and_global() {
+        let f = ScopeFilter::ProjectAndGlobal("myproj".into());
+        assert!(f.matches(&Scope::Global));
+        assert!(f.matches(&Scope::Project("myproj".into())));
+        assert!(!f.matches(&Scope::Project("other".into())));
+    }
+
+    #[test]
+    fn scope_filter_matches_all() {
+        let f = ScopeFilter::All;
+        assert!(f.matches(&Scope::Global));
+        assert!(f.matches(&Scope::Project("anything".into())));
+    }
 }
