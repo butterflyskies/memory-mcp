@@ -1,14 +1,13 @@
 # Publish to crates.io using Trusted Publishing (OIDC — no API token needed).
-# Called by the cargo-dist release workflow as a custom publish job.
+# Called by the release workflow after the draft release is created.
 name: Publish Crate
 
 on:
   workflow_call:
     inputs:
-      plan:
-        required: false
+      tag:
+        required: true
         type: string
-        description: "Unused — accepted for interface symmetry with other publish jobs"
 
 permissions:
   id-token: write
@@ -21,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ inputs.tag }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
         with:
@@ -28,9 +28,8 @@ jobs:
       - name: Authenticate with crates.io
         uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
         id: auth
-      # --no-verify: skip the verification rebuild. cargo-dist already built
-      # and tested the release artifacts; rebuilding here is redundant and
-      # requires system dependencies (libdbus-1-dev) not present in this job.
+      # --no-verify: skip the verification rebuild. CI already built and tested;
+      # rebuilding here requires system dependencies (libdbus-1-dev) not present.
       - name: Publish crate
         run: cargo publish --no-verify --locked
         env:
