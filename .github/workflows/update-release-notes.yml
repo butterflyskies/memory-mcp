@@ -25,13 +25,15 @@ jobs:
 
       - name: Extract tag from plan
         id: tag
+        env:
+          PLAN: ${{ inputs.plan }}
         run: |
-          tag=$(echo '${{ inputs.plan }}' | jq -r '.announcement_tag')
+          tag=$(echo "$PLAN" | jq -r '.announcement_tag')
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
         id: cliff
-        uses: orhun/git-cliff-action@4fcb14eb4e03ead1e6a5e3e9f418ae498079f01f # v4.4.2
+        uses: orhun/git-cliff-action@c93ef52f3d0ddcdcc9bd5447d98d458a11cd4f72 # v4.7.1
         with:
           args: --config github-keepachangelog --latest --strip all
         env:
@@ -42,7 +44,8 @@ jobs:
       - name: Update release body
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          gh release edit "${{ steps.tag.outputs.tag }}" \
+          gh release edit "$RELEASE_TAG" \
             --notes-file "${{ runner.temp }}/release-notes.md" \
             --repo "${{ github.repository }}"

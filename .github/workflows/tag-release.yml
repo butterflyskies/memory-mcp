@@ -1,14 +1,17 @@
 # Detect version bumps on main and create a git tag.
 # The tag push triggers the cargo-dist release workflow (release.yml),
 # which builds artifacts and generates release notes from the dist manifest.
-# CHANGELOG.md automation tracked in #98.
+#
+# Triggered by workflow_run so that:
+#   1. The tag is only created after CI passes (explicit gate, not polling)
+#   2. The dependency is visible in GitHub's workflow visualization UI
 name: Tag Release
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
-    paths:
-      - 'Cargo.toml'
 
 # Only one tag-release at a time.
 concurrency:
@@ -19,6 +22,8 @@ permissions: {}
 
 jobs:
   tag-release:
+    # Only run when CI succeeded, not on failure/cancellation.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -36,12 +41,20 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          # Use the CI run's commit, not the latest on the branch — avoids
+          # a race where a newer push lands between CI completing and this
+          # workflow starting.
+          ref: ${{ github.event.workflow_run.head_sha }}
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Check for version bump
         id: check
         run: |
           version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::Failed to extract version from Cargo.toml"
+            exit 1
+          fi
           tag="v${version}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${tag}" >> "$GITHUB_OUTPUT"
@@ -56,12 +69,16 @@ jobs:
 
       - name: Create and push tag
         if: steps.check.outputs.release == 'true'
+        env:
+          TAG_NAME: ${{ steps.check.outputs.tag_name }}
         run: |
-          git tag "${{ steps.check.outputs.tag_name }}"
-          git push origin "${{ steps.check.outputs.tag_name }}"
+          git tag "$TAG_NAME"
+          git push origin "$TAG_NAME"
 
       - name: Summary
         if: steps.check.outputs.release == 'true'
+        env:
+          TAG_NAME: ${{ steps.check.outputs.tag_name }}
         run: |
-          echo "### Release ${{ steps.check.outputs.tag_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Release ${TAG_NAME}" >> "$GITHUB_STEP_SUMMARY"
           echo "Tag created and pushed. cargo-dist release workflow will handle the rest." >> "$GITHUB_STEP_SUMMARY"

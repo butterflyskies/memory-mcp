@@ -33,8 +33,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Extract version from plan
         id: version
+        env:
+          PLAN: ${{ inputs.plan }}
         run: |
-          version=$(echo '${{ inputs.plan }}' | jq -r '.announcement_tag' | sed 's/^v//')
+          version=$(echo "$PLAN" | jq -r '.announcement_tag' | sed 's/^v//')
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
       - name: Docker meta
