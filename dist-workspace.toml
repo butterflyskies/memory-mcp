@@ -10,11 +10,9 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-
 # Whether to embed dependency information using cargo-auditable
 cargo-auditable = true
 # The installers to generate for each app
-installers = ["shell", "homebrew"]
-# A GitHub repo to push Homebrew formulas to
-tap = "butterflyskies/homebrew-tap"
+installers = ["shell"]
 # Publish jobs to run in CI
-publish-jobs = ["./publish-crate", "homebrew"]
+publish-jobs = ["./publish-crate"]
 # Features to pass to cargo build
 features = ["k8s"]
 # Post-announce jobs to run in CI
