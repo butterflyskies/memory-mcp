@@ -16,6 +16,8 @@ jobs:
   update-notes:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 is required — git-cliff reads the full commit history
+      # to generate changelog entries from conventional commits.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
@@ -31,15 +33,16 @@ jobs:
         id: cliff
         uses: orhun/git-cliff-action@4fcb14eb4e03ead1e6a5e3e9f418ae498079f01f # v4.4.2
         with:
-          config: cliff.toml
-          args: --latest --strip header
+          args: --config github-keepachangelog --latest --strip all
         env:
+          OUTPUT: ${{ runner.temp }}/release-notes.md
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
 
       - name: Update release body
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release edit "${{ steps.tag.outputs.tag }}" \
-            --notes "${{ steps.cliff.outputs.content }}" \
+            --notes-file "${{ runner.temp }}/release-notes.md" \
             --repo "${{ github.repository }}"
