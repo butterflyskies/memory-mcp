@@ -12,10 +12,6 @@ concurrency:
 
 permissions: {}
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE: butterflyskies/memory-mcp
-
 jobs:
   create-release:
     runs-on: ubuntu-latest
@@ -71,7 +67,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install cargo-auditable
-        run: cargo install cargo-auditable --locked
+        run: cargo install cargo-auditable@0.7.4 --locked
       - uses: taiki-e/upload-rust-binary-action@0e34102c043ded9f2ca39f7af5cd99a540c61aff # v1.29.1
         with:
           bin: memory-mcp
