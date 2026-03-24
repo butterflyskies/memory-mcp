@@ -25,6 +25,9 @@ cargo-dist-version = "0.31.0"
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = true
+# Allow modified CI files — we harden the generated workflow (SHA pins,
+# per-job permissions, expression injection fixes, cargo install over curl|sh)
+allow-dirty = ["ci"]
 
 # System dependencies for Linux builds (libdbus required by keyring crate)
 [dist.dependencies.apt]
