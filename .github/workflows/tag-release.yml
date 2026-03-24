@@ -1,5 +1,7 @@
-# Detect version bumps on main, generate changelog, create tag.
+# Detect version bumps on main, create tag.
 # The tag push triggers the cargo-dist release workflow (release.yml).
+# Changelog is generated for GitHub release notes only — not committed
+# to the repo (branch protection prevents direct pushes to main). See #98.
 name: Tag Release
 
 on:
@@ -50,31 +52,6 @@ jobs:
           else
             echo "New version ${version} detected"
             echo "release=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Generate changelog
-        if: steps.check.outputs.release == 'true'
-        uses: orhun/git-cliff-action@4fcb14eb4e03ead1e6a5e3e9f418ae498079f01f # v4.4.2
-        with:
-          config: cliff.toml
-          args: --unreleased --tag ${{ steps.check.outputs.tag_name }}
-        env:
-          OUTPUT: CHANGELOG.md
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-
-      - name: Commit changelog
-        if: steps.check.outputs.release == 'true'
-        run: |
-          git config user.name "release-manager[bot]"
-          git config user.email "release-manager[bot]@users.noreply.github.com"
-
-          # Only commit if changelog actually changed
-          if git diff --quiet CHANGELOG.md 2>/dev/null; then
-            echo "No changelog changes to commit"
-          else
-            git add CHANGELOG.md
-            git commit -m "docs: update changelog for ${{ steps.check.outputs.tag_name }}"
-            git push
           fi
 
       - name: Create and push tag
