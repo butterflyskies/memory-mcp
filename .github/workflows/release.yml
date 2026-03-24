@@ -36,6 +36,8 @@ jobs:
 
   # Build release binaries with cargo-auditable and upload as release assets.
   # All binaries include the k8s feature (opt-in at runtime via --store k8s-secret).
+  # Uses cargo auditable build (0.7+ subcommand) directly instead of
+  # taiki-e/upload-rust-binary-action, which doesn't support it yet.
   publish-binaries:
     needs: create-release
     strategy:
@@ -50,6 +52,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -61,19 +66,43 @@ jobs:
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
         with:
           toolchain: stable
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
       - name: Install cargo-auditable
         run: cargo install cargo-auditable@0.7.4 --locked
-      - uses: taiki-e/upload-rust-binary-action@0e34102c043ded9f2ca39f7af5cd99a540c61aff # v1.29.1
-        with:
-          bin: memory-mcp
-          target: ${{ matrix.target }}
-          build-tool: cargo-auditable
-          features: k8s
-          archive: memory-mcp-$tag-$target
-          tar: all
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: refs/tags/${{ needs.create-release.outputs.tag_name }}
+      - name: Build
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              cargo auditable build --release --features k8s --target x86_64-unknown-linux-gnu
+              cp target/x86_64-unknown-linux-gnu/release/memory-mcp memory-mcp
+              ;;
+            universal-apple-darwin)
+              cargo auditable build --release --features k8s --target aarch64-apple-darwin --target x86_64-apple-darwin
+              lipo -create -output memory-mcp \
+                target/aarch64-apple-darwin/release/memory-mcp \
+                target/x86_64-apple-darwin/release/memory-mcp
+              ;;
+            *)
+              echo "::error::Unknown target: ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.create-release.outputs.tag_name }}
+        run: |
+          archive="memory-mcp-${TAG_NAME}-${{ matrix.target }}"
+          mkdir "${archive}"
+          mv memory-mcp "${archive}/"
+          tar czf "${archive}.tar.gz" "${archive}"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+          else
+            shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+          fi
+          gh release upload "${TAG_NAME}" "${archive}.tar.gz" "${archive}.tar.gz.sha256" \
+            --repo "${{ github.repository }}"
 
   publish-crate:
     needs: create-release
