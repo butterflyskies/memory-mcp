@@ -44,17 +44,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            build-tool: cargo
           # Windows excluded until usearch supports it (see #42).
           - target: universal-apple-darwin
             os: macos-latest
-            build-tool: cargo
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
-    env:
-      # cargo-auditable embeds dependency info in the binary for cargo audit bin
-      RUSTC_WRAPPER: cargo-auditable
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -68,13 +63,11 @@ jobs:
           toolchain: stable
       - name: Install cargo-auditable
         run: cargo install cargo-auditable@0.7.4 --locked
-        env:
-          RUSTC_WRAPPER: ""
       - uses: taiki-e/upload-rust-binary-action@0e34102c043ded9f2ca39f7af5cd99a540c61aff # v1.29.1
         with:
           bin: memory-mcp
           target: ${{ matrix.target }}
-          build-tool: ${{ matrix.build-tool }}
+          build-tool: cargo-auditable
           features: k8s
           archive: memory-mcp-$tag-$target
           tar: all
