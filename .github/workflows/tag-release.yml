@@ -1,7 +1,7 @@
-# Detect version bumps on main, create tag.
-# The tag push triggers the cargo-dist release workflow (release.yml).
-# Changelog is generated for GitHub release notes only — not committed
-# to the repo (branch protection prevents direct pushes to main). See #98.
+# Detect version bumps on main and create a git tag.
+# The tag push triggers the cargo-dist release workflow (release.yml),
+# which builds artifacts and generates release notes from the dist manifest.
+# CHANGELOG.md automation tracked in #98.
 name: Tag Release
 
 on:
