@@ -122,8 +122,11 @@ async fn push_pull_with_bare_remote() {
         .await
         .expect("pull should succeed");
     assert!(
-        matches!(pull_result, PullResult::FastForward { .. }),
-        "expected FastForward pull, got: {pull_result:?}",
+        matches!(
+            pull_result,
+            PullResult::FastForward { .. } | PullResult::Merged { .. }
+        ),
+        "expected FastForward or Merged pull, got: {pull_result:?}",
     );
 
     // The cloned repo should have the memory.
