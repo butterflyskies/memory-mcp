@@ -1,0 +1,34 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# CI backends to support
+ci = "github"
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Whether to embed dependency information using cargo-auditable
+cargo-auditable = true
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "butterflyskies/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["./publish-crate", "homebrew"]
+# Features to pass to cargo build
+features = ["k8s"]
+# Post-announce jobs to run in CI
+post-announce-jobs = ["./publish-image"]
+# Where to host releases
+hosting = "github"
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = true
+
+# System dependencies for Linux builds (libdbus required by keyring crate)
+[dist.dependencies.apt]
+libdbus-1-dev = '*'
+pkg-config = '*'
