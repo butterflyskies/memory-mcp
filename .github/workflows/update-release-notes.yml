@@ -1,0 +1,45 @@
+# Update GitHub release notes with git-cliff output.
+# Called by the cargo-dist release workflow as a post-announce job.
+name: Update Release Notes
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  update-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Extract tag from plan
+        id: tag
+        run: |
+          tag=$(echo '${{ inputs.plan }}' | jq -r '.announcement_tag')
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: cliff
+        uses: orhun/git-cliff-action@4fcb14eb4e03ead1e6a5e3e9f418ae498079f01f # v4.4.2
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ steps.tag.outputs.tag }}" \
+            --notes "${{ steps.cliff.outputs.content }}" \
+            --repo "${{ github.repository }}"

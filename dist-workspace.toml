@@ -16,7 +16,7 @@ publish-jobs = ["./publish-crate"]
 # Features to pass to cargo build
 features = ["k8s"]
 # Post-announce jobs to run in CI
-post-announce-jobs = ["./publish-image"]
+post-announce-jobs = ["./publish-image", "./update-release-notes"]
 # Where to host releases
 hosting = "github"
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
