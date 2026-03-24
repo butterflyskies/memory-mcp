@@ -31,6 +31,6 @@ jobs:
       # and tested the release artifacts; rebuilding here is redundant and
       # requires system dependencies (libdbus-1-dev) not present in this job.
       - name: Publish crate
-        run: cargo publish --no-verify
+        run: cargo publish --no-verify --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
