@@ -1,79 +1,128 @@
-# Changelog
+## [0.4.0]
 
-## [0.3.1](https://github.com/butterflyskies/memory-mcp/compare/v0.3.0...v0.3.1) (2026-03-23)
+### Added
+- Address final review P3 findings
+- Address review findings for partitioned indexes
+- Add unit tests for ScopeFilter::matches()
+- Address code review findings
+- Add workflow_dispatch to release workflow by @butterflysky-ai in [#89](https://github.com/butterflyskies/memory-mcp/pull/89)
+- Add trusted publishing for crates.io releases by @butterflysky-ai in [#77](https://github.com/butterflyskies/memory-mcp/pull/77)
+- Add deployment workstream plan and update project memories by @butterflysky-ai in [#76](https://github.com/butterflyskies/memory-mcp/pull/76)
+- Add MCP client config examples for all major editors by @butterflysky-ai in [#75](https://github.com/butterflyskies/memory-mcp/pull/75)
+- Add cargo-semver-checks as required CI job by @butterflysky-ai in [#73](https://github.com/butterflyskies/memory-mcp/pull/73)
 
+### Changed
+- Bump version to 0.4.0, revert workflow changes
+- Scope-partitioned vector indexes
+- Scope affinity for recall and list
+- Skip redundant verification build in publish-crate by @butterflysky-ai in [#91](https://github.com/butterflyskies/memory-mcp/pull/91)
+- Release 0.3.1 by @butterflyskies-release-manager-bot[bot] in [#90](https://github.com/butterflyskies/memory-mcp/pull/90)
+- Bounded session management via mcp-session by @butterflysky-ai in [#82](https://github.com/butterflyskies/memory-mcp/pull/82)
 
-### Features
+### Fixed
+- Serialise ScopedIndex add/remove with write lock
+- Harden index persistence and remove dead code
+- Fix README accuracy and update TODO to reflect current state by @butterflysky-ai in [#74](https://github.com/butterflyskies/memory-mcp/pull/74)
 
-* bounded session management via mcp-session ([#82](https://github.com/butterflyskies/memory-mcp/issues/82)) ([9fb5895](https://github.com/butterflyskies/memory-mcp/commit/9fb589586419b680517573dbd2a4eb3a1741d248))
+### Removed
+- Remove dead ensure_scope, document lock ordering
+- Remove release-please workflow and configuration by @butterflysky-ai in [#95](https://github.com/butterflyskies/memory-mcp/pull/95)
 
-## [0.3.0](https://github.com/butterflyskies/memory-mcp/compare/v0.2.0...v0.3.0) (2026-03-21)
+## [0.3.0] - 2026-03-21
 
+### Changed
+- Release 0.3.0 by @butterflyskies-release-manager-bot[bot] in [#58](https://github.com/butterflyskies/memory-mcp/pull/58)
+- Fat lib / thin binary — expose domain modules from lib.rs by @butterflysky-ai in [#64](https://github.com/butterflyskies/memory-mcp/pull/64)
+- Update project overview with trust signals and release infrastructure by @butterflysky-ai in [#63](https://github.com/butterflyskies/memory-mcp/pull/63)
+- Trust signals phase 1 — metadata, cargo-deny, rustdoc by @butterflysky-ai in [#59](https://github.com/butterflyskies/memory-mcp/pull/59)
+- Update project overview and add operational concerns memory by @butterflysky-ai in [#54](https://github.com/butterflyskies/memory-mcp/pull/54)
 
-### ⚠ BREAKING CHANGES
+### Fixed
+- Use GitHub App token for release-please to trigger CI by @butterflysky-ai in [#57](https://github.com/butterflyskies/memory-mcp/pull/57)
 
-* fat lib / thin binary — expose domain modules from lib.rs ([#64](https://github.com/butterflyskies/memory-mcp/issues/64))
+### New Contributors
+* @butterflyskies-release-manager-bot[bot] made their first contribution in [#58](https://github.com/butterflyskies/memory-mcp/pull/58)
 
-### Features
+## [0.2.0] - 2026-03-20
 
-* trust signals phase 1 — metadata, cargo-deny, rustdoc ([#59](https://github.com/butterflyskies/memory-mcp/issues/59)) ([6b8a217](https://github.com/butterflyskies/memory-mcp/commit/6b8a217f549b65a8365e973e70df7c6c7065e77f))
+### Changed
+- Release 0.2.0 by @github-actions[bot] in [#53](https://github.com/butterflyskies/memory-mcp/pull/53)
+- Replace fastembed with candle direct for pure-Rust embeddings by @butterflysky-ai in [#51](https://github.com/butterflyskies/memory-mcp/pull/51)
+- Update project overview memory with cross-platform CI details by @butterflysky-ai in [#47](https://github.com/butterflyskies/memory-mcp/pull/47)
 
+## [0.1.5] - 2026-03-19
 
-### Bug Fixes
+### Changed
+- Release 0.1.5 by @github-actions[bot] in [#46](https://github.com/butterflyskies/memory-mcp/pull/46)
+- Vendor OpenSSL and add cross-platform compilation checks by @butterflysky-ai in [#43](https://github.com/butterflyskies/memory-mcp/pull/43)
 
-* **ci:** use GitHub App token for release-please to trigger CI ([#57](https://github.com/butterflyskies/memory-mcp/issues/57)) ([7d44d95](https://github.com/butterflyskies/memory-mcp/commit/7d44d95c1a2d1f80bd6de06b87f769f59ffb8852))
+### Fixed
+- Vendor OpenSSL only on non-Linux platforms by @butterflysky-ai in [#45](https://github.com/butterflyskies/memory-mcp/pull/45)
 
+## [0.1.4] - 2026-03-19
 
-### Code Refactoring
+### Changed
+- Release 0.1.4 by @github-actions[bot] in [#39](https://github.com/butterflyskies/memory-mcp/pull/39)
+- Release 0.1.5 by @github-actions[bot] in [#36](https://github.com/butterflyskies/memory-mcp/pull/36)
+- Release 0.1.4 by @github-actions[bot] in [#35](https://github.com/butterflyskies/memory-mcp/pull/35)
+- Release 0.1.4 by @github-actions[bot] in [#32](https://github.com/butterflyskies/memory-mcp/pull/32)
+- Release 0.1.5 by @github-actions[bot] in [#29](https://github.com/butterflyskies/memory-mcp/pull/29)
+- Release 0.1.4 by @github-actions[bot] in [#27](https://github.com/butterflyskies/memory-mcp/pull/27)
 
-* fat lib / thin binary — expose domain modules from lib.rs ([#64](https://github.com/butterflyskies/memory-mcp/issues/64)) ([41353bf](https://github.com/butterflyskies/memory-mcp/commit/41353bffe38fb38f700a295cef1f6662ec190f58))
+### Fixed
+- Upgrade release-please-action for force-tag-creation support by @butterflysky-ai in [#38](https://github.com/butterflyskies/memory-mcp/pull/38)
+- Restore release-please labels and reset version to v0.1.3 by @butterflysky-ai in [#34](https://github.com/butterflyskies/memory-mcp/pull/34)
+- Clean up orphaned release state and skip labeling by @butterflysky-ai in [#31](https://github.com/butterflyskies/memory-mcp/pull/31)
+- Move doc comment above #[cfg] so clap shows help for k8s-secret store by @butterflysky-ai in [#28](https://github.com/butterflyskies/memory-mcp/pull/28)
+- Use draft releases so binary assets can be uploaded before publish by @butterflysky-ai in [#26](https://github.com/butterflyskies/memory-mcp/pull/26)
 
-## [0.2.0](https://github.com/butterflyskies/memory-mcp/compare/v0.1.5...v0.2.0) (2026-03-20)
+## [0.1.3] - 2026-03-18
 
+### Added
+- Add release binary assets with SHA256 checksums by @butterflysky-ai in [#22](https://github.com/butterflyskies/memory-mcp/pull/22)
 
-### ⚠ BREAKING CHANGES
+### Changed
+- Release 0.1.3 by @github-actions[bot] in [#25](https://github.com/butterflyskies/memory-mcp/pull/25)
 
-* Embedding vectors change when switching from fastembed to candle. The vector index (derived data) will need to be rebuilt on first launch — it is always rebuildable from the git repo.
+### Fixed
+- Move doc comments above #[cfg] so clap shows help text for k8s flags by @butterflysky-ai in [#24](https://github.com/butterflyskies/memory-mcp/pull/24)
+- Fix cargo-binstall version pin and quiet gh run watch by @butterflysky-ai in [#21](https://github.com/butterflyskies/memory-mcp/pull/21)
 
-### Features
+## [0.1.2] - 2026-03-18
 
-* replace fastembed with candle direct for pure-Rust embeddings ([#51](https://github.com/butterflyskies/memory-mcp/issues/51)) ([13cde5a](https://github.com/butterflyskies/memory-mcp/commit/13cde5ab9a322eddee071f0279ed1ad5388752f9))
+### Changed
+- Release 0.1.2 by @github-actions[bot] in [#20](https://github.com/butterflyskies/memory-mcp/pull/20)
 
-## [0.1.5](https://github.com/butterflyskies/memory-mcp/compare/v0.1.4...v0.1.5) (2026-03-19)
+### Fixed
+- Fix release image tags and gate publish on CI by @butterflysky-ai in [#19](https://github.com/butterflyskies/memory-mcp/pull/19)
 
+## [memory-mcp-v0.1.1] - 2026-03-18
 
-### Bug Fixes
+### Added
+- Add comprehensive README by @butterflysky-ai in [#15](https://github.com/butterflyskies/memory-mcp/pull/15)
+- Add Kubernetes deployment (Round 1) by @butterflysky-ai in [#13](https://github.com/butterflyskies/memory-mcp/pull/13)
+- Add release-please and PR title linting by @butterflysky-ai in [#14](https://github.com/butterflyskies/memory-mcp/pull/14)
+- Add --store k8s-secret backend for auth login (#k8s feature) by @butterflysky-ai in [#12](https://github.com/butterflyskies/memory-mcp/pull/12)
+- Add keyring-based token storage as auth fallback by @butterflysky-ai in [#9](https://github.com/butterflyskies/memory-mcp/pull/9)
+- Add ADR-0010: keyring-based token storage by @butterflysky-ai in [#5](https://github.com/butterflyskies/memory-mcp/pull/5)
 
-* vendor OpenSSL only on non-Linux platforms ([#45](https://github.com/butterflyskies/memory-mcp/issues/45)) ([6f3dc4f](https://github.com/butterflyskies/memory-mcp/commit/6f3dc4f370865a719310a53f625e2dcb093d979a))
+### Changed
+- Release memory-mcp 0.1.1 by @github-actions[bot] in [#18](https://github.com/butterflyskies/memory-mcp/pull/18)
+- Migrate to googleapis/release-please-action and bump action versions by @butterflysky-ai in [#17](https://github.com/butterflyskies/memory-mcp/pull/17)
+- Update project overview memory by @butterflysky-ai in [#16](https://github.com/butterflyskies/memory-mcp/pull/16)
+- Update project overview and session handoff memories by @butterflysky-ai in [#11](https://github.com/butterflyskies/memory-mcp/pull/11)
+- Implement auth subcommand with OAuth device flow by @butterflysky-ai in [#10](https://github.com/butterflyskies/memory-mcp/pull/10)
+- Incremental index rebuild on pull by @butterflysky-ai in [#7](https://github.com/butterflyskies/memory-mcp/pull/7)
+- Modify funding sources in FUNDING.yml by @butterflysky in [#8](https://github.com/butterflyskies/memory-mcp/pull/8)
+- Update TODO.md to reflect Phase 2 progress by @butterflysky-ai in [#6](https://github.com/butterflyskies/memory-mcp/pull/6)
+- Implement git push/pull with auth and conflict resolution by @butterflysky-ai in [#4](https://github.com/butterflyskies/memory-mcp/pull/4)
+- Update TODO.md to reflect current project status by @butterflysky-ai in [#3](https://github.com/butterflyskies/memory-mcp/pull/3)
+- Implement all 7 MCP tool handlers with full observability by @butterflysky-ai in [#2](https://github.com/butterflyskies/memory-mcp/pull/2)
+- Scaffold Rust MCP server with streamable HTTP transport by @butterflysky-ai in [#1](https://github.com/butterflyskies/memory-mcp/pull/1)
+- Seed project: git-backed semantic memory MCP server by @butterflysky
 
-## [0.1.4](https://github.com/butterflyskies/memory-mcp/compare/v0.1.3...v0.1.4) (2026-03-19)
+### New Contributors
+* @github-actions[bot] made their first contribution in [#18](https://github.com/butterflyskies/memory-mcp/pull/18)
+* @butterflysky-ai made their first contribution in [#17](https://github.com/butterflyskies/memory-mcp/pull/17)
+* @butterflysky made their first contribution in [#8](https://github.com/butterflyskies/memory-mcp/pull/8)
 
-
-### Bug Fixes
-
-* clean up orphaned release state and skip labeling ([#31](https://github.com/butterflyskies/memory-mcp/issues/31)) ([a684190](https://github.com/butterflyskies/memory-mcp/commit/a684190cc1d8f1d02e0d3f23bce85392542b8642))
-* move doc comment above #[cfg] so clap shows help for k8s-secret store ([#28](https://github.com/butterflyskies/memory-mcp/issues/28)) ([1967c6c](https://github.com/butterflyskies/memory-mcp/commit/1967c6ccad431115086313e8a5ca45862798804a))
-* restore release-please labels and reset version to v0.1.3 ([#34](https://github.com/butterflyskies/memory-mcp/issues/34)) ([35cc0df](https://github.com/butterflyskies/memory-mcp/commit/35cc0df6360c3d832cbe21bf4f2bb51057c2b5f4))
-* upgrade release-please-action for force-tag-creation support ([#38](https://github.com/butterflyskies/memory-mcp/issues/38)) ([0b1389a](https://github.com/butterflyskies/memory-mcp/commit/0b1389a505d9a22b51acccd3b9eeb49b8a30decf))
-* use draft releases so binary assets can be uploaded before publish ([#26](https://github.com/butterflyskies/memory-mcp/issues/26)) ([76a3982](https://github.com/butterflyskies/memory-mcp/commit/76a39824f8efbecc48c71c07c3a6ca58286e2745))
-
-## [0.1.3](https://github.com/butterflyskies/memory-mcp/compare/v0.1.2...v0.1.3) (2026-03-18)
-
-
-### Bug Fixes
-
-* move doc comments above #[cfg] so clap shows help text for k8s flags ([#24](https://github.com/butterflyskies/memory-mcp/issues/24)) ([12047c9](https://github.com/butterflyskies/memory-mcp/commit/12047c9251617541822ae5b3228da3b8a4e118a3))
-
-## [0.1.2](https://github.com/butterflyskies/memory-mcp/compare/v0.1.1...v0.1.2) (2026-03-18)
-
-
-### Features
-
-* add Kubernetes deployment (Round 1) ([#13](https://github.com/butterflyskies/memory-mcp/issues/13)) ([2249bd7](https://github.com/butterflyskies/memory-mcp/commit/2249bd705fd282e04624573c617401bc48b082a2))
-
-## [0.1.1](https://github.com/butterflyskies/memory-mcp/compare/memory-mcp-v0.1.0...memory-mcp-v0.1.1) (2026-03-18)
-
-
-### Features
-
-* add Kubernetes deployment (Round 1) ([#13](https://github.com/butterflyskies/memory-mcp/issues/13)) ([2249bd7](https://github.com/butterflyskies/memory-mcp/commit/2249bd705fd282e04624573c617401bc48b082a2))
