@@ -97,6 +97,8 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
+    permissions:
+      contents: read
     if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
@@ -315,13 +317,8 @@ jobs:
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' && (needs.custom-publish-crate.result == 'skipped' || needs.custom-publish-crate.result == 'success') }}
     runs-on: "ubuntu-latest"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-          submodules: recursive
+      - run: echo "All publish jobs completed — releasing post-announce jobs"
 
   custom-publish-image:
     needs:
@@ -334,6 +331,7 @@ jobs:
     permissions:
       "contents": "read"
       "packages": "write"
+      "id-token": "write"    # provenance attestation
 
   custom-update-release-notes:
     needs:
