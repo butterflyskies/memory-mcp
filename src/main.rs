@@ -508,7 +508,10 @@ mod tests {
         let result = expand_path("~otheruser/path");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("not supported"), "error should mention unsupported: {msg}");
+        assert!(
+            msg.contains("not supported"),
+            "error should mention unsupported: {msg}"
+        );
     }
 
     #[cfg(feature = "k8s")]
