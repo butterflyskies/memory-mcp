@@ -264,7 +264,7 @@ impl Memory {
             source: self.metadata.source.as_deref(),
         };
 
-        let yaml = serde_yaml::to_string(&fm)?;
+        let yaml = serde_yaml_ng::to_string(&fm)?;
         Ok(format!("---\n{}---\n\n{}", yaml, self.content))
     }
 
@@ -299,7 +299,7 @@ impl Memory {
             source: Option<String>,
         }
 
-        let fm: Frontmatter = serde_yaml::from_str(yaml_str)?;
+        let fm: Frontmatter = serde_yaml_ng::from_str(yaml_str)?;
 
         Ok(Memory {
             id: fm.id,

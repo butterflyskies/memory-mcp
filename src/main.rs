@@ -362,14 +362,18 @@ fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
 }
 
 fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
-    let expanded = shellexpand::tilde(path);
-    if expanded.starts_with('~') {
-        anyhow::bail!(
-            "could not expand '~': home directory could not be determined; \
-             please provide --repo-path explicitly or set HOME"
-        );
+    match path.strip_prefix('~') {
+        Some(rest) => {
+            let home = dirs::home_dir().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not expand '~': home directory could not be determined; \
+                     please provide --repo-path explicitly or set HOME"
+                )
+            })?;
+            Ok(home.join(rest.strip_prefix('/').unwrap_or(rest)))
+        }
+        None => Ok(PathBuf::from(path)),
     }
-    Ok(PathBuf::from(expanded.as_ref()))
 }
 
 // ---------------------------------------------------------------------------
