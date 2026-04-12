@@ -14,7 +14,7 @@ rust-version = "1.88"
 k8s = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
-rmcp = { version = "1.1", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "1.4", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 git2 = "0.20"
