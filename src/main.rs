@@ -363,7 +363,7 @@ fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
 
 fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
     match path.strip_prefix('~') {
-        Some(rest) => {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
             let home = dirs::home_dir().ok_or_else(|| {
                 anyhow::anyhow!(
                     "could not expand '~': home directory could not be determined; \
@@ -372,6 +372,10 @@ fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
             })?;
             Ok(home.join(rest.strip_prefix('/').unwrap_or(rest)))
         }
+        Some(_) => anyhow::bail!(
+            "~user path expansion is not supported; \
+             please use an absolute path or ~/..."
+        ),
         None => Ok(PathBuf::from(path)),
     }
 }
@@ -473,6 +477,38 @@ mod tests {
     #[test]
     fn test_parse_nonzero_usize_hundred_is_ok() {
         assert_eq!(parse_nonzero_usize("100").unwrap(), 100);
+    }
+
+    #[test]
+    fn test_expand_path_tilde_alone() {
+        let result = expand_path("~").unwrap();
+        assert_eq!(result, dirs::home_dir().unwrap());
+    }
+
+    #[test]
+    fn test_expand_path_tilde_slash() {
+        let result = expand_path("~/foo/bar").unwrap();
+        assert_eq!(result, dirs::home_dir().unwrap().join("foo/bar"));
+    }
+
+    #[test]
+    fn test_expand_path_absolute() {
+        let result = expand_path("/tmp/repo").unwrap();
+        assert_eq!(result, PathBuf::from("/tmp/repo"));
+    }
+
+    #[test]
+    fn test_expand_path_relative() {
+        let result = expand_path("relative/path").unwrap();
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_expand_path_tilde_user_rejected() {
+        let result = expand_path("~otheruser/path");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("not supported"), "error should mention unsupported: {msg}");
     }
 
     #[cfg(feature = "k8s")]

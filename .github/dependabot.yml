@@ -1,0 +1,40 @@
+version: 2
+
+updates:
+  # Rust dependencies — weekly check for security patches and version bumps.
+  # OpenSSL is vendored, so openssl-sys bumps are the mechanism for CVE fixes.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: friday
+    commit-message:
+      prefix: "chore(deps):"
+    labels:
+      - dependencies
+    open-pull-requests-limit: 5
+    groups:
+      # Batch all non-security Rust dep bumps into a single weekly PR.
+      rust-dependencies:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions — pinned to full SHA; Dependabot proposes SHA bumps.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: friday
+    commit-message:
+      prefix: "chore(ci):"
+    labels:
+      - ci
+    open-pull-requests-limit: 3
+    groups:
+      # Batch all action version bumps into a single weekly PR.
+      actions:
+        update-types:
+          - major
+          - minor
+          - patch

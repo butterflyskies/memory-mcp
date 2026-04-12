@@ -52,6 +52,9 @@ secrecy = "0.10.3"
 # Vendor native C libraries so the binary statically links its own copies
 # rather than depending on whatever versions the host OS provides at runtime.
 # This makes builds reproducible and removes host library version variance.
+# Trade-off: distro security patches (e.g. apt upgrade openssl) no longer
+# apply — a rebuild is required to pick up OpenSSL CVEs. Dependabot monitors
+# for advisory-triggered version bumps to openssl-sys.
 # D-Bus (via keyring) is the only remaining system dynamic link — it must
 # match the running D-Bus daemon and cannot be vendored.
 openssl = { version = "0.10", features = ["vendored"] }
