@@ -51,7 +51,7 @@ candle-transformers = "0.9"
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex", "esaxx_fast"] }
 # Disable defaults to drop native-tls and the tokio/reqwest async API we don't
 # use. ureq provides the sync download API with rustls TLS by default.
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 
 # Optional dependencies gated behind features.
 # Disable defaults to avoid pulling in native-tls; rustls-tls matches the rest
