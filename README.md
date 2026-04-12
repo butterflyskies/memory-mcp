@@ -177,6 +177,28 @@ Zed does not yet support Streamable HTTP natively. Use `mcp-remote` as a stdio b
 
 The agent can now use `remember`, `recall`, `read`, `edit`, `forget`, `list`, and `sync` as tools.
 
+### Docker
+
+If you have Docker installed, the container image is the fastest way to get running — the embedding model is pre-baked so there's no download delay on first start:
+
+```bash
+docker run -d --name memory-mcp \
+  -p 8080:8080 \
+  -v ~/.memory-mcp:/data/repo \
+  ghcr.io/butterflyskies/memory-mcp:latest
+```
+
+The `-v` volume mount is required for persistence. Without it, memories are lost when the container stops.
+
+To sync memories across devices, initialize a git remote inside the mounted repo:
+
+```bash
+cd ~/.memory-mcp
+git init && git remote add origin git@github.com:you/my-memories.git
+```
+
+Then use the `sync` tool from your editor, or call `memory-mcp sync` directly.
+
 ## Tools
 
 | Tool | Description |
