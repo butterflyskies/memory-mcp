@@ -28,7 +28,8 @@ jobs:
         id: cliff
         uses: orhun/git-cliff-action@c93ef52f3d0ddcdcc9bd5447d98d458a11cd4f72 # v4.7.1
         with:
-          args: --config github-keepachangelog --latest --strip all
+          config: github-keepachangelog
+          args: --latest --strip all
         env:
           OUTPUT: ${{ runner.temp }}/release-notes.md
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

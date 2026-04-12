@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fail fast on formatting issues before they reach CI.
+exec cargo fmt -- --check

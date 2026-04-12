@@ -47,7 +47,7 @@ pub enum MemoryError {
 
     /// YAML serialisation or deserialisation failed.
     #[error("yaml error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_yaml_ng::Error),
 
     /// A background task failed to join.
     #[error("task join error: {0}")]

@@ -667,10 +667,10 @@ fn check_token_file_permissions(path: &std::path::Path) {
 
 /// Returns the user's home directory using the platform-native mechanism.
 ///
-/// Delegates to [`homedir::my_home`], which checks `HOME` on Unix and the
+/// Delegates to [`dirs::home_dir`], which checks `HOME` on Unix and the
 /// Windows profile directory on Windows — no deprecated `std::env::home_dir`.
 pub fn home_dir() -> Option<std::path::PathBuf> {
-    homedir::my_home().ok().flatten()
+    dirs::home_dir()
 }
 
 // ---------------------------------------------------------------------------
