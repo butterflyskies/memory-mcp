@@ -43,7 +43,7 @@ dirs = "6"
 mcp-session = "0.1"
 
 # Candle direct — pure-Rust BERT inference for embeddings.
-candle-core = "0.9"
+candle-core = "0.10"
 candle-nn = "0.9"
 candle-transformers = "0.9"
 # Disable defaults to drop onig (C regex library); fancy-regex is a pure-Rust
