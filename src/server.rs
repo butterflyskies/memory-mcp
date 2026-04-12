@@ -1,5 +1,9 @@
 use std::{sync::Arc, time::Instant};
 
+/// Maximum number of characters included in recall result snippets.
+/// Content longer than this is truncated and flagged with `truncated: true`.
+const SNIPPET_MAX_CHARS: usize = 500;
+
 use chrono::Utc;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -266,8 +270,11 @@ impl MemoryServer {
     /// Returns a JSON array of matching memories sorted by relevance.
     #[tool(
         name = "recall",
-        description = "Search memories by semantic similarity. Returns the top matching memories as a JSON array \
-        with name, scope, tags, and content snippet.\n\n\
+        description = "Search memories by semantic similarity. Embeds the query and returns the top matching memories as a JSON array \
+        with name, scope, tags, and a content snippet (max 500 chars).\n\n\
+        Each result includes `truncated` (bool) and `content_length` (total character count). \
+        When `truncated` is true, the snippet is incomplete — use the `read` tool with the memory's name and scope \
+        to retrieve the full content before acting on it.\n\n\
         Scope: pass 'project:<basename-of-your-cwd>' to search your current project + global memories, \
         'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
@@ -342,8 +349,10 @@ impl MemoryServer {
                     }
                 };
 
-                // Truncate content to 500 chars for the snippet.
-                let snippet: String = memory.content.chars().take(500).collect();
+                // Truncate content for the snippet and signal when content was cut.
+                let content_length = memory.content.chars().count();
+                let truncated = content_length > SNIPPET_MAX_CHARS;
+                let snippet: String = memory.content.chars().take(SNIPPET_MAX_CHARS).collect();
 
                 results_vec.push(serde_json::json!({
                     "id": memory.id,
@@ -351,6 +360,8 @@ impl MemoryServer {
                     "scope": memory.metadata.scope.to_string(),
                     "tags": memory.metadata.tags,
                     "content": snippet,
+                    "content_length": content_length,
+                    "truncated": truncated,
                     "distance": distance,
                 }));
             }
