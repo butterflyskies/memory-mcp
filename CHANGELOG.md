@@ -1,3 +1,15 @@
+## [0.5.1]
+
+### Added
+- Add secret-avoidance guidance to MCP tool instructions
+- Add docker run quick-start section to README
+- Add development roadmap
+
+## [0.5.0]
+
+### Changed
+- Supply chain audit — reduce deps, vendor native libs, unify TLS
+
 ## [0.4.0]
 
 ### Added
