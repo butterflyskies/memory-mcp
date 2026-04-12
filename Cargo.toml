@@ -21,7 +21,10 @@ git2 = "0.20"
 usearch = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Maintained fork of deprecated serde_yaml (dtolnay archived the original).
 serde_yaml_ng = "0.10"
+# Disable default features to trim unused chrono subsystems; clock provides
+# Utc::now(), serde provides DateTime serialisation — that's all we use.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 thiserror = "2"
 anyhow = "1"
@@ -32,6 +35,8 @@ uuid = { version = "1", features = ["v4"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 libc = "0.2"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
+# Disable default features to avoid pulling in native-tls; rustls is the sole
+# HTTP TLS stack. json enables reqwest::Response::json() for OAuth device flow.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
 dirs = "6"
@@ -41,10 +46,16 @@ mcp-session = "0.1"
 candle-core = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
+# Disable defaults to drop onig (C regex library); fancy-regex is a pure-Rust
+# drop-in. esaxx_fast enables the C++ suffix-array builder for BPE tokenizers.
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex", "esaxx_fast"] }
+# Disable defaults to drop native-tls and the tokio/reqwest async API we don't
+# use. ureq provides the sync download API with rustls TLS by default.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 
 # Optional dependencies gated behind features.
+# Disable defaults to avoid pulling in native-tls; rustls-tls matches the rest
+# of the crate's TLS strategy. Only the client feature is needed (no runtime).
 kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls"], optional = true }
 k8s-openapi = { version = "0.27", features = ["v1_31"], optional = true }
 secrecy = "0.10.3"
