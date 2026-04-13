@@ -12,6 +12,8 @@ pub mod auth;
 pub mod embedding;
 /// Error types used throughout the crate.
 pub mod error;
+/// Filesystem utilities — atomic writes with crash-safe temp-file-then-rename.
+pub(crate) mod fs_util;
 /// HNSW vector index for approximate nearest-neighbour search.
 pub mod index;
 /// Git-backed memory repository — read, write, sync, and diff operations.

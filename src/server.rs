@@ -1,5 +1,9 @@
 use std::{sync::Arc, time::Instant};
 
+/// Maximum number of characters included in recall result snippets.
+/// Content longer than this is truncated and flagged with `truncated: true`.
+const SNIPPET_MAX_CHARS: usize = 500;
+
 use chrono::Utc;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -27,6 +31,9 @@ use crate::{
 #[derive(Clone)]
 pub struct MemoryServer {
     state: Arc<AppState>,
+    // Read by the #[tool_router] macro-generated ServerHandler impl;
+    // rustc's dead-code analysis can't see through proc-macro output.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -194,7 +201,9 @@ impl MemoryServer {
         name = "remember",
         description = "Store a new memory. Saves the content to the git-backed repository and \
         indexes it for semantic search. Use scope 'project:<basename-of-your-cwd>' for \
-        project-specific memories or omit for global. Returns the assigned memory ID."
+        project-specific memories or omit for global. Returns the assigned memory ID. \
+        IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets — \
+        memories are plaintext files in a git repo and may be synced to a remote."
     )]
     async fn remember(
         &self,
@@ -266,8 +275,11 @@ impl MemoryServer {
     /// Returns a JSON array of matching memories sorted by relevance.
     #[tool(
         name = "recall",
-        description = "Search memories by semantic similarity. Returns the top matching memories as a JSON array \
-        with name, scope, tags, and content snippet.\n\n\
+        description = "Search memories by semantic similarity. Embeds the query and returns the top matching memories as a JSON array \
+        with name, scope, tags, and a content snippet (max 500 chars).\n\n\
+        Each result includes `truncated` (bool) and `content_length` (total character count). \
+        When `truncated` is true, the snippet is incomplete — use the `read` tool with the memory's name and scope \
+        to retrieve the full content before acting on it.\n\n\
         Scope: pass 'project:<basename-of-your-cwd>' to search your current project + global memories, \
         'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
@@ -342,8 +354,7 @@ impl MemoryServer {
                     }
                 };
 
-                // Truncate content to 500 chars for the snippet.
-                let snippet: String = memory.content.chars().take(500).collect();
+                let (snippet, content_length, truncated) = build_snippet(&memory.content);
 
                 results_vec.push(serde_json::json!({
                     "id": memory.id,
@@ -351,6 +362,8 @@ impl MemoryServer {
                     "scope": memory.metadata.scope.to_string(),
                     "tags": memory.metadata.tags,
                     "content": snippet,
+                    "content_length": content_length,
+                    "truncated": truncated,
                     "distance": distance,
                 }));
             }
@@ -435,7 +448,9 @@ impl MemoryServer {
         name = "edit",
         description = "Edit an existing memory. Supports partial updates — omit content or \
         tags to preserve existing values. Re-embeds and re-indexes the memory. Use scope \
-        'project:<basename-of-your-cwd>' for project-scoped memories. Returns the memory ID."
+        'project:<basename-of-your-cwd>' for project-scoped memories. Returns the memory ID. \
+        IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets — \
+        memories are plaintext files in a git repo and may be synced to a remote."
     )]
     async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
@@ -780,8 +795,69 @@ impl ServerHandler for MemoryServer {
             Scope convention: always pass scope='project:<basename-of-your-cwd>' when working within \
             a project. This returns project memories alongside global ones. Omitting scope defaults to \
             global-only for queries (recall, list) and targets a single memory for point operations \
-            (remember, edit, read, forget). Use scope='all' to search across all projects."
+            (remember, edit, read, forget). Use scope='all' to search across all projects.\n\n\
+            IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets in \
+            memory content. Memories are stored as plaintext markdown files committed to a git \
+            repository and may be synced to a remote. Treat all memory content as public."
                 .to_string(),
         )
+    }
+}
+
+/// Truncate content to [`SNIPPET_MAX_CHARS`] and return `(snippet, content_length, truncated)`.
+fn build_snippet(content: &str) -> (String, usize, bool) {
+    let content_length = content.chars().count();
+    let truncated = content_length > SNIPPET_MAX_CHARS;
+    let snippet: String = content.chars().take(SNIPPET_MAX_CHARS).collect();
+    (snippet, content_length, truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snippet_short_content_not_truncated() {
+        let content = "Hello, world!";
+        let (snippet, content_length, truncated) = build_snippet(content);
+        assert_eq!(snippet, "Hello, world!");
+        assert_eq!(content_length, 13);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn snippet_exact_limit_not_truncated() {
+        let content: String = "a".repeat(SNIPPET_MAX_CHARS);
+        let (snippet, content_length, truncated) = build_snippet(&content);
+        assert_eq!(snippet, content);
+        assert_eq!(content_length, SNIPPET_MAX_CHARS);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn snippet_over_limit_is_truncated() {
+        let content: String = "b".repeat(SNIPPET_MAX_CHARS + 100);
+        let (snippet, content_length, truncated) = build_snippet(&content);
+        assert_eq!(snippet.chars().count(), SNIPPET_MAX_CHARS);
+        assert_eq!(content_length, SNIPPET_MAX_CHARS + 100);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn snippet_counts_unicode_chars_not_bytes() {
+        // Each emoji is 1 char but multiple bytes.
+        let emoji_content: String = "\u{1F600}".repeat(SNIPPET_MAX_CHARS + 1);
+        let (snippet, content_length, truncated) = build_snippet(&emoji_content);
+        assert_eq!(snippet.chars().count(), SNIPPET_MAX_CHARS);
+        assert_eq!(content_length, SNIPPET_MAX_CHARS + 1);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn snippet_empty_content() {
+        let (snippet, content_length, truncated) = build_snippet("");
+        assert_eq!(snippet, "");
+        assert_eq!(content_length, 0);
+        assert!(!truncated);
     }
 }

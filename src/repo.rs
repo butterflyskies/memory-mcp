@@ -441,12 +441,35 @@ impl MemoryRepo {
 
             // Origin exists — we need the token now.
             let token = token_result?;
-            let callbacks = build_auth_callbacks(token);
+            let mut callbacks = build_auth_callbacks(token);
+
+            // git2's Remote::push() does not surface server-side rejections
+            // through its return value — they arrive via this callback.
+            let rejections: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let rej = Arc::clone(&rejections);
+            callbacks.push_update_reference(move |refname, status| {
+                if let Some(msg) = status {
+                    rej.lock()
+                        .expect("rejection lock poisoned")
+                        .push(format!("{refname}: {msg}"));
+                }
+                Ok(())
+            });
+
             let mut push_opts = git2::PushOptions::new();
             push_opts.remote_callbacks(callbacks);
 
             let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-            remote.push(&[&refspec], Some(&mut push_opts))?;
+            if let Err(e) = remote.push(&[&refspec], Some(&mut push_opts)) {
+                warn!("push to origin failed at transport level: {e}");
+                return Err(MemoryError::Git(e));
+            }
+
+            let rejected = rejections.lock().expect("rejection lock poisoned");
+            if !rejected.is_empty() {
+                return Err(MemoryError::PushRejected(rejected.join("; ")));
+            }
+
             info!("pushed branch '{}' to origin", branch);
             Ok(())
         })
@@ -1019,29 +1042,50 @@ impl MemoryRepo {
         Ok(())
     }
 
-    /// Open `path` for writing using `O_NOFOLLOW` on Unix so the final path
-    /// component cannot be a symlink, then write `data`.
+    /// Atomically write `data` to `path` via temp-file + rename.
     ///
-    /// On non-Unix platforms falls back to a plain `std::fs::write`.
+    /// Defense-in-depth against symlink attacks (layered):
+    /// 1. `validate_path` rejects symlinks in all path components.
+    /// 2. An `lstat` check here catches symlinks created between
+    ///    validation and write (narrows the TOCTOU window).
+    /// 3. On Unix, an `O_NOFOLLOW` probe on the final path detects
+    ///    symlinks planted in the window between lstat and
+    ///    `atomic_write`. The temp file itself is separately guarded
+    ///    by `O_NOFOLLOW` inside `write_tmp`.
     fn write_memory_file(&self, path: &Path, data: &[u8]) -> Result<(), MemoryError> {
+        // Layer 2: lstat — reject if the target is currently a symlink.
+        if path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(MemoryError::InvalidInput {
+                reason: format!("refusing to write through symlink: {}", path.display()),
+            });
+        }
+
+        // Layer 3 (Unix): O_NOFOLLOW probe — kernel-level symlink rejection.
+        // NotFound is fine (file doesn't exist yet); any other error (ELOOP
+        // from a symlink, permission denied, etc.) is rejected.
         #[cfg(unix)]
         {
-            use std::io::Write as _;
             use std::os::unix::fs::OpenOptionsExt as _;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
+            if let Err(e) = std::fs::OpenOptions::new()
+                .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
-                .open(path)?;
-            f.write_all(data)?;
-            Ok(())
+                .open(path)
+            {
+                // NotFound is fine — the file doesn't exist yet.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(MemoryError::InvalidInput {
+                        reason: format!("O_NOFOLLOW check failed for {}: {e}", path.display()),
+                    });
+                }
+            }
         }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(path, data)?;
-            Ok(())
-        }
+
+        crate::fs_util::atomic_write(path, data)?;
+        Ok(())
     }
 
     /// Open `path` for reading using `O_NOFOLLOW` on Unix, then return its
