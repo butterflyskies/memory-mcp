@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Errors produced by the memory engine.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MemoryError {
     /// An operation on the git-backed store failed.
     #[error("git error: {0}")]

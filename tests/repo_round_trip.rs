@@ -153,6 +153,7 @@ async fn push_pull_with_bare_remote() {
 #[tokio::test]
 async fn push_rejected_by_server_hook() {
     use std::fs;
+    use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Child, Command, Stdio};
@@ -166,11 +167,12 @@ async fn push_rejected_by_server_hook() {
         }
     }
 
-    // Reserve a free port. Hold the listener open so nothing else can grab
-    // it; git daemon's --reuseaddr lets it bind the same port concurrently.
-    // We drop the listener after the daemon is confirmed ready.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    // Grab a free port, then release it immediately. The TOCTOU window
+    // before the daemon binds is negligible in test environments.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
 
     // Set up a bare remote with an `update` hook that rejects all pushes.
     let remote_dir = tempfile::tempdir().unwrap();
@@ -186,11 +188,13 @@ async fn push_rejected_by_server_hook() {
     .unwrap();
     fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
 
-    // Start git daemon serving the bare repo's parent directory.
+    // Start git daemon with --verbose so it prints "Ready to rumble" to
+    // stderr once it has bound the port and is accepting connections.
     let base_path = remote_dir.path().parent().unwrap();
-    let child = Command::new("git")
+    let mut child = Command::new("git")
         .args([
             "daemon",
+            "--verbose",
             "--reuseaddr",
             "--listen=127.0.0.1",
             &format!("--port={port}"),
@@ -199,27 +203,30 @@ async fn push_rejected_by_server_hook() {
             "--export-all",
             &base_path.to_string_lossy(),
         ])
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
         .expect("failed to start git daemon — is git installed?");
 
+    // Block until the daemon confirms it's ready, then keep draining stderr
+    // in a background thread so verbose logging doesn't fill the pipe buffer
+    // and block the daemon mid-connection.
+    let stderr = child.stderr.take().unwrap();
     let _daemon = GitDaemon(child);
 
-    // Poll the port until the daemon is accepting connections, then release
-    // our placeholder listener so only the daemon holds the port.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+    let reader = BufReader::new(stderr);
+    let mut lines = reader.lines();
+    let mut ready = false;
+    for line in &mut lines {
+        if line.unwrap_or_default().contains("Ready to rumble") {
+            ready = true;
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "git daemon did not become ready within 5 seconds",
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    drop(listener);
+    assert!(ready, "git daemon exited without becoming ready");
+
+    // Drain remaining stderr in the background so the daemon doesn't stall.
+    std::thread::spawn(move || for _ in lines {});
 
     // Build the git:// URL pointing at the bare repo.
     let repo_name = remote_dir.path().file_name().unwrap().to_string_lossy();
