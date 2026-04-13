@@ -31,6 +31,9 @@ use crate::{
 #[derive(Clone)]
 pub struct MemoryServer {
     state: Arc<AppState>,
+    // Read by the #[tool_router] macro-generated ServerHandler impl;
+    // rustc's dead-code analysis can't see through proc-macro output.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
