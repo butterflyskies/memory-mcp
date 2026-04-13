@@ -198,7 +198,9 @@ impl MemoryServer {
         name = "remember",
         description = "Store a new memory. Saves the content to the git-backed repository and \
         indexes it for semantic search. Use scope 'project:<basename-of-your-cwd>' for \
-        project-specific memories or omit for global. Returns the assigned memory ID."
+        project-specific memories or omit for global. Returns the assigned memory ID. \
+        IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets — \
+        memories are plaintext files in a git repo and may be synced to a remote."
     )]
     async fn remember(
         &self,
@@ -443,7 +445,9 @@ impl MemoryServer {
         name = "edit",
         description = "Edit an existing memory. Supports partial updates — omit content or \
         tags to preserve existing values. Re-embeds and re-indexes the memory. Use scope \
-        'project:<basename-of-your-cwd>' for project-scoped memories. Returns the memory ID."
+        'project:<basename-of-your-cwd>' for project-scoped memories. Returns the memory ID. \
+        IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets — \
+        memories are plaintext files in a git repo and may be synced to a remote."
     )]
     async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
@@ -788,7 +792,10 @@ impl ServerHandler for MemoryServer {
             Scope convention: always pass scope='project:<basename-of-your-cwd>' when working within \
             a project. This returns project memories alongside global ones. Omitting scope defaults to \
             global-only for queries (recall, list) and targets a single memory for point operations \
-            (remember, edit, read, forget). Use scope='all' to search across all projects."
+            (remember, edit, read, forget). Use scope='all' to search across all projects.\n\n\
+            IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets in \
+            memory content. Memories are stored as plaintext markdown files committed to a git \
+            repository and may be synced to a remote. Treat all memory content as public."
                 .to_string(),
         )
     }
