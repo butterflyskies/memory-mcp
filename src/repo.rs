@@ -1048,8 +1048,10 @@ impl MemoryRepo {
     /// 1. `validate_path` rejects symlinks in all path components.
     /// 2. An `lstat` check here catches symlinks created between
     ///    validation and write (narrows the TOCTOU window).
-    /// 3. On Unix, an `O_NOFOLLOW` probe rejects symlinks at the
-    ///    final component at the kernel level.
+    /// 3. On Unix, an `O_NOFOLLOW` probe on the final path detects
+    ///    symlinks planted in the window between lstat and
+    ///    `atomic_write`. The temp file itself is separately guarded
+    ///    by `O_NOFOLLOW` inside `write_tmp`.
     fn write_memory_file(&self, path: &Path, data: &[u8]) -> Result<(), MemoryError> {
         // Layer 2: lstat — reject if the target is currently a symlink.
         if path

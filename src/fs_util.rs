@@ -159,39 +159,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn temp_file_cleaned_on_rename_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
+        // Make the rename target a *directory* so write_tmp succeeds
+        // (creating .file.txt.tmp in the parent) but rename fails with
+        // EISDIR. This exercises TempGuard cleanup after a real write.
         let dir = tempfile::tempdir().unwrap();
-        // Create a read-only subdirectory. write_tmp can create the temp
-        // file (it already exists by the time rename runs), but rename
-        // into a read-only directory fails.
-        let sub = dir.path().join("ro");
-        fs::create_dir(&sub).unwrap();
+        let target = dir.path().join("file.txt");
+        let tmp = dir.path().join(".file.txt.tmp");
 
-        // Pre-create target so the temp file lands in `sub`, then make
-        // the directory read-only so rename fails.
-        let target = sub.join("file.txt");
-        let tmp = sub.join(".file.txt.tmp");
-
-        // Create the temp file so write_tmp succeeds (truncate), then
-        // make dir read-only before rename.  We can't do this mid-call,
-        // so instead we make `target` a path where rename will fail:
-        // make `sub` read-only so rename (which modifies the directory)
-        // is denied.
-        fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+        // Create a directory at the target path — rename(file, dir) → EISDIR.
+        fs::create_dir(&target).unwrap();
 
         let result = atomic_write(&target, b"data");
-        assert!(result.is_err(), "expected rename to fail in read-only dir");
-        // TempGuard should have cleaned up — but remove_file also fails
-        // in a read-only dir. Restore permissions and verify the temp
-        // file was at least attempted (it may or may not exist depending
-        // on whether write_tmp itself failed).
-        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
-
-        // If write_tmp succeeded, the guard should have tried cleanup.
-        // On a read-only dir, both the write and cleanup fail, so the
-        // temp won't exist because write_tmp couldn't create it.
-        assert!(!tmp.exists(), "temp file should not persist after failure");
+        assert!(result.is_err(), "expected rename to fail with EISDIR");
+        // TempGuard should have cleaned up the temp file.
+        assert!(!tmp.exists(), "temp file should be cleaned up by TempGuard");
+        // The directory target should still be intact.
+        assert!(target.is_dir(), "target directory should be untouched");
     }
 
     #[cfg(unix)]
