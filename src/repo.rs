@@ -441,12 +441,35 @@ impl MemoryRepo {
 
             // Origin exists — we need the token now.
             let token = token_result?;
-            let callbacks = build_auth_callbacks(token);
+            let mut callbacks = build_auth_callbacks(token);
+
+            // git2's Remote::push() does not surface server-side rejections
+            // through its return value — they arrive via this callback.
+            let rejections: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let rej = Arc::clone(&rejections);
+            callbacks.push_update_reference(move |refname, status| {
+                if let Some(msg) = status {
+                    rej.lock()
+                        .expect("rejection lock poisoned")
+                        .push(format!("{refname}: {msg}"));
+                }
+                Ok(())
+            });
+
             let mut push_opts = git2::PushOptions::new();
             push_opts.remote_callbacks(callbacks);
 
             let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-            remote.push(&[&refspec], Some(&mut push_opts))?;
+            if let Err(e) = remote.push(&[&refspec], Some(&mut push_opts)) {
+                warn!("push to origin failed at transport level: {e}");
+                return Err(MemoryError::Git(e));
+            }
+
+            let rejected = rejections.lock().expect("rejection lock poisoned");
+            if !rejected.is_empty() {
+                return Err(MemoryError::PushRejected(rejected.join("; ")));
+            }
+
             info!("pushed branch '{}' to origin", branch);
             Ok(())
         })
