@@ -1,3 +1,12 @@
+## [0.6.1]
+
+### Fixed
+- Atomic file writes with RAII cleanup and symlink defense
+- Drop `--locked` from `cargo publish`
+
+### Changed
+- Refresh `Cargo.lock` to unblock v0.6.0 release
+
 ## [0.6.0]
 
 ### Added
