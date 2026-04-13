@@ -49,6 +49,10 @@ pub enum MemoryError {
     #[error("yaml error: {0}")]
     Yaml(#[from] serde_yaml_ng::Error),
 
+    /// The remote server rejected one or more ref updates during push.
+    #[error("push rejected: {0}")]
+    PushRejected(String),
+
     /// A background task failed to join.
     #[error("task join error: {0}")]
     Join(String),
@@ -64,6 +68,10 @@ impl From<MemoryError> for rmcp::model::ErrorData {
             MemoryError::NotFound { .. } | MemoryError::InvalidInput { .. } => {
                 rmcp::model::ErrorCode::INVALID_PARAMS
             }
+            // PushRejected is a server-side policy decision (e.g. branch
+            // protection), not an internal fault. No standard JSON-RPC code
+            // fits precisely; INTERNAL_ERROR is the least-bad option until
+            // MCP defines application-level error codes.
             _ => rmcp::model::ErrorCode::INTERNAL_ERROR,
         };
         rmcp::model::ErrorData {

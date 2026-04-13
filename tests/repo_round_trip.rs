@@ -7,6 +7,8 @@
 use std::sync::Arc;
 
 use memory_mcp::auth::AuthProvider;
+#[cfg(unix)]
+use memory_mcp::error::MemoryError;
 use memory_mcp::repo::MemoryRepo;
 use memory_mcp::types::{Memory, MemoryMetadata, PullResult, Scope};
 
@@ -137,4 +139,120 @@ async fn push_pull_with_bare_remote() {
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0].name, "push-memory");
     assert_eq!(memories[0].content, "Content for push test.");
+}
+
+/// Push via `git://` to a daemon whose bare remote has an `update` hook
+/// that rejects all ref updates.
+///
+/// This exercises the `push_update_reference` callback path — the fix for
+/// issue #81. Unlike `file://` transport, the git smart protocol runs
+/// server-side hooks and reports per-ref rejection status through the
+/// callback. Our code collects those rejections and surfaces them as
+/// `MemoryError::PushRejected`.
+#[cfg(unix)]
+#[tokio::test]
+async fn push_rejected_by_server_hook() {
+    use std::fs;
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Child, Command, Stdio};
+
+    /// RAII guard that kills `git daemon` on drop.
+    struct GitDaemon(Child);
+    impl Drop for GitDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Reserve a free port. Hold the listener open so nothing else can grab
+    // it; git daemon's --reuseaddr lets it bind the same port concurrently.
+    // We drop the listener after the daemon is confirmed ready.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    // Set up a bare remote with an `update` hook that rejects all pushes.
+    let remote_dir = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(remote_dir.path()).expect("failed to init bare repo");
+
+    let hooks_dir = remote_dir.path().join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook_path = hooks_dir.join("update");
+    fs::write(
+        &hook_path,
+        "#!/bin/sh\necho \"branch protection: PRs required\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Start git daemon serving the bare repo's parent directory.
+    let base_path = remote_dir.path().parent().unwrap();
+    let child = Command::new("git")
+        .args([
+            "daemon",
+            "--reuseaddr",
+            "--listen=127.0.0.1",
+            &format!("--port={port}"),
+            &format!("--base-path={}", base_path.display()),
+            "--enable=receive-pack",
+            "--export-all",
+            &base_path.to_string_lossy(),
+        ])
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("failed to start git daemon — is git installed?");
+
+    let _daemon = GitDaemon(child);
+
+    // Poll the port until the daemon is accepting connections, then release
+    // our placeholder listener so only the daemon holds the port.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "git daemon did not become ready within 5 seconds",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(listener);
+
+    // Build the git:// URL pointing at the bare repo.
+    let repo_name = remote_dir.path().file_name().unwrap().to_string_lossy();
+    let remote_url = format!("git://127.0.0.1:{port}/{repo_name}");
+
+    // Init a local repo, save a memory, and push.
+    let local_dir = tempfile::tempdir().unwrap();
+    let repo = Arc::new(
+        MemoryRepo::init_or_open(local_dir.path(), Some(&remote_url))
+            .expect("should init local repo"),
+    );
+    let auth = AuthProvider::with_token("ghp_fake_token");
+
+    let metadata = MemoryMetadata::new(Scope::Global, vec!["rejected".into()], None);
+    let memory = Memory::new(
+        "rejected-memory".into(),
+        "This push should be rejected.".into(),
+        metadata,
+    );
+    repo.save_memory(&memory)
+        .await
+        .expect("save should succeed");
+
+    let result = repo.push(&auth, "main").await;
+    assert!(result.is_err(), "push to a rejecting remote should fail");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, MemoryError::PushRejected(_)),
+        "expected PushRejected, got: {err:?}",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("refs/heads/main"),
+        "rejection should name the rejected ref, got: {msg}",
+    );
 }

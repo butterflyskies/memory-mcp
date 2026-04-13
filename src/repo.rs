@@ -445,8 +445,7 @@ impl MemoryRepo {
 
             // git2's Remote::push() does not surface server-side rejections
             // through its return value — they arrive via this callback.
-            let rejections: Arc<Mutex<Vec<String>>> =
-                Arc::new(Mutex::new(Vec::new()));
+            let rejections: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let rej = Arc::clone(&rejections);
             callbacks.push_update_reference(move |refname, status| {
                 if let Some(msg) = status {
@@ -461,14 +460,14 @@ impl MemoryRepo {
             push_opts.remote_callbacks(callbacks);
 
             let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-            remote.push(&[&refspec], Some(&mut push_opts))?;
+            if let Err(e) = remote.push(&[&refspec], Some(&mut push_opts)) {
+                warn!("push to origin failed at transport level: {e}");
+                return Err(MemoryError::Git(e));
+            }
 
             let rejected = rejections.lock().expect("rejection lock poisoned");
             if !rejected.is_empty() {
-                return Err(MemoryError::Git(git2::Error::from_str(&format!(
-                    "remote rejected push: {}",
-                    rejected.join("; ")
-                ))));
+                return Err(MemoryError::PushRejected(rejected.join("; ")));
             }
 
             info!("pushed branch '{}' to origin", branch);
