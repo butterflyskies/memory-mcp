@@ -56,8 +56,9 @@ tokenizers = { version = "0.22", default-features = false, features = ["progress
 # Disable defaults to drop native-tls and the tokio/reqwest async API we don't
 # use. ureq provides the sync download API with rustls TLS by default.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
-# Optional: unifies with hf-hub's transitive ureq and adds rustls-native-certs
-# so model downloads also trust the OS certificate store.
+# Optional: enables ureq's native-certs support so model downloads also trust
+# the OS certificate store. Note: this may currently add a second
+# rustls-native-certs major version alongside reqwest/hyper-rustls.
 ureq = { version = "2", features = ["native-certs"], optional = true }
 
 # Optional dependencies gated behind features.
