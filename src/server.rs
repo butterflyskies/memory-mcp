@@ -349,10 +349,7 @@ impl MemoryServer {
                     }
                 };
 
-                // Truncate content for the snippet and signal when content was cut.
-                let content_length = memory.content.chars().count();
-                let truncated = content_length > SNIPPET_MAX_CHARS;
-                let snippet: String = memory.content.chars().take(SNIPPET_MAX_CHARS).collect();
+                let (snippet, content_length, truncated) = build_snippet(&memory.content);
 
                 results_vec.push(serde_json::json!({
                     "id": memory.id,
@@ -794,5 +791,63 @@ impl ServerHandler for MemoryServer {
             (remember, edit, read, forget). Use scope='all' to search across all projects."
                 .to_string(),
         )
+    }
+}
+
+/// Truncate content to [`SNIPPET_MAX_CHARS`] and return `(snippet, content_length, truncated)`.
+fn build_snippet(content: &str) -> (String, usize, bool) {
+    let content_length = content.chars().count();
+    let truncated = content_length > SNIPPET_MAX_CHARS;
+    let snippet: String = content.chars().take(SNIPPET_MAX_CHARS).collect();
+    (snippet, content_length, truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snippet_short_content_not_truncated() {
+        let content = "Hello, world!";
+        let (snippet, content_length, truncated) = build_snippet(content);
+        assert_eq!(snippet, "Hello, world!");
+        assert_eq!(content_length, 13);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn snippet_exact_limit_not_truncated() {
+        let content: String = "a".repeat(SNIPPET_MAX_CHARS);
+        let (snippet, content_length, truncated) = build_snippet(&content);
+        assert_eq!(snippet, content);
+        assert_eq!(content_length, SNIPPET_MAX_CHARS);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn snippet_over_limit_is_truncated() {
+        let content: String = "b".repeat(SNIPPET_MAX_CHARS + 100);
+        let (snippet, content_length, truncated) = build_snippet(&content);
+        assert_eq!(snippet.chars().count(), SNIPPET_MAX_CHARS);
+        assert_eq!(content_length, SNIPPET_MAX_CHARS + 100);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn snippet_counts_unicode_chars_not_bytes() {
+        // Each emoji is 1 char but multiple bytes.
+        let emoji_content: String = "\u{1F600}".repeat(SNIPPET_MAX_CHARS + 1);
+        let (snippet, content_length, truncated) = build_snippet(&emoji_content);
+        assert_eq!(snippet.chars().count(), SNIPPET_MAX_CHARS);
+        assert_eq!(content_length, SNIPPET_MAX_CHARS + 1);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn snippet_empty_content() {
+        let (snippet, content_length, truncated) = build_snippet("");
+        assert_eq!(snippet, "");
+        assert_eq!(content_length, 0);
+        assert!(!truncated);
     }
 }
