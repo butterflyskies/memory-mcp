@@ -1,3 +1,12 @@
+## [0.5.2]
+
+### Added
+- Add PushRejected error variant and integration test
+
+### Fixed
+- Rmcp 1.4 compat and dependency refresh
+- Surface server-side push rejections instead of silently succeeding
+
 ## [0.5.1]
 
 ### Added
