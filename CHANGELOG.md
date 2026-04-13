@@ -1,11 +1,14 @@
-## [0.5.2]
+## [0.6.0]
 
 ### Added
-- Add PushRejected error variant and integration test
+- Add `PushRejected` error variant and integration test
+
+### Changed
+- Mark `MemoryError` as `#[non_exhaustive]` (breaking: downstream `match` must add `_ =>`)
 
 ### Fixed
-- Rmcp 1.4 compat and dependency refresh
 - Surface server-side push rejections instead of silently succeeding
+- rmcp 1.4 compat and dependency refresh
 
 ## [0.5.1]
 
