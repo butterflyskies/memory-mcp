@@ -459,43 +459,11 @@ fn store_in_file(token: &str) -> Result<(), MemoryError> {
         }
     }
 
-    // Write to a temporary file in the same directory, then rename into place.
-    // This ensures the token file is never left in a truncated state on crash,
-    // and the 0600 mode is set before any content is written.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let parent = token_path.parent().expect("token_path always has a parent");
-        let tmp_path = parent.join(".token.tmp");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|e| {
-                MemoryError::TokenStorage(format!("failed to open temp token file: {e}"))
-            })?;
-        f.write_all(token.as_bytes()).map_err(|e| {
-            MemoryError::TokenStorage(format!("failed to write temp token file: {e}"))
-        })?;
-        f.write_all(b"\n").map_err(|e| {
-            MemoryError::TokenStorage(format!("failed to write temp token file: {e}"))
-        })?;
-        f.sync_all().map_err(|e| {
-            MemoryError::TokenStorage(format!("failed to sync temp token file: {e}"))
-        })?;
-        drop(f);
-        std::fs::rename(&tmp_path, &token_path).map_err(|e| {
-            MemoryError::TokenStorage(format!("failed to rename token file into place: {e}"))
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&token_path, format!("{token}\n"))
-            .map_err(|e| MemoryError::TokenStorage(format!("failed to write token file: {e}")))?;
-    }
+    // Atomic write: temp file → sync → rename. On Unix the temp file is
+    // created with mode 0o600. On any failure the temp file is cleaned up
+    // automatically by the RAII guard inside `atomic_write`.
+    crate::fs_util::atomic_write(&token_path, format!("{token}\n").as_bytes())
+        .map_err(|e| MemoryError::TokenStorage(format!("failed to write token file: {e}")))?;
 
     info!("token stored in file ({})", token_path.display());
     Ok(())

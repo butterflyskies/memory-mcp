@@ -1042,29 +1042,48 @@ impl MemoryRepo {
         Ok(())
     }
 
-    /// Open `path` for writing using `O_NOFOLLOW` on Unix so the final path
-    /// component cannot be a symlink, then write `data`.
+    /// Atomically write `data` to `path` via temp-file + rename.
     ///
-    /// On non-Unix platforms falls back to a plain `std::fs::write`.
+    /// Defense-in-depth against symlink attacks (layered):
+    /// 1. `validate_path` rejects symlinks in all path components.
+    /// 2. An `lstat` check here catches symlinks created between
+    ///    validation and write (narrows the TOCTOU window).
+    /// 3. On Unix, an `O_NOFOLLOW` probe rejects symlinks at the
+    ///    final component at the kernel level.
     fn write_memory_file(&self, path: &Path, data: &[u8]) -> Result<(), MemoryError> {
+        // Layer 2: lstat — reject if the target is currently a symlink.
+        if path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(MemoryError::InvalidInput {
+                reason: format!("refusing to write through symlink: {}", path.display()),
+            });
+        }
+
+        // Layer 3 (Unix): O_NOFOLLOW probe — kernel-level symlink rejection.
+        // NotFound is fine (file doesn't exist yet); any other error (ELOOP
+        // from a symlink, permission denied, etc.) is rejected.
         #[cfg(unix)]
         {
-            use std::io::Write as _;
             use std::os::unix::fs::OpenOptionsExt as _;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
+            if let Err(e) = std::fs::OpenOptions::new()
+                .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
-                .open(path)?;
-            f.write_all(data)?;
-            Ok(())
+                .open(path)
+            {
+                // NotFound is fine — the file doesn't exist yet.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(MemoryError::InvalidInput {
+                        reason: format!("O_NOFOLLOW check failed for {}: {e}", path.display()),
+                    });
+                }
+            }
         }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(path, data)?;
-            Ok(())
-        }
+
+        crate::fs_util::atomic_write(path, data)?;
+        Ok(())
     }
 
     /// Open `path` for reading using `O_NOFOLLOW` on Unix, then return its
