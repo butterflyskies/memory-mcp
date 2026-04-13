@@ -12,6 +12,10 @@ rust-version = "1.88"
 
 [features]
 k8s = ["dep:kube", "dep:k8s-openapi"]
+# Load the OS certificate store alongside the bundled Mozilla roots. Needed
+# behind corporate TLS-intercepting proxies whose CA is installed in the
+# system trust store but absent from webpki-roots.
+native-certs = ["reqwest/rustls-tls-native-roots", "dep:ureq"]
 
 [dependencies]
 rmcp = { version = "1.1", features = ["server", "macros", "transport-streamable-http-server"] }
@@ -52,6 +56,10 @@ tokenizers = { version = "0.22", default-features = false, features = ["progress
 # Disable defaults to drop native-tls and the tokio/reqwest async API we don't
 # use. ureq provides the sync download API with rustls TLS by default.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+# Optional: enables ureq's native-certs support so model downloads also trust
+# the OS certificate store. Note: this may currently add a second
+# rustls-native-certs major version alongside reqwest/hyper-rustls.
+ureq = { version = "2", features = ["native-certs"], optional = true }
 
 # Optional dependencies gated behind features.
 # Disable defaults to avoid pulling in native-tls; rustls-tls matches the rest
