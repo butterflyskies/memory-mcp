@@ -260,16 +260,16 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let ct = CancellationToken::new();
     let ct_child = ct.child_token();
 
+    // SessionConfig and StreamableHttpServerConfig are #[non_exhaustive] in
+    // rmcp 1.4+, so struct literal syntax is unavailable from external crates.
+    // Default + field mutation is the intended pattern (see mcp-session#11).
+    #[allow(clippy::field_reassign_with_default)]
     let service = StreamableHttpService::new(
         move || Ok(MemoryServer::new(Arc::clone(&state))),
         Arc::new({
-            let mgr = BoundedSessionManager::new(
-                SessionConfig {
-                    keep_alive: Some(std::time::Duration::from_secs(4 * 60 * 60)),
-                    ..Default::default()
-                },
-                args.max_sessions,
-            );
+            let mut session_config = SessionConfig::default();
+            session_config.keep_alive = Some(std::time::Duration::from_secs(4 * 60 * 60));
+            let mgr = BoundedSessionManager::new(session_config, args.max_sessions);
             if args.session_rate_limit > 0 && args.session_rate_window_secs > 0 {
                 mgr.with_rate_limit(
                     args.session_rate_limit,
@@ -279,9 +279,10 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
                 mgr
             }
         }),
-        StreamableHttpServerConfig {
-            cancellation_token: ct_child,
-            ..Default::default()
+        {
+            let mut server_config = StreamableHttpServerConfig::default();
+            server_config.cancellation_token = ct_child;
+            server_config
         },
     );
 
