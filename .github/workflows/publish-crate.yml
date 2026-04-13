@@ -30,7 +30,11 @@ jobs:
         id: auth
       # --no-verify: skip the verification rebuild. CI already built and tested;
       # rebuilding here requires system dependencies (libdbus-1-dev) not present.
+      # --locked is intentionally omitted: cargo publish resolves against
+      # the live crates.io index, and transitive dependency patches published
+      # between commit and release cause --locked to fail. The lockfile is
+      # not shipped in the published crate anyway.
       - name: Publish crate
-        run: cargo publish --no-verify --locked
+        run: cargo publish --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
