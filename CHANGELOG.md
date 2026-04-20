@@ -1,3 +1,11 @@
+## [0.7.0]
+
+### Added
+- Add `native-certs` feature for OS certificate store support by @spolom in [#143](https://github.com/butterflyskies/memory-mcp/pull/143)
+
+### New Contributors
+* @spolom made their first contribution in [#143](https://github.com/butterflyskies/memory-mcp/pull/143)
+
 ## [0.6.1]
 
 ### Fixed
