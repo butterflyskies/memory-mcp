@@ -1,6 +1,6 @@
 [package]
 name = "memory-mcp"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MCP server for semantic memory — pure-Rust embeddings, vector search, git-backed storage"
@@ -55,10 +55,9 @@ candle-transformers = "0.9"
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex", "esaxx_fast"] }
 # Disable defaults to drop native-tls and the tokio/reqwest async API we don't
 # use. ureq provides the sync download API with rustls TLS by default.
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 # Optional: enables ureq's native-certs support so model downloads also trust
-# the OS certificate store. Note: this may currently add a second
-# rustls-native-certs major version alongside reqwest/hyper-rustls.
+# the OS certificate store.
 ureq = { version = "2", features = ["native-certs"], optional = true }
 
 # Optional dependencies gated behind features.
