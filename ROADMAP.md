@@ -1,7 +1,7 @@
 # memory-mcp Roadmap
 
 > Canonical source of truth for the memory-mcp development plan.
-> Updated with each phase completion. See the [pinned roadmap issue](../../issues) for discussion and progress notes.
+> Updated with each phase completion. See the [pinned roadmap issue](https://github.com/butterflyskies/memory-mcp/issues/132) for discussion and progress notes.
 
 ## Design Principle
 
@@ -9,25 +9,40 @@ Earlier phases should be implemented with awareness of where the project is head
 
 ---
 
-## Phase 1: Stabilize & Quick Wins ✓
+## Completed Work
 
-**Goal:** Fix known bugs, improve agent UX, and clear low-hanging fruit.
+### Phase 1: Stabilize & Quick Wins
 
 **Completed 2026-04-12.** All 6 issues closed. Released in v0.6.0 and v0.6.1.
 
-| Issue | Title | Effort | Status |
-|-------|-------|--------|--------|
-| #88 | Flaky test: FastForward vs Merged | Small | v0.5.1 |
-| #81 | git push silently succeeds on reject | Small | v0.6.0 |
-| #69 | Atomic file writes + cleanup | Medium | v0.6.1 |
-| #106 | Recall truncation guidance for agents | Small | v0.6.0 |
-| #108 | Secret-avoidance in tool instructions | Small | v0.6.0 |
-| #105 | Document `docker run` pattern in README | Small | v0.6.0 |
+| Issue | Title | Status |
+|-------|-------|--------|
+| #88 | Flaky test: FastForward vs Merged | v0.5.1 |
+| #81 | git push silently succeeds on reject | v0.6.0 |
+| #69 | Atomic file writes + cleanup | v0.6.1 |
+| #106 | Recall truncation guidance for agents | v0.6.0 |
+| #108 | Secret-avoidance in tool instructions | v0.6.0 |
+| #105 | Document `docker run` pattern in README | v0.6.0 |
 
 **Design decisions carried forward:**
 - `MemoryError` is `#[non_exhaustive]` — future variants are patch-compatible.
 - `fs_util::atomic_write` is `pub(crate)` — reusable for index persistence and config writes in later phases.
 - Recall response includes `truncated` flag and `content_length` — extensible for audit logging fields.
+
+### Earlier Phases (Pre-Roadmap)
+
+Core features delivered in v0.1.0–v0.5.0:
+- MCP server with streamable HTTP transport
+- Memory file format (markdown + YAML frontmatter)
+- All core tools: `remember`, `recall`, `forget`, `edit`, `list`, `read`, `sync`
+- Local embedding (candle, BGE-small-en-v1.5) + HNSW vector index (usearch)
+- Git push/pull with remote auth, incremental index rebuild
+- Keyring-based token storage, OAuth device flow
+- K8s deployment manifests, container image
+- Fat lib / thin binary refactor, semver hardening
+- Published to crates.io (v0.3.0+)
+
+Closed issues from original TODO: #60 (cargo-auditable), #62 (Trusted Publishing), #69 (atomic writes), #71 (recall over-fetch).
 
 ---
 
@@ -43,6 +58,8 @@ Earlier phases should be implemented with awareness of where the project is head
 | #109 | Content-level secret scanning | Medium | #108 |
 | #98 | Automate CHANGELOG without bypassing branch protection | Medium | -- |
 | #78 | `validate` subcommand + Docker build speedup | Large | -- |
+| #145 | Extract OAuth client ID from hardcoded const into config module | Small | -- |
+| #146 | Integration tests for auth login, auth status, MEMORY_MCP_BIND | Medium | -- |
 
 **Key insight:** #52 (comprehensive tracing) is cross-cutting. The scaffold goes in Phase 2 so every new feature gets spans for free. Structured fields: operation, scope, memory_name, duration. OTLP export behind feature flag.
 
@@ -73,6 +90,10 @@ Earlier phases should be implemented with awareness of where the project is head
 | #140 | Chunk long memories for embedding | Medium | #141 |
 | #55 | BM25 keyword search via Tantivy | Large | -- |
 | #107 | Memory expiry: TTL + completion-triggered deletion | Medium | -- |
+| #147 | Deduplication / update detection on `remember` | Medium | -- |
+| #148 | Tag-based filtering in `recall` | Small | -- |
+| #149 | Memory metadata enrichment (last-accessed, access count, confidence) | Medium | -- |
+| #150 | Periodic background sync | Medium | -- |
 
 **Key insight:** BGE-small-en-v1.5 silently truncates memories beyond 512 tokens (~400 words). ModernBERT Embed (`nomic-ai/modernbert-embed-base`) provides a 16x context window (8192 tokens), alternating attention for CPU efficiency, and Matryoshka dimensions. Already implemented in candle-transformers. Chunking (#140) handles memories that still exceed the new window. BM25 (#55) provides a complementary retrieval path with no token limit.
 
@@ -117,6 +138,23 @@ Earlier phases should be implemented with awareness of where the project is head
 | #56 | Cross-platform vector index (brute-force fallback) | Medium | #42, #94 |
 
 Windows support (#42, #56) is deferred until demand materializes.
+
+---
+
+## Future
+
+Items without a phase assignment yet. These will be scheduled as priorities become clear.
+
+| Issue | Title | Category |
+|-------|-------|----------|
+| #129 | Memory consolidation, write discipline, and quality metrics | Quality |
+| #130 | Post-compaction context re-priming hook | Agent UX |
+| #144 | Migrate optional ureq dep from v2 to v3 | Dependencies |
+| #151 | Migration tools for Serena memories and Claude Code auto-memories | Migration |
+| #152 | Container signing with cosign | Security |
+| #153 | CVE scanning gate in CI (Grype/Trivy) | Security |
+| #154 | CLI for manual memory management outside agent sessions | UX |
+
 
 ---
 

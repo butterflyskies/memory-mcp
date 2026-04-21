@@ -376,7 +376,7 @@ The core memory engine is stable — store, search, sync, and authenticate all w
 - **Tag-based filtering** in recall
 - **Richer observability** with structured tracing across all subsystems ([#52](https://github.com/butterflyskies/memory-mcp/issues/52))
 
-See [TODO.md](TODO.md) for the full plan and [open issues](https://github.com/butterflyskies/memory-mcp/issues) for what's in flight.
+See [ROADMAP.md](ROADMAP.md) for the full development plan and [open issues](https://github.com/butterflyskies/memory-mcp/issues) for what's in flight.
 
 ## Development
 
