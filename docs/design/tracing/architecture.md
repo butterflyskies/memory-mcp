@@ -6,6 +6,8 @@ phase: 3
 
 # Architecture: Tracing Scaffold (#52)
 
+*Draft — 2026-04-23*
+
 ## Decisions
 
 | # | Decision | Choice | Rationale |
@@ -110,7 +112,7 @@ graph TB
     agent["AI Agent\n(MCP client — Claude Code, etc.)"]
     operator["Operator\n(reads structured logs)"]
     collector["OTLP Collector\n(Honeycomb / Jaeger / Tempo)\n[optional — otlp feature]"]
-    remote["GitHub Remote\n(butterflyskies/memories)"]
+    remote["Git Remote\n(optional — deployment-specific)"]
 
     subgraph memory_mcp["memory-mcp"]
         server["MCP Server\n(Axum + rmcp)"]
@@ -120,7 +122,7 @@ graph TB
     server -->|"Tool results (JSON)"| agent
     server -->|"Structured traces\n(stderr, fmt layer)"| operator
     server -.->|"Span export\n(OTLP/gRPC)"| collector
-    server -->|"git push/pull\n(HTTPS + PAT)"| remote
+    server -->|"git push/pull\n(HTTPS, optional)"| remote
 
     style collector stroke-dasharray: 5 5
 ```

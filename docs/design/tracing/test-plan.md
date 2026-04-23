@@ -6,6 +6,8 @@ phase: 5
 
 # Test Plan: Tracing Scaffold (#52)
 
+*Draft — 2026-04-23*
+
 ## Test infrastructure
 
 Span-capturing tests use `tracing-test` or a custom in-memory subscriber

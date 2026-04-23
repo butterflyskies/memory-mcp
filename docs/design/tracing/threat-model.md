@@ -6,6 +6,8 @@ phase: 4
 
 # Threat Model: Tracing Scaffold (#52)
 
+*Draft — 2026-04-23*
+
 ## Scope
 
 Lightweight review focused on the trace output boundary — the one area

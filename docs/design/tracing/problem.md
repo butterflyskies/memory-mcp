@@ -6,13 +6,15 @@ phase: 1
 
 # Problem Space: Tracing Scaffold (#52)
 
+*Draft — 2026-04-22*
+
 ## What are we solving?
 
 memory-mcp has minimal, inconsistent observability. The MCP tool handlers in
 `server.rs` have basic spans with timing fields (`embed_ms`, `repo_ms`), but the
 subsystems they delegate to — embedding, vector index, git repo, auth — are opaque.
-When something goes wrong in production (goddess cluster), debugging requires
-guessing which subsystem failed and why, rather than following structured trace data.
+When something goes wrong in production, debugging requires guessing which
+subsystem failed and why, rather than following structured trace data.
 
 An AI agent calling the MCP server can't inspect internal state. The operator's
 only window is trace output — and right now that window is narrow and inconsistent.
