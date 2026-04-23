@@ -28,22 +28,22 @@ phase: 2
 
 | Category | Applicable? | Rationale |
 |----------|-------------|-----------|
+| V2: Authentication | Yes | Auth flow instrumentation must not leak token values |
 | V7: Error handling, logging | Yes | Directly governs what gets logged, at what level, what must be excluded |
 | V8: Data protection | Yes | Sensitive data (tokens, memory content, credentials) must not appear in traces |
-| V2: Authentication | Yes | Auth flow instrumentation must not leak token values |
 | V1, V3–V6, V9–V14 | No | Not applicable to an observability feature — no sessions, access control, crypto, file handling, or API changes in scope |
 
 ## ISO 27001:2022 Annex A Controls Reviewed
 
 | Control | Applicable? | Rationale |
 |---------|-------------|-----------|
-| A.8.15: Logging | Yes | Security-relevant events must be captured at appropriate levels even under conservative settings |
-| A.8.11: Data masking | Yes | Sensitive data redaction in trace output — maps to R-16/R-17/R-18 |
-| A.8.16: Monitoring | Yes | OTLP export enables downstream anomaly detection and alerting |
-| A.8.17: Clock synchronization | Handled | `tracing` crate uses system clock / `Instant` — no action needed |
 | A.5.33: Protection of records | Deferred | Log integrity and tamper evidence are the collector/backend's responsibility; Phase 5 concern |
 | A.8.10: Information deletion | Not applicable | Trace data retention is managed by the collector, not the application |
+| A.8.11: Data masking | Yes | Sensitive data redaction in trace output — maps to R-16/R-17/R-18 |
 | A.8.12: Data leakage prevention | Covered | Overlaps with V8 / R-16–R-18 |
+| A.8.15: Logging | Yes | Security-relevant events must be captured at appropriate levels even under conservative settings |
+| A.8.16: Monitoring | Yes | OTLP export enables downstream anomaly detection and alerting |
+| A.8.17: Clock synchronization | Handled | `tracing` crate uses system clock / `Instant` — no action needed |
 
 ## Requirements
 
