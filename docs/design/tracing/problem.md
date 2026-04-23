@@ -69,11 +69,11 @@ style.
   architecture should be extensible enough that adding propagation and metadata
   extraction later is straightforward (Axum middleware + OpenTelemetry extractors).
 
-### Out of scope (not tracked — separate concerns)
+### Out of scope (separate concerns)
 
-- Prometheus metrics endpoint (separate issue)
-- `/readyz` health endpoint with subsystem checks (noted as TODO in `run_serve`)
-- Performance benchmarking of tracing overhead
+- Prometheus metrics endpoint — #165
+- `/readyz` health endpoint with subsystem checks — #164
+- Performance benchmarking of tracing overhead (PR-level concern for #52)
 
 ### Constraints
 
