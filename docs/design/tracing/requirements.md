@@ -1,12 +1,12 @@
 <!-- design-meta
-status: draft
+status: approved
 last-updated: 2026-04-23
 phase: 2
 -->
 
 # Requirements: Tracing Scaffold (#52)
 
-*Draft — 2026-04-23*
+*Approved — 2026-04-23*
 
 ## Use Cases
 

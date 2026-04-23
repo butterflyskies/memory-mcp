@@ -1,12 +1,12 @@
 <!-- design-meta
-status: draft
+status: approved
 last-updated: 2026-04-23
 phase: 3
 -->
 
 # Architecture: Tracing Scaffold (#52)
 
-*Draft — 2026-04-23*
+*Approved — 2026-04-23*
 
 ## Decisions
 

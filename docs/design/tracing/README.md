@@ -1,5 +1,5 @@
 <!-- design-meta
-status: draft
+status: approved
 last-updated: 2026-04-23
 -->
 
@@ -14,11 +14,11 @@ spans for free by following the conventions established here.
 
 | Document | Phase | Status | Description |
 |----------|-------|--------|-------------|
-| [Problem Space](problem.md) | 1 | Draft | What we're solving, current gaps, success criteria |
-| [Requirements](requirements.md) | 2 | Draft | Use cases, requirements (R-01–R-21), ASVS/ISO review, SRTM |
-| [Architecture](architecture.md) | 3 | Draft | 9 decisions, field dictionary, Mermaid diagrams, audit vs. privacy tension |
-| [Threat Model](threat-model.md) | 4 | Draft | Lightweight review — trace output boundary. Full STRIDE deferred to #115 |
-| [Test Plan](test-plan.md) | 5 | Draft | 21 test cases (TC-01–TC-21), CI integration, PR review checklist |
+| [Problem Space](problem.md) | 1 | Approved | What we're solving, current gaps, success criteria |
+| [Requirements](requirements.md) | 2 | Approved | Use cases, requirements (R-01–R-21), ASVS/ISO review, SRTM |
+| [Architecture](architecture.md) | 3 | Approved | 9 decisions, field dictionary, Mermaid diagrams, audit vs. privacy tension |
+| [Threat Model](threat-model.md) | 4 | Approved | Lightweight review — trace output boundary. Full STRIDE deferred to #115 |
+| [Test Plan](test-plan.md) | 5 | Approved | 21 test cases (TC-01–TC-21), CI integration |
 
 ## Key decisions
 

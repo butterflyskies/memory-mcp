@@ -1,12 +1,12 @@
 <!-- design-meta
-status: draft
+status: approved
 last-updated: 2026-04-22
 phase: 1
 -->
 
 # Problem Space: Tracing Scaffold (#52)
 
-*Draft — 2026-04-22*
+*Approved — 2026-04-23*
 
 ## What are we solving?
 
