@@ -154,6 +154,7 @@ Items without a phase assignment yet. These will be scheduled as priorities beco
 | #152 | Container signing with cosign | Security |
 | #153 | CVE scanning gate in CI (Grype/Trivy) | Security |
 | #154 | CLI for manual memory management outside agent sessions | UX |
+| #161 | Revisit candle fork patch when upstream merges | Dependencies |
 
 
 ---

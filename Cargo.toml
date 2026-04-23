@@ -47,9 +47,9 @@ dirs = "6"
 mcp-session = "0.1"
 
 # Candle direct — pure-Rust BERT inference for embeddings.
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
 # Disable defaults to drop onig (C regex library); fancy-regex is a pure-Rust
 # drop-in. esaxx_fast enables the C++ suffix-array builder for BPE tokenizers.
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex", "esaxx_fast"] }
@@ -81,6 +81,11 @@ libz-sys = { version = "1", features = ["static"] }
 [dev-dependencies]
 git2 = "0.20"
 tempfile = "3"
+
+# candle 0.10 unconditionally pulls in the onig C regex library via tokenizers
+# for GGUF support we don't use. Upstream PR to make it optional:
+# https://github.com/huggingface/candle/pull/3490
+# Track removal in #161. Until then we accept the onig build cost.
 
 [profile.release]
 strip = true
