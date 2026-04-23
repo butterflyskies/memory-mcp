@@ -110,6 +110,7 @@ Closed issues from original TODO: #60 (cargo-auditable), #62 (Trusted Publishing
 | #111 | Log returned memory names on recall | Small | Phase 2 scaffold |
 | #112 | Log auth events | Small | Phase 2 scaffold |
 | #117 | Git commit SHA in write operation logs | Small | Phase 2 scaffold |
+| #162 | W3C Trace Context propagation | Small | #52, OTLP export |
 
 ---
 
