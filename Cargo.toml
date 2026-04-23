@@ -47,9 +47,9 @@ dirs = "6"
 mcp-session = "0.1"
 
 # Candle direct — pure-Rust BERT inference for embeddings.
-candle-core = "0.10"
-candle-nn = "0.10"
-candle-transformers = "0.10"
+candle-core = { version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+candle-transformers = { version = "0.10", default-features = false }
 # Disable defaults to drop onig (C regex library); fancy-regex is a pure-Rust
 # drop-in. esaxx_fast enables the C++ suffix-array builder for BPE tokenizers.
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex", "esaxx_fast"] }
@@ -81,6 +81,17 @@ libz-sys = { version = "1", features = ["static"] }
 [dev-dependencies]
 git2 = "0.20"
 tempfile = "3"
+
+# TEMPORARY FORK: candle 0.10 unconditionally pulls in the onig C regex library
+# via tokenizers for GGUF support we don't use. Our fork makes it opt-out.
+# Upstream PR: https://github.com/huggingface/candle/pull/3490
+# If merged, remove this [patch] section and drop default-features = false from
+# the candle deps above. Note: [patch.crates-io] overrides break dependabot's
+# ability to track candle version updates — check manually after removing.
+[patch.crates-io]
+candle-core = { git = "https://github.com/butterflyskies/candle.git", branch = "patch/optional-tokenizers" }
+candle-nn = { git = "https://github.com/butterflyskies/candle.git", branch = "patch/optional-tokenizers" }
+candle-transformers = { git = "https://github.com/butterflyskies/candle.git", branch = "patch/optional-tokenizers" }
 
 [profile.release]
 strip = true
