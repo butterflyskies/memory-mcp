@@ -21,6 +21,8 @@ phase: 3
 | 7 | OTLP deps | `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `tracing-opentelemetry` all optional behind `otlp` feature | Zero dep cost for default builds |
 | 8 | OTLP endpoint | Standard `OTEL_EXPORTER_OTLP_ENDPOINT` env var (handled by OpenTelemetry SDK) | No custom config; follows OTel conventions. Compatible with Honeycomb, Jaeger, Tempo, etc. |
 | 9 | Default levels | Handler spans at `info`, subsystem spans at `debug`, security events at `warn` | Operators get handler-level flow at defaults; `debug` for detail; security events always visible |
+| 10 | OTLP startup failure | Crash by default; `--otlp-optional` CLI arg enables fallback to fmt-only with a warning | Explicit opt-in to OTLP means failure should be loud. Fallback available for environments where the collector may lag behind the server. |
+| 11 | OTLP runtime resilience | Delegated to OpenTelemetry SDK's `BatchSpanProcessor` — buffers in memory, retries on failure, resumes when collector reconnects, drops oldest spans when buffer fills | SDK handles this well; no custom retry logic needed. Buffer/timeout tunables exposed via standard `OTEL_BSP_*` env vars. |
 
 ## Field Dictionary
 

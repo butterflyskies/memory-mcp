@@ -51,6 +51,15 @@ as part of this work and can be extended by #146 (integration tests).
 | TC-14 | R-14 | Integration | With `otlp` feature and a local collector, verify spans arrive at configured `OTEL_EXPORTER_OTLP_ENDPOINT` | CI workflow with collector sidecar |
 | TC-15 | R-15 | Build | `cargo tree` without `otlp` feature shows no `opentelemetry` crates | CI workflow |
 
+### OTLP resilience
+
+| Test ID | Requirement | Type | Description | Mechanism |
+|---------|-------------|------|-------------|-----------|
+| TC-22 | R-22 | Integration | With `otlp` feature, no collector running, no `--otlp-optional` — server exits with error message mentioning `--otlp-optional` | Process exit code + stderr check |
+| TC-23 | R-23 | Integration | With `otlp` feature, no collector running, `--otlp-optional` set — server starts, warning logged | Process stderr check |
+| TC-24 | R-24 | Documentation | SDK `BatchSpanProcessor` handles runtime disconnection — buffer, retry, reconnect. Verified by SDK documentation and upstream tests. | Documented behavior (not tested in our suite) |
+| TC-25 | R-25 | Build | `cargo check` without `otlp` — `--otlp-optional` arg is not present in CLI help | CI workflow |
+
 ### Sensitive data protection
 
 | Test ID | Requirement | Type | Description | Mechanism |
