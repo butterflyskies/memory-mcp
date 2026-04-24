@@ -124,8 +124,14 @@ struct ServeArgs {
     )]
     session_rate_window_secs: u64,
 
-    /// If set, OTLP exporter initialisation failures fall back to fmt-only
-    /// logging instead of crashing the process.
+    /// Enable OTLP span export. The server will crash on startup if the
+    /// collector is unreachable. Use --otlp-optional for graceful fallback.
+    #[cfg(feature = "otlp")]
+    #[arg(long, default_value_t = false, env = "MEMORY_MCP_OTLP_REQUIRED")]
+    otlp_required: bool,
+
+    /// Enable OTLP span export with graceful fallback: if the collector is
+    /// unreachable, log a warning and continue with fmt-only tracing.
     #[cfg(feature = "otlp")]
     #[arg(long, default_value_t = false, env = "MEMORY_MCP_OTLP_OPTIONAL")]
     otlp_optional: bool,
@@ -170,8 +176,16 @@ fn init_tracing_fmt_only() {
         .init();
 }
 
+/// Initialise tracing for the serve command. If `--otlp-required` or
+/// `--otlp-optional` is set, activates OTLP export. Otherwise uses fmt-only
+/// (passive — the feature is compiled in but not activated).
 #[cfg(feature = "otlp")]
-fn init_tracing(otlp_optional: bool) -> Option<OtlpProvider> {
+fn init_tracing_for_serve(args: &ServeArgs) -> Option<OtlpProvider> {
+    if !args.otlp_required && !args.otlp_optional {
+        init_tracing_fmt_only();
+        return None;
+    }
+
     use opentelemetry_otlp::SpanExporter;
     use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
     use tracing_opentelemetry::OpenTelemetryLayer;
@@ -181,7 +195,6 @@ fn init_tracing(otlp_optional: bool) -> Option<OtlpProvider> {
 
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
-    // Attempt to build the OTLP exporter (gRPC via tonic).
     let otlp_result = SpanExporter::builder()
         .with_tonic()
         .build()
@@ -204,8 +217,7 @@ fn init_tracing(otlp_optional: bool) -> Option<OtlpProvider> {
             Some(provider)
         }
         Err(e) => {
-            if otlp_optional {
-                // Fall back to fmt-only; warn after subscriber is set up.
+            if args.otlp_optional {
                 tracing_subscriber::registry()
                     .with(filter)
                     .with(fmt_layer)
@@ -246,10 +258,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Tracing goes to stderr only — stdout must remain clean for MCP.
-    // The otlp feature also returns the provider for graceful shutdown.
     #[cfg(not(feature = "otlp"))]
     init_tracing();
-    // otlp: tracing is initialized per-command arm below.
+    // otlp: tracing is initialized per-command arm below (serve may activate
+    // OTLP export; other commands always use fmt-only).
 
     let cli = Cli::parse();
 
@@ -260,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
             match cli.command {
                 Some(Command::Serve(args)) => {
                     #[cfg(feature = "otlp")]
-                    let _otlp_provider = init_tracing(args.otlp_optional);
+                    let _otlp_provider = init_tracing_for_serve(&args);
                     let result = run_serve(args).await;
                     #[cfg(feature = "otlp")]
                     if let Some(provider) = _otlp_provider {
@@ -273,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Serve(args)) => {
             #[cfg(feature = "otlp")]
-            let _otlp_provider = init_tracing(args.otlp_optional);
+            let _otlp_provider = init_tracing_for_serve(&args);
             let result = run_serve(args).await;
             #[cfg(feature = "otlp")]
             if let Some(provider) = _otlp_provider {
