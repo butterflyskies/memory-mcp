@@ -15,12 +15,18 @@ use tracing::{info, warn, Instrument};
 /// Extract the `Mcp-Session-Id` header from HTTP request parts.
 ///
 /// Returns `"unknown"` if the header is absent or not valid UTF-8.
-fn extract_session_id(parts: &http::request::Parts) -> &str {
-    parts
+/// Truncates to 128 chars to bound span field size from untrusted input.
+fn extract_session_id(parts: &http::request::Parts) -> String {
+    let raw = parts
         .headers
         .get("mcp-session-id")
         .and_then(|v: &http::HeaderValue| v.to_str().ok())
-        .unwrap_or("unknown")
+        .unwrap_or("unknown");
+    if raw.len() > 128 {
+        format!("{}…", &raw[..128])
+    } else {
+        raw.to_owned()
+    }
 }
 
 use crate::{
@@ -231,7 +237,7 @@ impl MemoryServer {
                 ),
             }));
         }
-        let session_id = extract_session_id(&parts).to_owned();
+        let session_id = extract_session_id(&parts);
         let content_size = args.content.len();
         let span = tracing::info_span!(
             "handler.remember",
@@ -304,7 +310,7 @@ impl MemoryServer {
         Parameters(args): Parameters<RecallArgs>,
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts).to_owned();
+        let session_id = extract_session_id(&parts);
         // Note: query text is intentionally omitted from the span (R-17 privacy decision).
         let span = tracing::info_span!(
             "handler.recall",
@@ -426,7 +432,7 @@ impl MemoryServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
-        let session_id = extract_session_id(&parts).to_owned();
+        let session_id = extract_session_id(&parts);
         let span = tracing::info_span!(
             "handler.forget",
             session_id = %session_id,
@@ -497,7 +503,7 @@ impl MemoryServer {
                 }));
             }
         }
-        let session_id = extract_session_id(&parts).to_owned();
+        let session_id = extract_session_id(&parts);
         let content_size = args.content.as_ref().map(|c| c.len()).unwrap_or(0);
         let span = tracing::info_span!(
             "handler.edit",
@@ -590,7 +596,7 @@ impl MemoryServer {
         Parameters(args): Parameters<ListArgs>,
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts).to_owned();
+        let session_id = extract_session_id(&parts);
         let span = tracing::info_span!(
             "handler.list",
             session_id = %session_id,
@@ -674,7 +680,7 @@ impl MemoryServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
-        let session_id = extract_session_id(&parts).to_owned();
+        let session_id = extract_session_id(&parts);
         let span = tracing::info_span!(
             "handler.read",
             session_id = %session_id,
@@ -731,7 +737,7 @@ impl MemoryServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
         let pull_first = args.pull_first.unwrap_or(true);
-        let session_id = extract_session_id(&parts).to_owned();
+        let session_id = extract_session_id(&parts);
         let span = tracing::info_span!(
             "handler.sync",
             session_id = %session_id,

@@ -249,8 +249,7 @@ async fn main() -> anyhow::Result<()> {
     // The otlp feature also returns the provider for graceful shutdown.
     #[cfg(not(feature = "otlp"))]
     init_tracing();
-    #[cfg(feature = "otlp")]
-    let _otlp_provider: Option<OtlpProvider> = None; // initialised per-command below.
+    // otlp: tracing is initialized per-command arm below.
 
     let cli = Cli::parse();
 

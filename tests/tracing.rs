@@ -134,10 +134,12 @@ impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer
                 }
                 // Update the corresponding SpanRecord in the store.
                 let span_name = span.name().to_string();
-                let updated_kv = kv.clone();
                 drop(ext);
                 let mut store = self.store.lock().unwrap();
                 // Find the last span with this name and update its fields.
+                // Note: name-based lookup means multi-call tests for the same
+                // operation will update the wrong SpanRecord. Sufficient for
+                // current tests (one call per operation per with_capturing scope).
                 if let Some(rec) = store.spans.iter_mut().rev().find(|s| s.name == span_name) {
                     for (new_key, new_val) in &new_kv {
                         if let Some(existing) = rec.fields.iter_mut().find(|(k, _)| k == new_key) {
@@ -146,7 +148,6 @@ impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer
                             rec.fields.push((new_key.clone(), new_val.clone()));
                         }
                     }
-                    let _ = updated_kv; // suppress unused warning
                 }
             }
         }
@@ -579,11 +580,18 @@ fn repo_init_url_is_redacted_in_logs() {
 fn auth_failure_produces_warn_event() {
     use memory_mcp::auth::AuthProvider;
 
+    // Override HOME to an empty temp directory so resolve_token cannot
+    // find ~/.config/memory-mcp/token (which may exist on dev machines).
+    let fake_home = tempfile::tempdir().expect("tempdir for fake HOME");
     let (_, store) = with_capturing(|| {
-        // Clear env var so resolution must fall back to keyring / fail.
         std::env::remove_var("MEMORY_MCP_GITHUB_TOKEN");
-        let provider = AuthProvider::new(); // may or may not have keyring
-        let _ = provider.resolve_token(); // keyring absent in CI → warn
+        std::env::set_var("HOME", fake_home.path());
+        let provider = AuthProvider::new();
+        let _ = provider.resolve_token(); // no env, no file, no keyring → warn
+                                          // Restore HOME so other tests are unaffected.
+        if let Some(real_home) = dirs::home_dir() {
+            std::env::set_var("HOME", real_home);
+        }
     });
     let store = store.lock().unwrap();
 
