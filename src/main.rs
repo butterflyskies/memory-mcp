@@ -10,6 +10,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+// The SdkTracerProvider type is used in the otlp feature only.
+#[cfg(feature = "otlp")]
+use opentelemetry_sdk::trace::SdkTracerProvider as OtlpProvider;
+
 use memory_mcp::auth::{self, AuthProvider, StoreBackend};
 use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend, MODEL_ID};
 use memory_mcp::index::ScopedIndex;
@@ -119,10 +123,108 @@ struct ServeArgs {
         env = "MEMORY_MCP_SESSION_RATE_WINDOW_SECS"
     )]
     session_rate_window_secs: u64,
+
+    /// If set, OTLP exporter initialisation failures fall back to fmt-only
+    /// logging instead of crashing the process.
+    #[cfg(feature = "otlp")]
+    #[arg(long, default_value_t = false, env = "MEMORY_MCP_OTLP_OPTIONAL")]
+    otlp_optional: bool,
 }
 
 #[derive(Args)]
 struct WarmupArgs {}
+
+// ---------------------------------------------------------------------------
+// Tracing initialisation
+// ---------------------------------------------------------------------------
+
+/// Initialise the global tracing subscriber.
+///
+/// Default build: Registry + EnvFilter (`memory_mcp=info` default) + fmt(stderr).
+/// `otlp` feature: same + OpenTelemetry layer with BatchSpanProcessor.
+///
+/// Returns the OTLP tracer provider when the `otlp` feature is enabled, so the
+/// caller can call `provider.shutdown()` after the server exits.
+#[cfg(not(feature = "otlp"))]
+fn init_tracing() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "memory_mcp=info,warn".to_string().into()),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .init();
+}
+
+/// Initialise fmt-only tracing (no OTLP). Used for non-serve commands
+/// (`warmup`, `auth`) when the `otlp` feature is enabled but OTLP is only
+/// meaningful for the long-running server process.
+#[cfg(feature = "otlp")]
+fn init_tracing_fmt_only() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "memory_mcp=info,warn".to_string().into()),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .init();
+}
+
+#[cfg(feature = "otlp")]
+fn init_tracing(otlp_optional: bool) -> Option<OtlpProvider> {
+    use opentelemetry_otlp::SpanExporter;
+    use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
+    use tracing_opentelemetry::OpenTelemetryLayer;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "memory_mcp=info,warn".to_string().into());
+
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    // Attempt to build the OTLP exporter (gRPC via tonic).
+    let otlp_result = SpanExporter::builder()
+        .with_tonic()
+        .build()
+        .map(|exporter| {
+            let batch = BatchSpanProcessor::builder(exporter).build();
+            SdkTracerProvider::builder()
+                .with_span_processor(batch)
+                .build()
+        });
+
+    match otlp_result {
+        Ok(provider) => {
+            let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "memory-mcp");
+            let otel_layer = OpenTelemetryLayer::new(tracer);
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer)
+                .with(otel_layer)
+                .init();
+            Some(provider)
+        }
+        Err(e) => {
+            if otlp_optional {
+                // Fall back to fmt-only; warn after subscriber is set up.
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(fmt_layer)
+                    .init();
+                tracing::warn!(
+                    error = %e,
+                    "OTLP exporter init failed — continuing with fmt-only tracing (--otlp-optional is set)"
+                );
+                None
+            } else {
+                eprintln!(
+                    "error: OTLP exporter init failed: {e}\n\
+                     Hint: pass --otlp-optional to fall back to fmt-only logging."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -144,13 +246,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Tracing goes to stderr only — stdout must remain clean for MCP.
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".to_string().into()),
-        )
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .init();
+    // The otlp feature also returns the provider for graceful shutdown.
+    #[cfg(not(feature = "otlp"))]
+    init_tracing();
+    #[cfg(feature = "otlp")]
+    let _otlp_provider: Option<OtlpProvider> = None; // initialised per-command below.
 
     let cli = Cli::parse();
 
@@ -159,36 +259,62 @@ async fn main() -> anyhow::Result<()> {
             // Re-parse as "memory-mcp serve" so clap's env var resolution runs.
             let cli = Cli::parse_from(["memory-mcp", "serve"]);
             match cli.command {
-                Some(Command::Serve(args)) => run_serve(args).await?,
+                Some(Command::Serve(args)) => {
+                    #[cfg(feature = "otlp")]
+                    let _otlp_provider = init_tracing(args.otlp_optional);
+                    let result = run_serve(args).await;
+                    #[cfg(feature = "otlp")]
+                    if let Some(provider) = _otlp_provider {
+                        let _ = provider.shutdown();
+                    }
+                    result?;
+                }
                 _ => unreachable!(),
             }
         }
-        Some(Command::Serve(args)) => run_serve(args).await?,
-        Some(Command::Warmup(args)) => run_warmup(args).await?,
-        Some(Command::Auth(auth_cmd)) => match auth_cmd.action {
-            AuthAction::Login(login_args) => {
-                #[cfg(feature = "k8s")]
-                let k8s_config = if matches!(login_args.store, Some(StoreBackend::K8sSecret)) {
-                    Some(auth::K8sSecretConfig {
-                        namespace: login_args.k8s_namespace.clone(),
-                        secret_name: login_args.k8s_secret_name.clone(),
-                    })
-                } else {
-                    None
-                };
-                auth::device_flow_login(
-                    login_args.store,
+        Some(Command::Serve(args)) => {
+            #[cfg(feature = "otlp")]
+            let _otlp_provider = init_tracing(args.otlp_optional);
+            let result = run_serve(args).await;
+            #[cfg(feature = "otlp")]
+            if let Some(provider) = _otlp_provider {
+                let _ = provider.shutdown();
+            }
+            result?;
+        }
+        Some(Command::Warmup(args)) => {
+            #[cfg(feature = "otlp")]
+            init_tracing_fmt_only();
+            run_warmup(args).await?;
+        }
+        Some(Command::Auth(auth_cmd)) => {
+            #[cfg(feature = "otlp")]
+            init_tracing_fmt_only();
+            match auth_cmd.action {
+                AuthAction::Login(login_args) => {
                     #[cfg(feature = "k8s")]
-                    k8s_config,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    let k8s_config = if matches!(login_args.store, Some(StoreBackend::K8sSecret)) {
+                        Some(auth::K8sSecretConfig {
+                            namespace: login_args.k8s_namespace.clone(),
+                            secret_name: login_args.k8s_secret_name.clone(),
+                        })
+                    } else {
+                        None
+                    };
+                    auth::device_flow_login(
+                        login_args.store,
+                        #[cfg(feature = "k8s")]
+                        k8s_config,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                }
+                AuthAction::Status => {
+                    let provider = AuthProvider::default();
+                    auth::print_auth_status(&provider);
+                }
             }
-            AuthAction::Status => {
-                let provider = AuthProvider::default();
-                auth::print_auth_status(&provider);
-            }
-        },
+        }
     }
 
     Ok(())
@@ -211,7 +337,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
     let remote_url = args.remote_url.filter(|u| !u.is_empty());
 
-    // Initialise subsystems.
+    // Initialise subsystems — each called function creates its own span.
     let repo = MemoryRepo::init_or_open(&repo_path, remote_url.as_deref())
         .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 

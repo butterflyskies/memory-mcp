@@ -39,8 +39,15 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo clippy --workspace --features k8s -- -D warnings
+      - run: cargo clippy --workspace --features otlp -- -D warnings
+      - name: Verify no opentelemetry in default build
+        run: |
+          cargo tree 2>&1 | grep -i opentelemetry && \
+            { echo "ERROR: opentelemetry appeared in default build tree" >&2; exit 1; } || \
+            echo "OK: opentelemetry not present in default build"
       - run: cargo nextest run --workspace --no-fail-fast
       - run: cargo nextest run --workspace --no-fail-fast --features k8s
+      - run: cargo nextest run --workspace --no-fail-fast --features otlp
 
   # Catch cross-platform compilation failures before they reach the release pipeline.
   # Mirrors the release.yml publish-binaries matrix (minus Windows — see #42).

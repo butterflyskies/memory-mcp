@@ -156,9 +156,15 @@ impl AuthProvider {
 
     /// Resolve the token and return both the raw value and which source provided it.
     fn try_resolve_with_source() -> Result<(SecretString, TokenSource), MemoryError> {
+        let span = tracing::debug_span!("auth.resolve", token_source = tracing::field::Empty,);
+        let _enter = span.entered();
+
         // 1. Environment variable.
+        debug!("auth: trying environment variable");
         if let Ok(tok) = std::env::var(ENV_VAR) {
             if !tok.trim().is_empty() {
+                tracing::Span::current().record("token_source", "env_var");
+                info!(token_source = "env_var", "auth token resolved");
                 return Ok((
                     SecretString::from(tok.trim().to_string()),
                     TokenSource::EnvVar,
@@ -167,6 +173,7 @@ impl AuthProvider {
         }
 
         // 2. Token file.
+        debug!("auth: trying token file");
         if let Some(home) = home_dir() {
             let path = home.join(TOKEN_FILE);
             if path.exists() {
@@ -176,16 +183,23 @@ impl AuthProvider {
                 let raw = std::fs::read_to_string(&path)?;
                 let tok = raw.trim().to_string();
                 if !tok.is_empty() {
+                    tracing::Span::current().record("token_source", "file");
+                    info!(token_source = "file", "auth token resolved");
                     return Ok((SecretString::from(tok), TokenSource::File));
                 }
             }
         }
 
         // 3. System keyring (GNOME Keyring / KWallet / macOS Keychain).
+        debug!("auth: trying system keyring");
         match keyring::Entry::new("memory-mcp", "github-token") {
             Ok(entry) => match entry.get_password() {
                 Ok(tok) if !tok.trim().is_empty() => {
-                    info!("resolved GitHub token from system keyring");
+                    tracing::Span::current().record("token_source", "keyring");
+                    info!(
+                        token_source = "keyring",
+                        "resolved GitHub token from system keyring"
+                    );
                     return Ok((
                         SecretString::from(tok.trim().to_string()),
                         TokenSource::Keyring,
@@ -205,6 +219,7 @@ impl AuthProvider {
             }
         }
 
+        warn!("auth token resolution failed — no token found in env var, file, or keyring");
         Err(MemoryError::Auth(
             "no token available; set MEMORY_MCP_GITHUB_TOKEN, add \
              ~/.config/memory-mcp/token, or store a token in the system keyring \
