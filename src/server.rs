@@ -23,7 +23,8 @@ fn extract_session_id(parts: &http::request::Parts) -> String {
         .and_then(|v: &http::HeaderValue| v.to_str().ok())
         .unwrap_or("unknown");
     if raw.len() > 128 {
-        format!("{}…", &raw[..128])
+        let truncated: String = raw.chars().take(128).collect();
+        format!("{truncated}…")
     } else {
         raw.to_owned()
     }

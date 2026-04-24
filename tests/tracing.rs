@@ -580,17 +580,23 @@ fn repo_init_url_is_redacted_in_logs() {
 fn auth_failure_produces_warn_event() {
     use memory_mcp::auth::AuthProvider;
 
-    // Override HOME to an empty temp directory so resolve_token cannot
-    // find ~/.config/memory-mcp/token (which may exist on dev machines).
+    // Capture real env before overriding, then restore after.
+    let real_home = std::env::var_os("HOME");
+    let saved_token = std::env::var_os("MEMORY_MCP_GITHUB_TOKEN");
     let fake_home = tempfile::tempdir().expect("tempdir for fake HOME");
     let (_, store) = with_capturing(|| {
         std::env::remove_var("MEMORY_MCP_GITHUB_TOKEN");
         std::env::set_var("HOME", fake_home.path());
         let provider = AuthProvider::new();
-        let _ = provider.resolve_token(); // no env, no file, no keyring → warn
-                                          // Restore HOME so other tests are unaffected.
-        if let Some(real_home) = dirs::home_dir() {
-            std::env::set_var("HOME", real_home);
+        let _ = provider.resolve_token();
+        // Restore env vars so other tests are unaffected.
+        match &real_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match &saved_token {
+            Some(t) => std::env::set_var("MEMORY_MCP_GITHUB_TOKEN", t),
+            None => {} // already removed above
         }
     });
     let store = store.lock().unwrap();
