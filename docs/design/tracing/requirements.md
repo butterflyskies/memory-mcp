@@ -19,6 +19,8 @@ phase: 2
 | UC-05 | Operator | Adjust trace verbosity at runtime via `RUST_LOG` without restarting the server | Normal | Should |
 | UC-06 | Developer | Add a new subsystem method and instrument it by following existing conventions | Normal | Must |
 | UC-07 | Developer | Read trace output during local development to understand request flow | Normal | Must |
+| UC-08 | Operator | Start the server when the OTLP collector is temporarily unreachable, with the server continuing to function | Normal | Must |
+| UC-09 | Operator | Have the server automatically resume exporting spans when a disconnected OTLP collector comes back | Normal | Must |
 | AC-01 | Attacker | Read trace output to extract auth tokens, memory content, or git credentials | Abuse | Must-mitigate |
 | AC-02 | Attacker | Trigger operations that produce excessive trace output to fill disk or flood a log aggregator | Abuse | Should-mitigate |
 | SC-01 | System | Redact sensitive fields (tokens, credentials, full memory content) in all trace output regardless of log level | Security | Must |
@@ -93,6 +95,15 @@ phase: 2
 | R-20 | Default log level shall produce useful output without being noisy (info-level for handler spans, debug-level for subsystem internals) | UC-05, AC-02 | V7.1 | Should |
 | R-21 | Security-relevant events (auth failures, invalid inputs, permission denials) shall be logged at `warn` or higher, not gated behind `debug` | SC-01, SC-02 | V7.2, A.8.15 | Must |
 
+### OTLP resilience
+
+| ID | Requirement | Source UC | Security Ref | Priority |
+|----|-------------|-----------|--------------|----------|
+| R-22 | When OTLP is enabled, startup failure to connect to the collector shall crash the server by default with a message indicating the `--otlp-optional` flag | UC-08 | — | Must |
+| R-23 | When `--otlp-optional` is set, OTLP init failure shall log a warning and fall back to fmt-only operation | UC-08 | — | Must |
+| R-24 | During runtime, the OTLP exporter shall buffer spans in memory, retry on export failure, and automatically resume exporting when the collector becomes reachable again | UC-09 | A.8.15 | Must |
+| R-25 | The `--otlp-optional` CLI arg shall only be compiled when the `otlp` feature is active | UC-08 | — | Must |
+
 ## Security Requirements Traceability Matrix (SRTM)
 
 | Req ID | Requirement | Source UC | Security Ref | Test Case |
@@ -118,3 +129,7 @@ phase: 2
 | R-19 | RUST_LOG per-module control | UC-05 | V7.1 | TC-19: per-module filtering works (existing EnvFilter) |
 | R-20 | Appropriate default levels | UC-05, AC-02 | V7.1 | TC-20: default config — info handler spans, no debug noise |
 | R-21 | Security events at warn+ | SC-01, SC-02 | V7.2, A.8.15 | TC-21: auth failure produces warn-level event |
+| R-22 | OTLP startup failure crashes by default | UC-08 | — | TC-22: without `--otlp-optional`, unreachable collector causes exit |
+| R-23 | `--otlp-optional` enables graceful fallback | UC-08 | — | TC-23: with `--otlp-optional`, unreachable collector logs warning, server starts |
+| R-24 | Runtime OTLP resilience (buffer, retry, reconnect) | UC-09 | A.8.15 | TC-24: SDK BatchSpanProcessor handles disconnection (documented behavior) |
+| R-25 | `--otlp-optional` only with `otlp` feature | UC-08 | — | TC-25: `cargo check` without `otlp` — arg not present in CLI |
