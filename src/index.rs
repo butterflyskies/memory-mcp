@@ -202,6 +202,15 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Return the number of entries currently in the key map.
+    pub(crate) fn key_count(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+        state.key_map.len()
+    }
+
     /// Return the commit SHA stored in the index metadata (if any).
     pub fn commit_sha(&self) -> Option<String> {
         let state = self
@@ -375,6 +384,15 @@ impl ScopedIndex {
         vector: &[f32],
         qualified_name: String,
     ) -> Result<u64, MemoryError> {
+        let dimensions = vector.len();
+        let _span = tracing::debug_span!(
+            "index.add",
+            scope = %scope.dir_prefix(),
+            dimensions,
+            key_count = tracing::field::Empty,
+        )
+        .entered();
+
         // Write lock serialises the full find→insert→remove composite so
         // concurrent upserts for the same name cannot interleave. Reads
         // (via `search`) use a read lock and are not blocked by other reads.
@@ -417,6 +435,9 @@ impl ScopedIndex {
             let _ = self.all.remove(key);
         }
 
+        // Record key_count (all-index size) after insertion.
+        tracing::Span::current().record("key_count", self.all.key_count());
+
         Ok(all_key)
     }
 
@@ -426,6 +447,12 @@ impl ScopedIndex {
     /// Both removals are best-effort: an error in one does not prevent the
     /// other from running. Returns `Ok(())` regardless of individual failures.
     pub fn remove(&self, scope: &Scope, qualified_name: &str) -> Result<(), MemoryError> {
+        let _span = tracing::debug_span!(
+            "index.remove",
+            scope = %scope.dir_prefix(),
+        )
+        .entered();
+
         // Write lock serialises with concurrent adds for the same name.
         let scopes = self.scopes.write().expect("scopes lock poisoned");
 
@@ -470,7 +497,21 @@ impl ScopedIndex {
         query: &[f32],
         limit: usize,
     ) -> Result<Vec<(u64, String, f32)>, MemoryError> {
-        match filter {
+        let dimensions = query.len();
+        let scope_str = match filter {
+            ScopeFilter::GlobalOnly => "global".to_owned(),
+            ScopeFilter::All => "all".to_owned(),
+            ScopeFilter::ProjectAndGlobal(p) => format!("project+global:{p}"),
+        };
+        let span = tracing::debug_span!(
+            "index.search",
+            scope = %scope_str,
+            dimensions,
+            count = tracing::field::Empty,
+        );
+        let _enter = span.entered();
+
+        let results = match filter {
             ScopeFilter::All => self.all.search(query, limit),
 
             ScopeFilter::GlobalOnly => {
@@ -505,7 +546,11 @@ impl ScopedIndex {
                 combined.truncate(limit);
                 Ok(combined)
             }
+        };
+        if let Ok(ref r) = results {
+            tracing::Span::current().record("count", r.len());
         }
+        results
     }
 
     /// Find the key for a given qualified name in the **all-index** (not scope-specific).
@@ -538,6 +583,9 @@ impl ScopedIndex {
     ///   projects/foo/index.usearch
     /// ```
     pub fn save(&self, dir: &Path) -> Result<(), MemoryError> {
+        let _span =
+            tracing::debug_span!("index.save", key_count = tracing::field::Empty,).entered();
+
         std::fs::create_dir_all(dir)?;
 
         // Write a dirty marker — if we crash mid-save, the next load will see
@@ -558,6 +606,10 @@ impl ScopedIndex {
             idx.save(&scope_dir.join("index.usearch"))?;
         }
 
+        // Record total key count (all-index is authoritative — it holds every entry).
+        let key_count = self.all.key_count();
+        tracing::Span::current().record("key_count", key_count);
+
         // Remove marker — save completed successfully.
         let _ = std::fs::remove_file(&marker);
 
@@ -569,6 +621,9 @@ impl ScopedIndex {
     /// Missing subdirectories are treated as empty — those scopes will be
     /// rebuilt incrementally on next use.
     pub fn load(dir: &Path, dimensions: usize) -> Result<Self, MemoryError> {
+        let span = tracing::info_span!("index.load", key_count = tracing::field::Empty,);
+        let _enter = span.entered();
+
         // If a previous save was interrupted, the on-disk state may be
         // inconsistent (some indexes from current state, others from prior).
         // Rather than loading mixed data, start fresh — indexes are a cache
@@ -632,6 +687,9 @@ impl ScopedIndex {
                 }
             }
         }
+
+        let key_count = all.key_count();
+        tracing::Span::current().record("key_count", key_count);
 
         Ok(Self {
             scopes: RwLock::new(scopes),

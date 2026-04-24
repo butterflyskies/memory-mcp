@@ -4,7 +4,7 @@ use std::{
 };
 
 use git2::{build::CheckoutBuilder, ErrorCode, MergeOptions, Repository, Signature};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -122,6 +122,8 @@ impl MemoryRepo {
     /// If `remote_url` is provided, ensures an `origin` remote exists pointing
     /// at that URL (creating or updating it as necessary).
     pub fn init_or_open(path: &Path, remote_url: Option<&str>) -> Result<Self, MemoryError> {
+        let _span = tracing::info_span!("repo.init").entered();
+
         let repo = if path.join(".git").exists() {
             Repository::open(path)?
         } else {
@@ -200,7 +202,13 @@ impl MemoryRepo {
 
         let arc = Arc::clone(self);
         let memory = memory.clone();
+        let name = memory.name.clone();
+
+        // Capture span before entering spawn_blocking so the child thread can record oid.
+        let span = tracing::debug_span!("repo.save", name = %name, oid = tracing::field::Empty);
+
         tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+            let _enter = span.entered();
             let repo = arc
                 .inner
                 .lock()
@@ -219,6 +227,15 @@ impl MemoryRepo {
                 &file_path,
                 &format!("chore: save memory '{}'", memory.name),
             )?;
+
+            // Record the new HEAD OID after commit.
+            if let Ok(head) = repo.head() {
+                if let Ok(commit) = head.peel_to_commit() {
+                    tracing::Span::current().record("oid", commit.id().to_string().as_str());
+                    debug!(oid = %commit.id(), "memory saved to repo");
+                }
+            }
+
             Ok(())
         })
         .await
@@ -242,7 +259,9 @@ impl MemoryRepo {
         let arc = Arc::clone(self);
         let name = name.to_string();
         let file_path_clone = file_path.clone();
+        let span = tracing::debug_span!("repo.delete", name = %name);
         tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+            let _enter = span.entered();
             let repo = arc
                 .inner
                 .lock()
@@ -314,7 +333,9 @@ impl MemoryRepo {
 
         let arc = Arc::clone(self);
         let name = name.to_string();
+        let span = tracing::debug_span!("repo.read", name = %name);
         tokio::task::spawn_blocking(move || -> Result<Memory, MemoryError> {
+            let _enter = span.entered();
             // Check existence/symlink status before opening.
             match std::fs::symlink_metadata(&file_path) {
                 Err(_) => return Err(MemoryError::NotFound { name }),
@@ -342,8 +363,10 @@ impl MemoryRepo {
     ) -> Result<Vec<Memory>, MemoryError> {
         let root = self.root.clone();
         let scope_clone = scope.cloned();
+        let span = tracing::debug_span!("repo.list", file_count = tracing::field::Empty,);
 
         tokio::task::spawn_blocking(move || -> Result<Vec<Memory>, MemoryError> {
+            let _enter = span.entered();
             let dirs: Vec<PathBuf> = match scope_clone.as_ref() {
                 Some(s) => vec![root.join(s.dir_prefix())],
                 None => {
@@ -402,6 +425,8 @@ impl MemoryRepo {
                 collect_md_files(&dir, &mut memories)?;
             }
 
+            tracing::Span::current().record("file_count", memories.len());
+
             Ok(memories)
         })
         .await
@@ -423,8 +448,10 @@ impl MemoryRepo {
         let token_result = auth.resolve_token();
         let arc = Arc::clone(self);
         let branch = branch.to_string();
+        let span = tracing::debug_span!("repo.push", branch = %branch);
 
         tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+            let _enter = span.entered();
             let repo = arc
                 .inner
                 .lock()
@@ -565,8 +592,10 @@ impl MemoryRepo {
         let token_result = auth.resolve_token();
         let arc = Arc::clone(self);
         let branch = branch.to_string();
+        let span = tracing::debug_span!("repo.pull", branch = %branch);
 
         tokio::task::spawn_blocking(move || -> Result<PullResult, MemoryError> {
+            let _enter = span.entered();
             let repo = arc
                 .inner
                 .lock()

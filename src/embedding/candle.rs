@@ -82,7 +82,20 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
         let arc = Arc::clone(&self.inner);
         let texts = texts.to_vec();
+        let batch_size = texts.len();
+        let dim = self.dim;
+
+        // Capture current span before entering spawn_blocking so the
+        // child thread can enter it and keep the span hierarchy intact.
+        let span = tracing::debug_span!(
+            "embedding.embed",
+            batch_size,
+            dimensions = dim,
+            model = MODEL_ID,
+        );
+
         tokio::task::spawn_blocking(move || {
+            let _enter = span.enter();
             let guard = arc.lock().unwrap_or_else(|poisoned| {
                 tracing::warn!("embedding mutex was poisoned — clearing poison and continuing");
                 poisoned.into_inner()
@@ -122,6 +135,8 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
 /// Use the `warmup` subcommand or a k8s init container to pre-populate the
 /// cache and avoid blocking the first server startup.
 fn load_model_files() -> anyhow::Result<(BertConfig, Tokenizer, PathBuf)> {
+    let _span = tracing::info_span!("embedding.load_model", model = MODEL_ID).entered();
+
     let cache = Cache::from_env();
     let hf_repo = Repo::new(MODEL_ID.to_string(), RepoType::Model);
 
@@ -172,6 +187,8 @@ const MAX_BATCH_SIZE: usize = 64;
 /// Splits the input into chunks of at most [`MAX_BATCH_SIZE`] texts and runs
 /// each chunk through [`embed_chunk`], concatenating the results.
 fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
+    let _span = tracing::debug_span!("embedding.embed_batch", batch_size = texts.len()).entered();
+
     if texts.is_empty() {
         return Ok(Vec::new());
     }
@@ -191,6 +208,7 @@ fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, M
 /// CLS pooling extracts the first token's hidden state, which is then
 /// L2-normalised to produce unit vectors.
 fn embed_chunk(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
+    let _span = tracing::debug_span!("embedding.embed_chunk", chunk_size = texts.len()).entered();
     debug_assert!(!texts.is_empty(), "embed_chunk called with empty texts");
 
     let encodings = inner

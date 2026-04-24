@@ -6,11 +6,29 @@ const SNIPPET_MAX_CHARS: usize = 500;
 
 use chrono::Utc;
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
     model::{ErrorData, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, ServerHandler,
 };
 use tracing::{info, warn, Instrument};
+
+/// Extract the `Mcp-Session-Id` header from HTTP request parts.
+///
+/// Returns `"unknown"` if the header is absent or not valid UTF-8.
+/// Truncates to 128 chars to bound span field size from untrusted input.
+fn extract_session_id(parts: &http::request::Parts) -> String {
+    let raw = parts
+        .headers
+        .get("mcp-session-id")
+        .and_then(|v: &http::HeaderValue| v.to_str().ok())
+        .unwrap_or("unknown");
+    if raw.len() > 128 {
+        let truncated: String = raw.chars().take(128).collect();
+        format!("{truncated}…")
+    } else {
+        raw.to_owned()
+    }
+}
 
 use crate::{
     embedding::EmbeddingBackend,
@@ -208,6 +226,7 @@ impl MemoryServer {
     async fn remember(
         &self,
         Parameters(args): Parameters<RememberArgs>,
+        Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
         if args.content.len() > MAX_CONTENT_SIZE {
@@ -219,10 +238,14 @@ impl MemoryServer {
                 ),
             }));
         }
+        let session_id = extract_session_id(&parts);
+        let content_size = args.content.len();
         let span = tracing::info_span!(
-            "remember",
+            "handler.remember",
+            session_id = %session_id,
             name = %args.name,
             scope = ?args.scope,
+            content_size,
         );
         let state = Arc::clone(&self.state);
         async move {
@@ -283,12 +306,19 @@ impl MemoryServer {
         Scope: pass 'project:<basename-of-your-cwd>' to search your current project + global memories, \
         'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
-    async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> Result<String, ErrorData> {
+    async fn recall(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
+        let session_id = extract_session_id(&parts);
+        // Note: query text is intentionally omitted from the span (R-17 privacy decision).
         let span = tracing::info_span!(
-            "recall",
-            query = %args.query,
+            "handler.recall",
+            session_id = %session_id,
             scope = ?args.scope,
             limit = ?args.limit,
+            count = tracing::field::Empty,
         );
         let state = Arc::clone(&self.state);
         async move {
@@ -368,14 +398,13 @@ impl MemoryServer {
                 }));
             }
 
-            info!(
-                returned = results_vec.len(),
-                skipped_errors, "recall complete"
-            );
+            let count = results_vec.len();
+            tracing::Span::current().record("count", count);
+            info!(returned = count, skipped_errors, "recall complete");
 
             Ok(serde_json::json!({
                 "results": results_vec,
-                "count": results_vec.len(),
+                "count": count,
                 "limit": limit,
                 "pre_filter_count": pre_filter_count,
                 "skipped_errors": skipped_errors,
@@ -398,10 +427,16 @@ impl MemoryServer {
         memories or omit for global. Removes the file from git and the vector from the search index. \
         Returns 'ok' on success."
     )]
-    async fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> Result<String, ErrorData> {
+    async fn forget(
+        &self,
+        Parameters(args): Parameters<ForgetArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
+        let session_id = extract_session_id(&parts);
         let span = tracing::info_span!(
-            "forget",
+            "handler.forget",
+            session_id = %session_id,
             name = %args.name,
             scope = ?args.scope,
         );
@@ -452,7 +487,11 @@ impl MemoryServer {
         IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets — \
         memories are plaintext files in a git repo and may be synced to a remote."
     )]
-    async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> Result<String, ErrorData> {
+    async fn edit(
+        &self,
+        Parameters(args): Parameters<EditArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
         if let Some(ref content) = args.content {
             if content.len() > MAX_CONTENT_SIZE {
@@ -465,10 +504,14 @@ impl MemoryServer {
                 }));
             }
         }
+        let session_id = extract_session_id(&parts);
+        let content_size = args.content.as_ref().map(|c| c.len()).unwrap_or(0);
         let span = tracing::info_span!(
-            "edit",
+            "handler.edit",
+            session_id = %session_id,
             name = %args.name,
             scope = ?args.scope,
+            content_size,
         );
         let state = Arc::clone(&self.state);
         async move {
@@ -549,8 +592,18 @@ impl MemoryServer {
         'global' for global-only, or 'all' for everything. Omitting scope defaults to global-only. \
         Returns a JSON array of memory summaries without full content."
     )]
-    async fn list(&self, Parameters(args): Parameters<ListArgs>) -> Result<String, ErrorData> {
-        let span = tracing::info_span!("list", scope = ?args.scope);
+    async fn list(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
+        let session_id = extract_session_id(&parts);
+        let span = tracing::info_span!(
+            "handler.list",
+            session_id = %session_id,
+            scope = ?args.scope,
+            count = tracing::field::Empty,
+        );
         let state = Arc::clone(&self.state);
         async move {
             let scope_filter =
@@ -584,11 +637,9 @@ impl MemoryServer {
                     global
                 }
             };
-            info!(
-                ms = start.elapsed().as_millis(),
-                count = memories.len(),
-                "listed memories"
-            );
+            let count = memories.len();
+            tracing::Span::current().record("count", count);
+            info!(ms = start.elapsed().as_millis(), count, "listed memories");
 
             let summaries: Vec<serde_json::Value> = memories
                 .into_iter()
@@ -606,7 +657,7 @@ impl MemoryServer {
 
             Ok(serde_json::json!({
                 "memories": summaries,
-                "count": summaries.len(),
+                "count": count,
             })
             .to_string())
         }
@@ -624,9 +675,19 @@ impl MemoryServer {
         project-scoped memories or omit for global. Returns the full markdown content and metadata \
         (id, scope, tags, timestamps) as a JSON object."
     )]
-    async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> Result<String, ErrorData> {
+    async fn read(
+        &self,
+        Parameters(args): Parameters<ReadArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
-        let span = tracing::info_span!("read", name = %args.name, scope = ?args.scope);
+        let session_id = extract_session_id(&parts);
+        let span = tracing::info_span!(
+            "handler.read",
+            session_id = %session_id,
+            name = %args.name,
+            scope = ?args.scope,
+        );
         let state = Arc::clone(&self.state);
         async move {
             let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
@@ -671,9 +732,18 @@ impl MemoryServer {
         description = "Sync the memory repo with the git remote (push/pull). Requires \
         MEMORY_MCP_GITHUB_TOKEN or a token file. Returns a status message."
     )]
-    async fn sync(&self, Parameters(args): Parameters<SyncArgs>) -> Result<String, ErrorData> {
+    async fn sync(
+        &self,
+        Parameters(args): Parameters<SyncArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
         let pull_first = args.pull_first.unwrap_or(true);
-        let span = tracing::info_span!("sync", pull_first);
+        let session_id = extract_session_id(&parts);
+        let span = tracing::info_span!(
+            "handler.sync",
+            session_id = %session_id,
+            pull_first,
+        );
         let state = Arc::clone(&self.state);
         async move {
             let start = Instant::now();
@@ -730,6 +800,7 @@ impl MemoryServer {
                             &state.index,
                             &changes,
                         )
+                        .instrument(tracing::info_span!("server.incremental_reindex"))
                         .await;
                         info!(
                             added = stats.added,
