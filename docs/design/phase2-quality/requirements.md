@@ -85,6 +85,8 @@ Issues: #94, #145, #146, #164
 | R-19 | `/readyz` health checks shall be lightweight — status queries only, no embedding generation, no index scans | AC-02, SC-02 | V13.4 | TC-19 (pending) |
 | R-20 | `/readyz` failures shall be logged at warn level with subsystem detail via the existing tracing infrastructure | UC-06 | V7.1, A.8.15 | TC-20 (pending) |
 | R-21 | Remote sync unavailability shall not affect readiness by default; an opt-in flag (e.g., `--require-remote-sync`) shall make remote reachability a readiness condition | UC-05, UC-07 | V14.2 | TC-21 (pending) |
+| R-22 | `/readyz` shall be protected against sustained flooding — either via an in-process rate limiter or documented operator responsibility for network-level rate limiting | AC-02 | V13.4 | TC-22 (pending) |
+| R-23 | When `--require-remote-sync` is enabled, the remote reachability check shall cache its result with a short TTL (5–30 seconds) rather than making a fresh outbound call per request | AC-02 | V13.4 | TC-23 (pending) |
 
 ## ASVS & ISO 27001 Review
 
