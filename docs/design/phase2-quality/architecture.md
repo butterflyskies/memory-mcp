@@ -27,14 +27,16 @@ Implementations:
 - **`InMemoryStore`** — `HashMap`-based, for fast deterministic tests at the trait
   level.
 
-### 2. OAuthDeviceFlowProvider trait (RFC 8628)
+### 2. `auth::oauth::DeviceFlowProvider` trait (RFC 8628)
 
-The hardcoded GitHub OAuth constants become a trait covering the RFC 8628 device
-authorization grant specifically. See [ADR-0024](../../../docs/adr/0024-oauth-device-flow-provider-trait.md)
+The hardcoded GitHub OAuth constants move into a new `auth::oauth` module with a
+trait covering the RFC 8628 device authorization grant. The module namespace
+provides the OAuth context, so the trait name doesn't need an `OAuth` prefix.
+See [ADR-0024](../../adr/0024-oauth-device-flow-provider-trait.md)
 for the full analysis of why this is scoped to device flow, not all OAuth.
 
-`device_flow_login()` takes `&dyn OAuthDeviceFlowProvider` instead of importing
-constants directly.
+`device_flow_login()` moves into `auth::oauth` and takes `&dyn DeviceFlowProvider`
+instead of importing constants directly.
 
 Implementations:
 - **`GitHubDeviceFlow`** — zero-sized struct, compile-time constants.
@@ -95,7 +97,7 @@ graph TB
 
 Internal structure after the Phase 2 refactor, wired through `AppState`. Three
 trait-abstracted subsystems: `EmbeddingBackend` (existing), `VectorStore` (new),
-and `OAuthDeviceFlowProvider` (new). The `/readyz` endpoint reaches into all three
+and `DeviceFlowProvider` (new). The `/readyz` endpoint reaches into all three
 subsystems to assert readiness. The private `RawIndex` trait inside `UsearchStore`
 is shown separately — it exists only for failure injection testing.
 
@@ -141,7 +143,7 @@ graph TB
 
     subgraph AuthSub["Auth Subsystem"]
         AP["AuthProvider<br/>env var → keyring → token file"]
-        DFP["«trait» OAuthDeviceFlowProvider<br/>client_id / device_code_url<br/>access_token_url / scopes / validate"]
+        DFP["«trait» DeviceFlowProvider<br/>client_id / device_code_url<br/>access_token_url / scopes / validate"]
         GDF["GitHubDeviceFlow<br/>(zero-sized, constants)"]
         MDF["MockDeviceFlow<br/>(test server)"]
     end
@@ -284,7 +286,7 @@ sequenceDiagram
 
 ### Sequence: Device Flow Login
 
-The `OAuthDeviceFlowProvider` abstraction insulates login orchestration from
+The `DeviceFlowProvider` abstraction insulates login orchestration from
 hardcoded constants. `GitHubDeviceFlow` supplies all endpoint URLs and scopes.
 `MockDeviceFlow` can substitute in integration tests by pointing at a local test
 server without any change to the flow driver.
@@ -293,13 +295,13 @@ server without any change to the flow driver.
 sequenceDiagram
     actor CLI as CLI / Operator
     participant Login as device_flow_login()
-    participant DFP as «trait» OAuthDeviceFlowProvider
+    participant DFP as «trait» DeviceFlowProvider
     participant GDF as GitHubDeviceFlow
     participant GHDevice as OAuth device_code endpoint
     participant GHToken as OAuth access_token endpoint
     participant AP as AuthProvider
 
-    CLI->>Login: login(provider: &dyn OAuthDeviceFlowProvider)
+    CLI->>Login: login(provider: &dyn DeviceFlowProvider)
 
     Note over Login,GDF: Provider abstraction: config injection
     Login->>DFP: validate()

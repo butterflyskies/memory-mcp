@@ -1,4 +1,4 @@
-# ADR-0024: OAuthDeviceFlowProvider trait for multi-provider device flow auth
+# ADR-0024: `auth::oauth::DeviceFlowProvider` trait for multi-provider device flow auth
 
 ## Status
 Proposed
@@ -22,20 +22,23 @@ We considered three abstraction levels:
   (`device_code_url`, `access_token_url`) are specific to the device flow grant
   type. Providers that only support authorization code flow or API keys wouldn't
   fit this shape, and the name would imply generality the trait doesn't have.
-- **`OAuthDeviceFlowProvider`** (RFC 8628 trait): chosen because it accurately
-  describes the scope — any provider implementing RFC 8628 device authorization
-  grant can implement this trait. GitHub and GitLab both qualify.
+- **`auth::oauth::DeviceFlowProvider`** (RFC 8628 trait): chosen because it
+  accurately describes the scope — any provider implementing RFC 8628 device
+  authorization grant can implement this trait. GitHub and GitLab both qualify.
+  The `auth::oauth` module namespace provides the OAuth context, so the trait
+  name itself doesn't need the `OAuth` prefix.
 - **`AuthFlow`** (high-level auth strategy trait): deferred. If a future provider
   needs a fundamentally different grant type, the right move is a higher-level
-  trait where `OAuthDeviceFlowProvider` becomes one implementation strategy.
+  trait where `DeviceFlowProvider` becomes one implementation strategy.
   This refactor is mechanical when there's a real second flow to design against.
 
 ## Decision
-Define an `OAuthDeviceFlowProvider` trait covering the RFC 8628 device
-authorization grant:
+Introduce an `auth::oauth` module with a `DeviceFlowProvider` trait covering
+the RFC 8628 device authorization grant:
 
 ```rust
-trait OAuthDeviceFlowProvider: Send + Sync {
+// src/auth/oauth/mod.rs
+trait DeviceFlowProvider: Send + Sync {
     fn client_id(&self) -> &str;
     fn device_code_url(&self) -> &str;
     fn access_token_url(&self) -> &str;
@@ -44,14 +47,35 @@ trait OAuthDeviceFlowProvider: Send + Sync {
 }
 ```
 
-`device_flow_login()` takes `&dyn OAuthDeviceFlowProvider` instead of importing
+Module structure:
+
+```
+auth/
+  oauth/
+    mod.rs        — DeviceFlowProvider trait, device_flow_login()
+    github.rs     — GitHubDeviceFlow (zero-sized, compile-time constants)
+  mod.rs          — AuthProvider, token resolution, store backends
+```
+
+`device_flow_login()` takes `&dyn DeviceFlowProvider` instead of importing
 constants directly. The current constants become the `GitHubDeviceFlow`
-implementation (zero-sized struct). A `MockDeviceFlow` implementation points at
-an in-process test server for integration tests.
+implementation. A `MockDeviceFlow` implementation points at an in-process test
+server for integration tests.
 
 Each provider validates its own parameters (`validate()`) — GitHub checks its
 `Iv1.` client ID format, GitLab would check its own. Endpoint URLs must use
 HTTPS (except localhost for testing).
+
+Future auth strategies that aren't OAuth device flow (authorization code,
+API keys) would be sibling modules under `auth/`, not forced into the
+`auth::oauth` module:
+
+```
+auth/
+  oauth/          — DeviceFlowProvider, AuthCodeProvider (future)
+  api_key/        — ApiKeyProvider (future, non-OAuth)
+  mod.rs          — AuthProvider
+```
 
 ## Consequences
 - `device_flow_login()` becomes testable against a mock OAuth server
@@ -60,7 +84,7 @@ HTTPS (except localhost for testing).
 - The `DeviceCodeResponse` and `AccessTokenResponse` structs remain shared —
   RFC 8628 standardises the response format across providers
 - If a non-device-flow provider is needed later, introduce a higher-level
-  `AuthFlow` trait — `OAuthDeviceFlowProvider` becomes one strategy, alongside
-  `AuthCodeProvider` or `ApiKeyProvider`
+  `AuthFlow` trait — `DeviceFlowProvider` becomes one strategy, alongside
+  `AuthCodeProvider` or `ApiKeyProvider`, each in their own module under `auth/`
 - Supersedes the hardcoded constants from ADR-0012 but does not invalidate
   ADR-0012's other decisions (keyring storage, stdout backend, etc.)

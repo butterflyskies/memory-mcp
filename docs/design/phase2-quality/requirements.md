@@ -61,7 +61,7 @@ Issues: #94, #145, #146, #164
 
 | Req ID | Requirement | Source UC | Security Ref | Test Case |
 |--------|-------------|-----------|--------------|-----------|
-| R-08 | OAuth device flow parameters (client ID, device code URL, access token URL, scopes) shall be sourced from a `OAuthDeviceFlowProvider` trait, with GitHub as the default implementation | UC-08, UC-13, AC-03 | V14.2 | TC-08 (pending) |
+| R-08 | OAuth device flow parameters (client ID, device code URL, access token URL, scopes) shall be sourced from a `DeviceFlowProvider` trait, with GitHub as the default implementation | UC-08, UC-13, AC-03 | V14.2 | TC-08 (pending) |
 | R-09 | Each provider implementation shall validate its own parameters before use in the auth flow (e.g., client ID format, URL scheme) | AC-03 | V5.1, V14.3 | TC-09 (pending) |
 | R-10 | OAuth device flow endpoint URLs shall only permit HTTPS scheme (except localhost for development/testing) | AC-03 | V5.1, V14.3 | TC-10 (pending) |
 
@@ -119,14 +119,16 @@ Issues: #94, #145, #146, #164
 
 ## Design Notes
 
-- **Provider abstraction scope:** The `OAuthDeviceFlowProvider` trait covers RFC 8628
-  device authorization grant specifically — not all OAuth grant types. This is
-  deliberate: device flow is the right choice for CLI tools, and both GitHub and
-  GitLab support it. If a future provider needs a different grant type (authorization
-  code, API keys), the path is a higher-level `AuthFlow` trait with
-  `OAuthDeviceFlowProvider` as one strategy. See [ADR-0024](../../adr/0024-oauth-device-flow-provider-trait.md)
-  for full analysis. We are implementing the GitHub provider now; GitLab and others
-  are future implementations.
+- **Provider abstraction scope:** The `auth::oauth::DeviceFlowProvider` trait
+  covers RFC 8628 device authorization grant specifically — not all OAuth grant
+  types. The `auth::oauth` module namespace provides the OAuth context, so the
+  trait name doesn't need an `OAuth` prefix. Device flow is the right choice for
+  CLI tools, and both GitHub and GitLab support it. If a future provider needs a
+  different grant type, the path is a higher-level `AuthFlow` trait with
+  `DeviceFlowProvider` as one strategy, alongside sibling modules under `auth/`.
+  See [ADR-0024](../../adr/0024-oauth-device-flow-provider-trait.md) for full
+  analysis. We are implementing the GitHub provider now; GitLab and others are
+  future implementations.
 - **R-09 validation:** GitHub OAuth client IDs follow a known format (`Iv1.` prefix +
   hex characters). GitLab uses a different format. Provider-specific validation belongs
   in each provider's implementation, not in a universal rule.
