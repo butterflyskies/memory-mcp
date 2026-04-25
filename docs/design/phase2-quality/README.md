@@ -14,9 +14,9 @@ and `/readyz` health endpoint.
 |----------|-------|--------|
 | [Problem Space](problem.md) | 1 | Approved |
 | [Requirements & SRTM](requirements.md) | 2 | Approved |
-| [Architecture](architecture.md) | 3 | Draft |
-| [Threat Model](threat-model.md) | 4 (lightweight) | Draft |
-| [Test Plan](test-plan.md) | 5 | Draft |
+| [Architecture](architecture.md) | 3 | Approved |
+| [Threat Model](threat-model.md) | 4 (lightweight) | Approved |
+| [Test Plan](test-plan.md) | 5 | Approved |
 
 ## Related
 

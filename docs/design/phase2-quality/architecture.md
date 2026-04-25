@@ -1,5 +1,5 @@
 <!-- design-meta
-status: draft
+status: approved
 last-updated: 2026-04-25
 phase: 3
 -->
