@@ -49,44 +49,44 @@ Issues: #94, #145, #146, #164
 
 | Req ID | Requirement | Source UC | Security Ref | Test Case |
 |--------|-------------|-----------|--------------|-----------|
-| R-01 | System shall define a public `VectorStore` trait with operations: add (name, scope, vector), remove (name, scope), search (query, scope filter, limit), save, load, health check | UC-01, UC-02, UC-03 | V1.1 | TC-01 (pending) |
-| R-02 | The usearch-backed implementation shall preserve all existing behavior — add, remove, search, scoped retrieval, save/load round-trip, upsert semantics | UC-01, UC-02, UC-03 | — | TC-02 (pending) |
-| R-03 | The usearch implementation shall use a private internal trait for raw index operations to allow failure injection | UC-11 | V1.1 | TC-03 (pending) |
-| R-04 | When the all-index insert fails after a scope-index insert succeeds, the scope insert shall be rolled back, restoring the index to its pre-call state | UC-04, UC-11 | V7.1 | TC-04 (pending) |
-| R-05 | Errors from the vector storage trait shall propagate as typed errors without exposing backend-specific details to callers | UC-04 | V7.2, A.8.11 | TC-05 (pending) |
-| R-06 | The `VectorStore` trait shall include a readiness method that reports whether the backend can serve queries | UC-05, UC-12 | V13.1 | TC-06 (pending) |
-| R-07 | Consumer code (server, MCP handlers) shall program against the `VectorStore` trait, not concrete usearch types | UC-03 | V1.1 | TC-07 (pending) |
+| R-01 | System shall define a public `VectorStore` trait with operations: add (name, scope, vector), remove (name, scope), search (query, scope filter, limit), save, load, health check | UC-01, UC-02, UC-03 | V1.1 | TC-01 |
+| R-02 | The usearch-backed implementation shall preserve all existing behavior — add, remove, search, scoped retrieval, save/load round-trip, upsert semantics | UC-01, UC-02, UC-03 | — | TC-02a–e |
+| R-03 | The usearch implementation shall use a private internal trait for raw index operations to allow failure injection | UC-11 | V1.1 | TC-03 |
+| R-04 | When the all-index insert fails after a scope-index insert succeeds, the scope insert shall be rolled back, restoring the index to its pre-call state | UC-04, UC-11 | V7.1 | TC-04a–b |
+| R-05 | Errors from the vector storage trait shall propagate as typed errors without exposing backend-specific details to callers | UC-04 | V7.2, A.8.11 | TC-05a–c |
+| R-06 | The `VectorStore` trait shall include a readiness method that reports whether the backend can serve queries | UC-05, UC-12 | V13.1 | TC-06a–b |
+| R-07 | Consumer code (server, MCP handlers) shall program against the `VectorStore` trait, not concrete usearch types | UC-03 | V1.1 | TC-07 |
 
 ### OAuth device flow provider abstraction (#145)
 
 | Req ID | Requirement | Source UC | Security Ref | Test Case |
 |--------|-------------|-----------|--------------|-----------|
-| R-08 | OAuth device flow parameters (client ID, device code URL, access token URL, scopes) shall be sourced from a `DeviceFlowProvider` trait, with GitHub as the default implementation | UC-08, UC-13, AC-03 | V14.2 | TC-08 (pending) |
-| R-09 | Each provider implementation shall validate its own parameters before use in the auth flow (e.g., client ID format, URL scheme) | AC-03 | V5.1, V14.3 | TC-09 (pending) |
-| R-10 | OAuth device flow endpoint URLs shall only permit HTTPS scheme (except localhost for development/testing) | AC-03 | V5.1, V14.3 | TC-10 (pending) |
+| R-08 | OAuth device flow parameters (client ID, device code URL, access token URL, scopes) shall be sourced from a `DeviceFlowProvider` trait, with GitHub as the default implementation | UC-08, UC-13, AC-03 | V14.2 | TC-08a–b |
+| R-09 | Each provider implementation shall validate its own parameters before use in the auth flow (e.g., client ID format, URL scheme) | AC-03 | V5.1, V14.3 | TC-09a–c |
+| R-10 | OAuth device flow endpoint URLs shall only permit HTTPS scheme (except localhost for development/testing) | AC-03 | V5.1, V14.3 | TC-10a–c |
 
 ### Integration tests (#146)
 
 | Req ID | Requirement | Source UC | Security Ref | Test Case |
 |--------|-------------|-----------|--------------|-----------|
-| R-11 | Integration tests shall exercise `auth login` against a mock OAuth server that implements the device flow protocol | UC-08 | — | TC-11 (pending) |
-| R-12 | Integration tests shall verify `auth status` reports correct token source and provenance | UC-09 | — | TC-12 (pending) |
-| R-13 | Integration tests shall verify the server binds to the address specified by `MEMORY_MCP_BIND` | UC-10 | — | TC-13 (pending) |
-| R-14 | Integration tests shall run in CI without real OAuth credentials from any provider | UC-08, UC-11 | — | TC-14 (pending) |
+| R-11 | Integration tests shall exercise `auth login` against a mock OAuth server that implements the device flow protocol | UC-08 | — | TC-11a–c |
+| R-12 | Integration tests shall verify `auth status` reports correct token source and provenance | UC-09 | — | TC-12a–b |
+| R-13 | Integration tests shall verify the server binds to the address specified by `MEMORY_MCP_BIND` | UC-10 | — | TC-13 |
+| R-14 | Integration tests shall run in CI without real OAuth credentials from any provider | UC-08, UC-11 | — | TC-14 |
 
 ### Health endpoint (#164)
 
 | Req ID | Requirement | Source UC | Security Ref | Test Case |
 |--------|-------------|-----------|--------------|-----------|
-| R-15 | `/readyz` shall return 200 with a JSON body when all subsystems are healthy | UC-05, UC-07 | V13.1 | TC-15 (pending) |
-| R-16 | `/readyz` shall return 503 with a JSON body identifying which subsystem(s) failed when any check fails | UC-06, UC-07 | V13.1, A.8.16 | TC-16 (pending) |
-| R-17 | `/readyz` shall check: git repo accessible and valid (must work for empty repos with no commits), embedding-index dimensional consistency (`embedding.dimensions() == index.dimensions()`), vector index ready (via trait readiness method) | UC-05, UC-06 | A.8.16 | TC-17 (pending) |
-| R-18 | `/readyz` response shall not include internal file paths, version strings, error stack traces, or backend-specific details | AC-01, SC-01 | V7.4, A.8.11 | TC-18 (pending) |
-| R-19 | `/readyz` health checks shall be lightweight — status queries only, no embedding generation, no index scans | AC-02, SC-02 | V13.4 | TC-19 (pending) |
-| R-20 | `/readyz` failures shall be logged at warn level with subsystem detail via the existing tracing infrastructure | UC-06 | V7.1, A.8.15 | TC-20 (pending) |
-| R-21 | Remote sync unavailability shall not affect readiness by default; an opt-in flag (e.g., `--require-remote-sync`) shall make remote reachability a readiness condition | UC-05, UC-07 | V14.2 | TC-21 (pending) |
-| R-22 | `/readyz` shall be protected against sustained flooding — either via an in-process rate limiter or documented operator responsibility for network-level rate limiting | AC-02 | V13.4 | TC-22 (pending) |
-| R-23 | When `--require-remote-sync` is enabled, the remote reachability check shall cache its result with a short TTL (5–30 seconds) rather than making a fresh outbound call per request | AC-02 | V13.4 | TC-23 (pending) |
+| R-15 | `/readyz` shall return 200 with a JSON body when all subsystems are healthy | UC-05, UC-07 | V13.1 | TC-15 |
+| R-16 | `/readyz` shall return 503 with a JSON body identifying which subsystem(s) failed when any check fails | UC-06, UC-07 | V13.1, A.8.16 | TC-16a–c |
+| R-17 | `/readyz` shall check: git repo accessible and valid (must work for empty repos with no commits), embedding-index dimensional consistency (`embedding.dimensions() == index.dimensions()`), vector index ready (via trait readiness method) | UC-05, UC-06 | A.8.16 | TC-17a–c |
+| R-18 | `/readyz` response shall not include internal file paths, version strings, error stack traces, or backend-specific details | AC-01, SC-01 | V7.4, A.8.11 | TC-18a–b |
+| R-19 | `/readyz` health checks shall be lightweight — status queries only, no embedding generation, no index scans | AC-02, SC-02 | V13.4 | TC-19 |
+| R-20 | `/readyz` failures shall be logged at warn level with subsystem detail via the existing tracing infrastructure | UC-06 | V7.1, A.8.15 | TC-20 |
+| R-21 | Remote sync unavailability shall not affect readiness by default; an opt-in flag (e.g., `--require-remote-sync`) shall make remote reachability a readiness condition | UC-05, UC-07 | V14.2 | TC-21a–b |
+| R-22 | `/readyz` shall be protected against sustained flooding — either via an in-process rate limiter or documented operator responsibility for network-level rate limiting | AC-02 | V13.4 | TC-22 |
+| R-23 | When `--require-remote-sync` is enabled, the remote reachability check shall cache its result with a short TTL (5–30 seconds) rather than making a fresh outbound call per request | AC-02 | V13.4 | TC-23 |
 
 ## ASVS & ISO 27001 Review
 
