@@ -113,8 +113,10 @@ Add to `~/.claude.json` (or your project-local `.mcp.json`):
   count — plan for 512MB request, 1Gi limit as a starting point.
 - **CPU**: Embedding computation is CPU-bound. Single-query latency is
   ~50ms on modern hardware. 250m request, 1 core limit.
-- **Disk**: The git repo + HF model cache. 1Gi PVC should be generous
-  for the foreseeable future.
+- **Disk**: The git repo + HF model cache. The BGE-small-en-v1.5 model
+  weighs ~130MB; each memory is a small markdown file (~1–5KB). 1Gi is
+  comfortable for thousands of memories. Scale the PVC if your repo
+  grows significantly or if you switch to a larger embedding model.
 
 ### Model weights mmap safety
 
