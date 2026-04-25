@@ -44,11 +44,15 @@ Implementations:
 
 ### 3. /readyz endpoint
 
-A new Axum route alongside `/healthz`. Checks three subsystems via their existing
-APIs — no new network calls, no heavy computation:
-- Git repo: HEAD resolvable
-- Embedding: `dimensions() > 0`
+A new Axum route alongside `/healthz`. Default checks (no network I/O):
+- Git repo: accessible and valid (must pass for empty repos with no commits)
+- Embedding ↔ index consistency: `embedding.dimensions() == index.dimensions()`
+  (validates model-index agreement without hardcoding a magic number)
 - Vector index: `is_ready()` from VectorStore trait
+
+Optional check (enabled by `--require-remote-sync`):
+- Remote sync: git remote is reachable. Off by default — the server is fully
+  functional for local operations without a remote.
 
 Returns 200 + JSON or 503 + JSON with per-subsystem status. Response bodies use a
 fixed vocabulary (`"up"` / `"down"` + a constrained `reason` field on failure) —
@@ -102,6 +106,10 @@ subsystems to assert readiness. The private `RawIndex` trait inside `UsearchStor
 is shown separately — it exists only for failure injection testing.
 
 ```mermaid
+---
+config:
+  layout: elk
+---
 graph TD
     subgraph HTTP["HTTP Layer (Axum 0.8)"]
         healthz["/healthz<br/>liveness probe"]
@@ -336,9 +344,15 @@ sequenceDiagram
 ### Sequence: Readiness Check
 
 `/readyz` is entirely inward-facing: every check is a method call on an
-already-initialised subsystem. No network I/O occurs. The handler aggregates
-per-subsystem status into structured JSON and returns 503 if any check fails,
-200 if all pass, without exposing internal details.
+already-initialised subsystem. No network I/O occurs by default. The handler
+aggregates per-subsystem status into structured JSON and returns 503 if any
+check fails, 200 if all pass, without exposing internal details.
+
+The git repo check validates accessibility and validity, not commit history —
+a freshly initialised empty repo is ready. The embedding check verifies
+dimensional consistency with the vector index rather than checking for a
+magic number, so model upgrades (e.g., ModernBERT) don't break readiness.
+Remote sync reachability is only checked when `--require-remote-sync` is set.
 
 ```mermaid
 sequenceDiagram
@@ -350,25 +364,34 @@ sequenceDiagram
     participant VS as «trait» VectorStore
 
     K8s->>Router: GET /readyz
-    Router->>RH: readyz_handler(AppState)
+    Router->>RH: readyz_handler(AppState, config)
 
-    Note over RH,Repo: Check 1: git repo
-    RH->>Repo: head_resolvable()
-    Repo-->>RH: Ok / Err
+    Note over RH,Repo: Check 1: git repo accessible and valid
+    RH->>Repo: is_accessible()
+    Repo-->>RH: Ok (works even with no commits)
 
-    Note over RH,Embed: Check 2: embedding model
+    Note over RH,VS: Check 2: embedding ↔ index dimensional consistency
     RH->>Embed: dimensions()
-    Embed-->>RH: 384 (or 0 if not loaded)
+    Embed-->>RH: 384
+    RH->>VS: dimensions()
+    VS-->>RH: 384
+    RH->>RH: assert embedding dims == index dims
 
-    Note over RH,VS: Check 3: vector index
+    Note over RH,VS: Check 3: vector index ready
     RH->>VS: is_ready()
     VS-->>RH: ReadyStatus
 
+    opt --require-remote-sync enabled
+        Note over RH,Repo: Check 4: remote reachable
+        RH->>Repo: remote_reachable()
+        Repo-->>RH: Ok / Err
+    end
+
     RH->>RH: aggregate: all up → 200, any down → 503
 
-    alt all subsystems up
+    alt all checks pass
         RH-->>Router: 200 {"status":"ready","checks":{"git_repo":{"status":"up"},...}}
-    else any subsystem down
+    else any check fails
         RH-->>Router: 503 {"status":"not_ready","checks":{...,"reason":"..."}}
     end
 

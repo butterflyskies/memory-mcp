@@ -80,10 +80,11 @@ Issues: #94, #145, #146, #164
 |--------|-------------|-----------|--------------|-----------|
 | R-15 | `/readyz` shall return 200 with a JSON body when all subsystems are healthy | UC-05, UC-07 | V13.1 | TC-15 (pending) |
 | R-16 | `/readyz` shall return 503 with a JSON body identifying which subsystem(s) failed when any check fails | UC-06, UC-07 | V13.1, A.8.16 | TC-16 (pending) |
-| R-17 | `/readyz` shall check: git repo accessible (HEAD resolvable), embedding model loaded, vector index ready (via trait readiness method) | UC-05, UC-06 | A.8.16 | TC-17 (pending) |
+| R-17 | `/readyz` shall check: git repo accessible and valid (must work for empty repos with no commits), embedding-index dimensional consistency (`embedding.dimensions() == index.dimensions()`), vector index ready (via trait readiness method) | UC-05, UC-06 | A.8.16 | TC-17 (pending) |
 | R-18 | `/readyz` response shall not include internal file paths, version strings, error stack traces, or backend-specific details | AC-01, SC-01 | V7.4, A.8.11 | TC-18 (pending) |
 | R-19 | `/readyz` health checks shall be lightweight — status queries only, no embedding generation, no index scans | AC-02, SC-02 | V13.4 | TC-19 (pending) |
 | R-20 | `/readyz` failures shall be logged at warn level with subsystem detail via the existing tracing infrastructure | UC-06 | V7.1, A.8.15 | TC-20 (pending) |
+| R-21 | Remote sync unavailability shall not affect readiness by default; an opt-in flag (e.g., `--require-remote-sync`) shall make remote reachability a readiness condition | UC-05, UC-07 | V14.2 | TC-21 (pending) |
 
 ## ASVS & ISO 27001 Review
 
