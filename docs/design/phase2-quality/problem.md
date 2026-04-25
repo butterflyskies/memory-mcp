@@ -1,5 +1,5 @@
 <!-- design-meta
-status: draft
+status: approved
 last-updated: 2026-04-24
 phase: 1
 -->
@@ -35,11 +35,13 @@ health) — with `VectorIndex`/`ScopedIndex` becoming implementation details of
 a usearch-backed concrete type. A separate, private low-level trait inside the
 usearch implementation enables failure injection for rollback testing.
 
-### 2. Hardcoded OAuth client ID (#145)
+### 2. Hardcoded, GitHub-specific OAuth constants (#145)
 
-`GITHUB_CLIENT_ID` is a `const` in `auth.rs`. This prevents:
-- Testing the OAuth device flow against a mock server (different client ID)
-- Using an alternative OAuth app without recompilation
+`GITHUB_CLIENT_ID`, `GITHUB_DEVICE_CODE_URL`, and `GITHUB_ACCESS_TOKEN_URL` are
+constants in `auth.rs`. The auth flow is shaped entirely around GitHub's OAuth
+device flow with no abstraction for alternative providers. This prevents:
+- Testing the OAuth device flow against a mock server (different client ID/URLs)
+- Supporting alternative OAuth providers (GitLab, etc.) without rewriting auth
 - Integration tests that exercise the full auth path
 
 ### 3. No integration tests for auth CLI or bind address (#146)
@@ -55,8 +57,8 @@ These paths are exercised only manually.
 ### 4. No readiness signal for orchestrators (#164)
 
 `/healthz` returns 200 if the process is alive. It says nothing about whether
-the server can serve requests. In the goddess cluster (or any deployment behind
-a gateway), traffic can be routed to an instance where the repo is inaccessible,
+the server can serve requests. In any deployment behind
+a gateway, traffic can be routed to an instance where the repo is inaccessible,
 the embedding model failed to load, or the vector index is corrupt.
 
 A `/readyz` endpoint should check subsystem health and return structured results:
@@ -98,7 +100,8 @@ against a well-defined index abstraction.
 - Public trait for vector storage at the semantic level (name + scope operations)
 - Private trait inside usearch implementation for failure injection testing
 - Usearch-backed implementation of the public trait (refactoring existing code)
-- Config extraction for OAuth client ID
+- OAuth provider abstraction with GitHub as the default concrete implementation
+- Config extraction for provider-specific OAuth parameters (client ID, URLs)
 - Integration test harness for auth CLI subcommands and bind address
 - `/readyz` endpoint with subsystem health checks
 - Health-check capability on the vector storage trait (supports /readyz)
@@ -106,6 +109,8 @@ against a well-defined index abstraction.
 ### Out of scope
 - Alternative index backend implementations beyond test mocks
 - Full config framework (TOML/YAML config files)
+- Non-GitHub OAuth provider implementations (GitLab, etc.) — the abstraction
+  must support them, but only GitHub is built now
 - `/metrics` endpoint (#165) — separate design surface
 - Auth framework redesign (#79, Phase 6)
 - W3C Trace Context (#162, Phase 5)
@@ -127,6 +132,6 @@ against a well-defined index abstraction.
 3. Auth integration tests cover device flow (mocked), status reporting, and
    bind-address override — all run in CI
 4. `/readyz` returns structured health for git repo, embedding model, and vector
-   index; the goddess deployment can adopt it as a readiness probe
+   index; any k8s or gateway deployment can adopt it as a readiness probe
 5. All four items ship cohesively without requiring architectural rework in
    later phases
