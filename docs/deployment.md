@@ -105,22 +105,27 @@ Add to `~/.claude.json` (or your project-local `.mcp.json`):
 
 ---
 
-## Goddess Cluster (project-internal)
+## Operational notes
 
-The goddess cluster uses a richer stack. The production manifests live in the
-ArgoCD gitops repo, not here. Key differences from the generic path:
+### Resource sizing
 
-- **Registry**: `ghcr.io/butterflyskies/memory-mcp` (public); mirrored to
-  `harbor.svc.echoes` if needed for air-gapped pulls
-- **Namespace**: `memory-mcp`
-- **Ingress**: Cilium Gateway API (HTTPRoute, not Ingress)
-- **TLS**: `StepClusterIssuer` (step-ca) — certificate auto-provisioned
-- **TLS termination**: at the gateway; pod serves plain HTTP
-- **Domain**: `memories.svc.echoes`
-- **GitOps**: ArgoCD Application syncing from the gitops repo
-- **Auth identity**: `github:butterflysky-ai` via Dex OIDC; RBAC grants
-  secrets/services/pods/deployments/httproutes in `memory-mcp`
+- **Memory**: ~300MB baseline (model weights + index). Grows with memory
+  count — plan for 512MB request, 1Gi limit as a starting point.
+- **CPU**: Embedding computation is CPU-bound. Single-query latency is
+  ~50ms on modern hardware. 250m request, 1 core limit.
+- **Disk**: The git repo + HF model cache. 1Gi PVC should be generous
+  for the foreseeable future.
 
-To deploy a new version, push to `main` (or tag `v*`). The GitHub Actions
-workflow builds and pushes to Harbor. ArgoCD picks up the new image tag
-automatically (image updater) or on manual sync.
+### Model weights mmap safety
+
+The embedding model is memory-mapped from the HuggingFace cache. If the
+cache is mutated while the server is running (e.g., by `huggingface-cli`),
+the mmap'd region becomes undefined. The container image pre-warms the
+model so this is only a concern if the cache volume is shared. Keep
+`HF_HOME` on a volume dedicated to the pod.
+
+### Backup
+
+The git repo IS the backup — it syncs to a GitHub remote. If the PVC is
+lost, re-clone from the remote. The vector index is rebuilt from the repo
+on startup.
