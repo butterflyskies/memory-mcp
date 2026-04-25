@@ -102,7 +102,7 @@ subsystems to assert readiness. The private `RawIndex` trait inside `UsearchStor
 is shown separately — it exists only for failure injection testing.
 
 ```mermaid
-graph TB
+graph TD
     subgraph HTTP["HTTP Layer (Axum 0.8)"]
         healthz["/healthz<br/>liveness probe"]
         readyz["/readyz<br/>readiness probe"]
@@ -110,6 +110,7 @@ graph TB
     end
 
     subgraph Handlers["MCP Handlers (src/server.rs)"]
+        direction LR
         remember["remember"]
         recall["recall"]
         read_h["read"]
@@ -120,56 +121,55 @@ graph TB
     end
 
     subgraph State["AppState (src/types.rs)"]
+        direction LR
         repo["repo: Arc‹MemoryRepo›"]
         embedding_field["embedding: Box‹dyn EmbeddingBackend›"]
         index_field["index: Box‹dyn VectorStore›"]
         auth_field["auth: AuthProvider"]
     end
 
+    mcppath --> Handlers
+    readyz --> State
+    Handlers --> State
+
+    subgraph RepoSub["Git Repo Subsystem"]
+        MR["MemoryRepo<br/>(git-backed CRUD)"]
+    end
+
     subgraph EmbeddingSub["Embedding Subsystem"]
         EB["«trait» EmbeddingBackend<br/>embed() / embed_one() / dimensions()"]
         Candle["CandleEmbeddingEngine<br/>(BGE-small-en-v1.5)"]
+        Candle -.->|implements| EB
     end
 
     subgraph VectorSub["Vector Index Subsystem"]
         VS["«trait» VectorStore<br/>add / remove / search<br/>save / load / is_ready"]
         UStore["UsearchStore<br/>(ScopedIndex + VectorIndex)"]
         IMStore["InMemoryStore<br/>(HashMap, tests)"]
+        UStore -.->|implements| VS
+        IMStore -.->|implements| VS
         subgraph RawIdx["Private: RawIndex (failure injection)"]
             URaw["UsearchRawIndex"]
             FRaw["FailingRawIndex<br/>(test double)"]
         end
+        UStore --> URaw
+        UStore --> FRaw
     end
 
-    subgraph AuthSub["Auth Subsystem"]
+    subgraph AuthSub["Auth Subsystem (auth::oauth)"]
         AP["AuthProvider<br/>env var → keyring → token file"]
         DFP["«trait» DeviceFlowProvider<br/>client_id / device_code_url<br/>access_token_url / scopes / validate"]
         GDF["GitHubDeviceFlow<br/>(zero-sized, constants)"]
         MDF["MockDeviceFlow<br/>(test server)"]
+        GDF -.->|implements| DFP
+        MDF -.->|implements| DFP
+        AP -.-> DFP
     end
-
-    subgraph RepoSub["Git Repo Subsystem"]
-        MR["MemoryRepo<br/>(git-backed CRUD)"]
-    end
-
-    mcppath --> Handlers
-    Handlers --> State
-    readyz --> State
-
-    embedding_field -.-> EB
-    Candle -.->|implements| EB
-
-    index_field -.-> VS
-    UStore -.->|implements| VS
-    IMStore -.->|implements| VS
-    UStore --> URaw
-    UStore --> FRaw
 
     repo --> MR
+    embedding_field -.-> EB
+    index_field -.-> VS
     auth_field --> AP
-    AP -.-> DFP
-    GDF -.->|implements| DFP
-    MDF -.->|implements| DFP
 ```
 
 ### Data Flow Diagram with Trust Boundaries
