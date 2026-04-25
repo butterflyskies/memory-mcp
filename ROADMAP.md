@@ -105,12 +105,13 @@ Closed issues from original TODO: #60 (cargo-auditable), #62 (Trusted Publishing
 
 | Issue | Title | Effort | Depends on |
 |-------|-------|--------|------------|
-| #52 (remainder) | Complete tracing pass | Medium | Phase 2 scaffold |
-| #110 | Authenticated user identity in log events | Small | Phase 2 scaffold |
-| #111 | Log returned memory names on recall | Small | Phase 2 scaffold |
-| #112 | Log auth events | Small | Phase 2 scaffold |
-| #117 | Git commit SHA in write operation logs | Small | Phase 2 scaffold |
-| #162 | W3C Trace Context propagation | Small | #52, OTLP export |
+| #172 | Complete operational span coverage from #52 | Small | Phase 2 scaffold |
+| #173 | Tiered audit channel infrastructure | Medium | Phase 2 scaffold |
+| #110 | Authenticated user identity in log events | Small | #173 |
+| #111 | Log returned memory names on recall | Small | #173 |
+| #112 | Log auth events | Small | #173 |
+| #117 | Git commit SHA in write operation logs | Small | #173 |
+| #162 | W3C Trace Context propagation | Small | OTLP export |
 
 ---
 
@@ -120,7 +121,7 @@ Closed issues from original TODO: #60 (cargo-auditable), #62 (Trusted Publishing
 
 | Issue | Title | Effort | Depends on |
 |-------|-------|--------|------------|
-| #115 | Authentication & authorization framework | Large | #52 |
+| #115 | Authentication & authorization framework | Large | #173 |
 | #116 | Memory scope isolation | Large | #115 |
 | #113 | Log access denied events | Small | #115 |
 | #119 | Enterprise scope hierarchy (org/team/project/user) | Large | #116 |
