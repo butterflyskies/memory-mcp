@@ -35,8 +35,6 @@ trait RawIndex: Send + Sync + Sized {
     fn remove(&self, key: u64) -> Result<(), RawIndexError>;
     fn search(&self, query: &[f32], count: usize) -> Result<RawSearchResults, RawIndexError>;
     fn save(&self, path: &str) -> Result<(), RawIndexError>;
-    #[allow(dead_code)]
-    fn load(&self, path: &str) -> Result<(), RawIndexError>;
     fn reserve(&self, capacity: usize) -> Result<(), RawIndexError>;
     fn size(&self) -> usize;
     fn capacity(&self) -> usize;
@@ -81,10 +79,6 @@ impl RawIndex for UsearchRawIndex {
 
     fn save(&self, path: &str) -> Result<(), RawIndexError> {
         self.inner.save(path).map_err(|e| e.into())
-    }
-
-    fn load(&self, path: &str) -> Result<(), RawIndexError> {
-        self.inner.load(path).map_err(|e| e.into())
     }
 
     fn reserve(&self, capacity: usize) -> Result<(), RawIndexError> {
@@ -526,6 +520,16 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         )
         .entered();
 
+        if vector.len() != self.dimensions {
+            return Err(MemoryError::InvalidInput {
+                reason: format!(
+                    "expected {} dimensions, got {}",
+                    self.dimensions,
+                    vector.len()
+                ),
+            });
+        }
+
         // Write lock serialises the full find→insert→remove composite so
         // concurrent upserts for the same name cannot interleave. Reads
         // (via `search`) use a read lock and are not blocked by other reads.
@@ -628,6 +632,16 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         );
         let _enter = span.entered();
 
+        if query.len() != self.dimensions {
+            return Err(MemoryError::InvalidInput {
+                reason: format!(
+                    "expected {} dimensions, got {}",
+                    self.dimensions,
+                    query.len()
+                ),
+            });
+        }
+
         let results = match filter {
             ScopeFilter::All => self.all.search(query, limit),
 
@@ -685,13 +699,15 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         let marker = dir.join(".save-in-progress");
         std::fs::write(&marker, b"")?;
 
+        // Acquire scopes read lock before accessing any indexes.
+        let scopes = self.scopes.read().expect("scopes lock poisoned");
+
         // Persist all-index.
         let all_dir = dir.join("all");
         std::fs::create_dir_all(&all_dir)?;
         self.all.save(&all_dir.join("index.usearch"))?;
 
         // Persist per-scope indexes.
-        let scopes = self.scopes.read().expect("scopes lock poisoned");
         for (scope, idx) in scopes.iter() {
             let scope_dir = dir.join(scope.dir_prefix());
             std::fs::create_dir_all(&scope_dir)?;
@@ -701,6 +717,9 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         // Record total key count (all-index is authoritative — it holds every entry).
         let key_count = self.all.key_count();
         tracing::Span::current().record("key_count", key_count);
+
+        // Drop scopes lock before filesystem cleanup.
+        drop(scopes);
 
         // Remove marker — save completed successfully.
         let _ = std::fs::remove_file(&marker);
@@ -713,8 +732,8 @@ impl<R: RawIndex> UsearchStoreInner<R> {
     }
 
     fn set_commit_sha(&self, sha: Option<&str>) {
-        self.all.set_commit_sha(sha);
         let scopes = self.scopes.read().expect("scopes lock poisoned");
+        self.all.set_commit_sha(sha);
         for idx in scopes.values() {
             idx.set_commit_sha(sha);
         }
@@ -730,6 +749,8 @@ impl<R: RawIndex> UsearchStoreInner<R> {
 // ---------------------------------------------------------------------------
 // VectorStore implementation for UsearchStore
 // ---------------------------------------------------------------------------
+
+impl crate::index::sealed::Sealed for UsearchStore {}
 
 impl crate::index::VectorStore for UsearchStore {
     fn add(
@@ -799,7 +820,6 @@ mod tests {
         Remove,
         Search,
         Save,
-        Load,
         Reserve,
         None,
     }
@@ -890,13 +910,6 @@ mod tests {
                 return Err(Self::injected_error("save"));
             }
             self.inner.save(path).map_err(|e| e.into())
-        }
-
-        fn load(&self, path: &str) -> Result<(), RawIndexError> {
-            if self.should_fail(FailOn::Load) {
-                return Err(Self::injected_error("load"));
-            }
-            self.inner.load(path).map_err(|e| e.into())
         }
 
         fn reserve(&self, capacity: usize) -> Result<(), RawIndexError> {
@@ -1407,6 +1420,31 @@ mod tests {
             !display.contains("usearch") && !display.contains("cxx::Exception"),
             "TC-05b: display must not leak raw backend type names, got: {}",
             display
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-05b (real): Dimension mismatch produces clean MemoryError
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tc05b_dimension_mismatch_error_is_clean() {
+        let store = UsearchStore::new(8).expect("create");
+        let wrong_dims = vec![1.0_f32, 0.0, 0.0]; // 3 dims, store expects 8
+        let err = store
+            .inner
+            .add(&Scope::Global, &wrong_dims, "global/bad-dims".to_string())
+            .unwrap_err();
+        let display = format!("{}", err);
+        assert!(
+            !display.contains("usearch") && !display.contains("cxx::Exception"),
+            "error display must not leak backend type names, got: {}",
+            display
+        );
+        assert!(
+            matches!(err, MemoryError::InvalidInput { .. }),
+            "dimension mismatch should return InvalidInput, got: {:?}",
+            err
         );
     }
 

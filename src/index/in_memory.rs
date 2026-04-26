@@ -81,6 +81,8 @@ fn similarity_to_distance(sim: f32) -> f32 {
     1.0 - sim
 }
 
+impl crate::index::sealed::Sealed for InMemoryStore {}
+
 impl VectorStore for InMemoryStore {
     fn add(
         &self,
@@ -435,6 +437,20 @@ mod tests {
             "results should be sorted by ascending distance"
         );
         assert_eq!(results[0].1, "global/closest");
+    }
+
+    #[test]
+    fn tc05c_in_memory_store_dimension_mismatch_returns_invalid_input() {
+        let store = InMemoryStore::new(4);
+        let wrong_dims = vec![1.0_f32, 0.0]; // 2 dims, store expects 4
+        let err = store
+            .add(&Scope::Global, &wrong_dims, "global/bad-dims".to_string())
+            .unwrap_err();
+        assert!(
+            matches!(err, MemoryError::InvalidInput { .. }),
+            "TC-05c: dimension mismatch should return InvalidInput, got: {:?}",
+            err
+        );
     }
 
     #[test]

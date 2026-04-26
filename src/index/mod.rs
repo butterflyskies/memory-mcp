@@ -18,6 +18,14 @@ pub use in_memory::InMemoryStore;
 pub use usearch::UsearchStore;
 
 // ---------------------------------------------------------------------------
+// Sealed trait — prevents external implementations of VectorStore
+// ---------------------------------------------------------------------------
+
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
+// ---------------------------------------------------------------------------
 // VectorStore trait
 // ---------------------------------------------------------------------------
 
@@ -29,7 +37,7 @@ pub use usearch::UsearchStore;
 /// # Object safety
 /// The trait is object-safe: `load` (which would return `Self`) is intentionally
 /// absent. Each implementation provides its own constructor.
-pub trait VectorStore: Send + Sync {
+pub trait VectorStore: Send + Sync + sealed::Sealed {
     /// Insert or upsert `vector` for `qualified_name` in the given `scope`.
     ///
     /// Returns the key assigned to the entry in the global "all" index.
@@ -148,34 +156,76 @@ mod tests {
             "TC-02b: search should not return removed entry"
         );
 
+        // TC-02d: search with ProjectAndGlobal returns correct entries.
+        let proj_scope = Scope::Project("testproj".to_string());
+        store
+            .add(
+                &Scope::Global,
+                &vec_a(),
+                "global/contract-global".to_string(),
+            )
+            .expect("re-add global entry for TC-02d");
+        store
+            .add(
+                &proj_scope,
+                &vec_b(),
+                "projects/testproj/contract-proj".to_string(),
+            )
+            .expect("add project entry should succeed");
+        let pag_results = store
+            .search(
+                &ScopeFilter::ProjectAndGlobal("testproj".to_string()),
+                &vec_a(),
+                10,
+            )
+            .expect("ProjectAndGlobal search should succeed");
+        let pag_names: Vec<&str> = pag_results.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(
+            pag_names
+                .iter()
+                .any(|n| *n == "projects/testproj/contract-proj"),
+            "TC-02d: ProjectAndGlobal should include project entries"
+        );
+        assert!(
+            pag_names.iter().any(|n| *n == "global/contract-global"),
+            "TC-02d: ProjectAndGlobal should include global entries"
+        );
+        // Clean up
+        store
+            .remove(&proj_scope, "projects/testproj/contract-proj")
+            .expect("remove project entry");
+        store
+            .remove(&Scope::Global, "global/contract-global")
+            .expect("remove global entry");
+
         // TC-06: is_ready() returns true for a freshly created store.
         assert!(
             store.is_ready(),
             "TC-06: is_ready() should return true for a functioning store"
         );
 
-        // TC-07: dimensions() returns the value the store was created with.
+        // dimensions() returns the value the store was created with.
         assert_eq!(
             store.dimensions(),
             8,
-            "TC-07: dimensions() should return 8 (the value passed to new)"
+            "dimensions() should return 8 (the value passed to new)"
         );
 
-        // TC-08: commit_sha / set_commit_sha round-trip.
+        // commit_sha / set_commit_sha round-trip.
         assert!(
             store.commit_sha().is_none(),
-            "TC-08: commit_sha() should be None on a fresh store"
+            "commit_sha() should be None on a fresh store"
         );
         store.set_commit_sha(Some("deadbeef"));
         assert_eq!(
             store.commit_sha(),
             Some("deadbeef".to_string()),
-            "TC-08: commit_sha() should reflect set_commit_sha(Some(...))"
+            "commit_sha() should reflect set_commit_sha(Some(...))"
         );
         store.set_commit_sha(None);
         assert!(
             store.commit_sha().is_none(),
-            "TC-08: commit_sha() should be None after set_commit_sha(None)"
+            "commit_sha() should be None after set_commit_sha(None)"
         );
     }
 
