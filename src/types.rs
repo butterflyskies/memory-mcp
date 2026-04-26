@@ -570,7 +570,7 @@ pub struct ReindexStats {
 use std::sync::Arc;
 
 use crate::{
-    auth::AuthProvider, embedding::EmbeddingBackend, index::ScopedIndex, repo::MemoryRepo,
+    auth::AuthProvider, embedding::EmbeddingBackend, index::VectorStore, repo::MemoryRepo,
 };
 
 /// Shared application state threaded through the Axum server.
@@ -584,7 +584,7 @@ pub struct AppState {
     /// Backend used to compute text embeddings.
     pub embedding: Box<dyn EmbeddingBackend>,
     /// In-memory vector index for semantic search (scope-partitioned).
-    pub index: ScopedIndex,
+    pub index: Box<dyn VectorStore>,
     /// Authentication provider for API access control.
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").
@@ -597,7 +597,7 @@ impl AppState {
         repo: Arc<MemoryRepo>,
         branch: String,
         embedding: Box<dyn EmbeddingBackend>,
-        index: ScopedIndex,
+        index: Box<dyn VectorStore>,
         auth: AuthProvider,
     ) -> Self {
         Self {

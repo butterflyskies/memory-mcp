@@ -257,11 +257,11 @@ fn canonical_fields() -> HashSet<&'static str> {
 
 #[test]
 fn index_add_span_has_correct_name() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::Scope;
 
     let (_, store) = with_capturing(|| {
-        let idx = ScopedIndex::new(4).expect("create index");
+        let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         let _ = idx.add(&Scope::Global, &v, "global/tc01-test".to_string());
     });
@@ -275,11 +275,11 @@ fn index_add_span_has_correct_name() {
 
 #[test]
 fn index_remove_span_has_correct_name() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::Scope;
 
     let (_, store) = with_capturing(|| {
-        let idx = ScopedIndex::new(4).expect("create index");
+        let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         let _ = idx.add(&Scope::Global, &v, "global/tc01-remove".to_string());
         let _ = idx.remove(&Scope::Global, "global/tc01-remove");
@@ -294,11 +294,11 @@ fn index_remove_span_has_correct_name() {
 
 #[test]
 fn index_search_span_has_correct_name() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::{Scope, ScopeFilter};
 
     let (_, store) = with_capturing(|| {
-        let idx = ScopedIndex::new(4).expect("create index");
+        let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         let _ = idx.add(&Scope::Global, &v, "global/tc01-search".to_string());
         let _ = idx.search(&ScopeFilter::GlobalOnly, &v, 5);
@@ -313,16 +313,16 @@ fn index_search_span_has_correct_name() {
 
 #[test]
 fn index_save_load_spans_have_correct_names() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::Scope;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let (_, store) = with_capturing(|| {
-        let idx = ScopedIndex::new(4).expect("create index");
+        let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         let _ = idx.add(&Scope::Global, &v, "global/tc01-save".to_string());
         let _ = idx.save(dir.path());
-        let _ = ScopedIndex::load(dir.path(), 4);
+        let _ = UsearchStore::load(dir.path(), 4);
     });
     let spans = store.lock().unwrap();
     let names: Vec<&str> = spans.spans.iter().map(|s| s.name.as_str()).collect();
@@ -342,20 +342,20 @@ fn index_save_load_spans_have_correct_names() {
 
 #[test]
 fn index_spans_only_use_canonical_fields() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::{Scope, ScopeFilter};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let allowed = canonical_fields();
 
     let (_, store) = with_capturing(|| {
-        let idx = ScopedIndex::new(4).expect("create index");
+        let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         let _ = idx.add(&Scope::Global, &v, "global/tc04-test".to_string());
         let _ = idx.remove(&Scope::Global, "global/tc04-test");
         let _ = idx.search(&ScopeFilter::All, &v, 5);
         let _ = idx.save(dir.path());
-        let _ = ScopedIndex::load(dir.path(), 4);
+        let _ = UsearchStore::load(dir.path(), 4);
     });
     let spans = store.lock().unwrap();
     // Only check index.* spans.
@@ -386,11 +386,11 @@ fn index_spans_only_use_canonical_fields() {
 
 #[test]
 fn index_add_span_has_scope_and_dimensions_fields() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::Scope;
 
     let (_, store) = with_capturing(|| {
-        let idx = ScopedIndex::new(8).expect("create index");
+        let idx = UsearchStore::new(8).expect("create index");
         let v = vec![0.0_f32; 8];
         let _ = idx.add(&Scope::Global, &v, "global/tc06-test".to_string());
     });
@@ -421,11 +421,11 @@ fn index_add_span_has_scope_and_dimensions_fields() {
 
 #[test]
 fn index_search_span_has_required_fields() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::{Scope, ScopeFilter};
 
     let (_, store) = with_capturing(|| {
-        let idx = ScopedIndex::new(4).expect("create index");
+        let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         let _ = idx.add(&Scope::Global, &v, "global/tc07".to_string());
         let _ = idx.search(&ScopeFilter::GlobalOnly, &v, 5);
@@ -457,12 +457,12 @@ fn index_search_span_has_required_fields() {
 
 #[test]
 fn index_save_span_has_key_count_field() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::Scope;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let (_, store) = with_capturing(|| {
-        let idx = ScopedIndex::new(4).expect("create index");
+        let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         let _ = idx.add(&Scope::Global, &v, "global/tc09-save".to_string());
         let _ = idx.save(dir.path());
@@ -631,7 +631,7 @@ fn auth_failure_produces_warn_event() {
 
 #[test]
 fn debug_spans_are_filtered_when_only_info_enabled() {
-    use memory_mcp::index::ScopedIndex;
+    use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::Scope;
 
     // --- Baseline: verify index.* spans DO appear under DEBUG filter ---
@@ -643,7 +643,7 @@ fn debug_spans_are_filtered_when_only_info_enabled() {
         let filter = tracing_subscriber::EnvFilter::new("debug");
         let subscriber = Registry::default().with(layer).with(filter);
         with_default(subscriber, || {
-            let idx = ScopedIndex::new(4).expect("create index");
+            let idx = UsearchStore::new(4).expect("create index");
             let v = vec![1.0_f32, 0.0, 0.0, 0.0];
             let _ = idx.add(&Scope::Global, &v, "global/tc20-baseline".to_string());
         });
@@ -670,7 +670,7 @@ fn debug_spans_are_filtered_when_only_info_enabled() {
     let subscriber = Registry::default().with(layer).with(filter);
 
     with_default(subscriber, || {
-        let idx = ScopedIndex::new(4).expect("create index");
+        let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
         let _ = idx.add(&Scope::Global, &v, "global/tc20-filter".to_string());
     });
