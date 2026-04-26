@@ -628,6 +628,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
             "index.search",
             scope = %scope_str,
             dimensions,
+            key_count = self.all.key_count(),
             count = tracing::field::Empty,
         );
         let _enter = span.entered();

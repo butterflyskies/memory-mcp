@@ -449,6 +449,10 @@ fn index_search_span_has_required_fields() {
         search_span.fields.iter().any(|(k, _)| k == "count"),
         "index.search missing 'count' field"
     );
+    assert!(
+        search_span.fields.iter().any(|(k, _)| k == "key_count"),
+        "index.search missing 'key_count' field"
+    );
 }
 
 // ---------------------------------------------------------------------------
