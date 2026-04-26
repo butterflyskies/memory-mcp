@@ -1,0 +1,6 @@
+[branches]
+main = "main"
+perennials = []
+
+[sync]
+feature-strategy = "rebase"

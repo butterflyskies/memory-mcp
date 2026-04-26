@@ -5,16 +5,16 @@ use tracing::{debug, info, warn};
 
 use crate::error::MemoryError;
 
+/// OAuth device flow trait and provider implementations.
+pub mod oauth;
+pub use oauth::{device_flow_login, DeviceFlowProvider, GitHubDeviceFlow};
+
 /// Token resolution order:
 /// 1. `MEMORY_MCP_GITHUB_TOKEN` environment variable
 /// 2. `~/.config/memory-mcp/token` file
 /// 3. System keyring (GNOME Keyring / KWallet / macOS Keychain)
 const ENV_VAR: &str = "MEMORY_MCP_GITHUB_TOKEN";
 const TOKEN_FILE: &str = ".config/memory-mcp/token";
-
-const GITHUB_CLIENT_ID: &str = "Ov23liWxHYkwXTxCrYHp";
-const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
-const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 
 // ---------------------------------------------------------------------------
 // StoreBackend — where to persist a newly acquired token
@@ -77,29 +77,6 @@ impl fmt::Display for TokenSource {
             TokenSource::Explicit => write!(f, "explicit token"),
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Serde structs for OAuth responses
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Deserialize)]
-struct DeviceCodeResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    expires_in: u64,
-    interval: u64,
-}
-
-#[derive(serde::Deserialize)]
-struct AccessTokenResponse {
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,152 +225,13 @@ impl Default for AuthProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Device flow login
-// ---------------------------------------------------------------------------
-
-/// Authenticate with GitHub via the OAuth device flow and persist the token.
-///
-/// Prints user-facing prompts to stderr. Never logs the token value.
-pub async fn device_flow_login(
-    store: Option<StoreBackend>,
-    #[cfg(feature = "k8s")] k8s_config: Option<K8sSecretConfig>,
-) -> Result<(), MemoryError> {
-    use std::time::{Duration, Instant};
-    use tokio::time::sleep;
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| MemoryError::OAuth(format!("failed to build HTTP client: {e}")))?;
-
-    // Step 1: Request a device code.
-    let device_resp = client
-        .post(GITHUB_DEVICE_CODE_URL)
-        .header("Accept", "application/json")
-        .form(&[("client_id", GITHUB_CLIENT_ID), ("scope", "repo")])
-        .send()
-        .await
-        .map_err(|e| {
-            MemoryError::OAuth(format!(
-                "failed to contact GitHub device code endpoint: {e}"
-            ))
-        })?
-        .error_for_status()
-        .map_err(|e| MemoryError::OAuth(format!("GitHub device code request failed: {e}")))?
-        .json::<DeviceCodeResponse>()
-        .await
-        .map_err(|e| MemoryError::OAuth(format!("failed to parse device code response: {e}")))?;
-
-    // Compute overall deadline from expires_in, capped at 30 minutes to guard
-    // against a compromised response setting an excessively long expiry.
-    let expires_in = device_resp.expires_in.min(1800);
-    let deadline = Instant::now() + Duration::from_secs(expires_in);
-
-    // Step 2: Display instructions to the user.
-    eprintln!();
-    eprintln!("  Open this URL in your browser:");
-    eprintln!("    {}", device_resp.verification_uri);
-    eprintln!();
-    eprintln!("  Enter this code when prompted:");
-    eprintln!("    {}", device_resp.user_code);
-    eprintln!();
-    eprintln!("  Waiting for authorization...");
-
-    // Step 3: Poll for the access token.
-    let mut poll_interval = device_resp.interval.clamp(1, 30);
-    let token = loop {
-        if Instant::now() >= deadline {
-            return Err(MemoryError::OAuth(format!(
-                "Device code expired after {expires_in} seconds"
-            )));
-        }
-
-        sleep(Duration::from_secs(poll_interval)).await;
-
-        let resp = client
-            .post(GITHUB_ACCESS_TOKEN_URL)
-            .header("Accept", "application/json")
-            .form(&[
-                ("client_id", GITHUB_CLIENT_ID),
-                ("device_code", &device_resp.device_code),
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ])
-            .send()
-            .await
-            .map_err(|e| MemoryError::OAuth(format!("polling GitHub token endpoint failed: {e}")))?
-            .error_for_status()
-            .map_err(|e| {
-                MemoryError::OAuth(format!("GitHub token request returned error status: {e}"))
-            })?
-            .json::<AccessTokenResponse>()
-            .await
-            .map_err(|e| MemoryError::OAuth(format!("failed to parse token response: {e}")))?;
-
-        if let Some(tok) = resp.access_token.filter(|t| !t.trim().is_empty()) {
-            break SecretString::from(tok);
-        }
-
-        match resp.error.as_deref() {
-            Some("authorization_pending") => {
-                // Normal — user has not yet approved; keep polling.
-                continue;
-            }
-            Some("slow_down") => {
-                // GitHub asked us to back off; add 5 s to interval, capped at 60 s.
-                poll_interval = (poll_interval + 5).min(60);
-                continue;
-            }
-            Some("expired_token") => {
-                return Err(MemoryError::OAuth(
-                    "device code expired; please run `memory-mcp auth login` again".to_string(),
-                ));
-            }
-            Some("access_denied") => {
-                return Err(MemoryError::OAuth(
-                    "authorization denied by user".to_string(),
-                ));
-            }
-            Some(other) => {
-                let desc = resp
-                    .error_description
-                    .as_deref()
-                    .unwrap_or("no description");
-                return Err(MemoryError::OAuth(format!(
-                    "unexpected OAuth error '{other}': {desc}"
-                )));
-            }
-            None => {
-                return Err(MemoryError::OAuth(
-                    "GitHub returned neither an access_token nor an error field; \
-                     unexpected response"
-                        .to_string(),
-                ));
-            }
-        }
-    };
-
-    // Step 4: Store the token.
-    store_token(
-        &token,
-        store,
-        #[cfg(feature = "k8s")]
-        k8s_config,
-    )
-    .await?;
-    eprintln!("Authentication successful.");
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Token storage
 // ---------------------------------------------------------------------------
 
 /// Persist a token via the specified backend.
 ///
 /// Never logs the token value — only the chosen storage destination.
-async fn store_token(
+pub(crate) async fn store_token(
     token: &SecretString,
     backend: Option<StoreBackend>,
     #[cfg(feature = "k8s")] k8s_config: Option<K8sSecretConfig>,
@@ -788,19 +626,6 @@ mod tests {
         let _ = entry.delete_credential(); // cleanup before assert
         assert!(result.is_ok(), "expected token from keyring: {result:?}");
         assert_eq!(result.unwrap().expose_secret(), test_token);
-    }
-
-    /// Device flow requires real GitHub interaction — skip in CI.
-    #[tokio::test]
-    #[ignore = "requires real GitHub OAuth interaction"]
-    async fn test_device_flow_login_ignored_in_ci() {
-        device_flow_login(
-            Some(StoreBackend::Stdout),
-            #[cfg(feature = "k8s")]
-            None,
-        )
-        .await
-        .expect("device flow should succeed");
     }
 
     #[cfg(feature = "k8s")]

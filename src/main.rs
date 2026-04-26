@@ -313,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
                         None
                     };
                     auth::device_flow_login(
+                        &auth::GitHubDeviceFlow,
                         login_args.store,
                         #[cfg(feature = "k8s")]
                         k8s_config,
