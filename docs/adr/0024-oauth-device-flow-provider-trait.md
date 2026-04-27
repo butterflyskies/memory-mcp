@@ -1,7 +1,7 @@
 # ADR-0024: `auth::oauth::DeviceFlowProvider` trait for multi-provider device flow auth
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 ADR-0012 introduced the OAuth device flow for token acquisition, with the GitHub
