@@ -22,3 +22,6 @@ performance profiles.
 - `VectorStore` pays one vtable indirection per call, which is negligible relative to
   the HNSW search or mutex acquisition it wraps.
 - `RawIndex` is private — the generic parameter never leaks into public API.
+
+## References
+- #94

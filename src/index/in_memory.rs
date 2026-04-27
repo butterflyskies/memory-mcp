@@ -84,6 +84,10 @@ fn similarity_to_distance(sim: f32) -> f32 {
 impl crate::index::sealed::Sealed for InMemoryStore {}
 
 impl VectorStore for InMemoryStore {
+    // Scope filtering relies on qualified_name encoding the scope (e.g.
+    // "global:foo" or "project:bar:baz"), which UsearchStoreInner guarantees.
+    // The scope parameter is stored alongside the entry for search filtering
+    // but is not used as a separate index key.
     fn add(
         &self,
         scope: &Scope,

@@ -1,7 +1,11 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     path::Path,
-    sync::{Mutex, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex, RwLock,
+    },
 };
 
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
@@ -117,6 +121,7 @@ struct VectorState<R: RawIndex> {
 /// `VectorIndex<FailingRawIndex>` enables failure injection.
 struct VectorIndex<R: RawIndex = UsearchRawIndex> {
     state: Mutex<VectorState<R>>,
+    entry_count: AtomicUsize,
 }
 
 impl VectorIndex<UsearchRawIndex> {
@@ -180,6 +185,7 @@ impl VectorIndex<UsearchRawIndex> {
             );
         }
 
+        let count = key_map.len();
         Ok(Self {
             state: Mutex::new(VectorState {
                 index: UsearchRawIndex { inner },
@@ -188,6 +194,7 @@ impl VectorIndex<UsearchRawIndex> {
                 next_key,
                 commit_sha,
             }),
+            entry_count: AtomicUsize::new(count),
         })
     }
 }
@@ -209,6 +216,7 @@ impl<R: RawIndex> VectorIndex<R> {
                 next_key: 0,
                 commit_sha: None,
             }),
+            entry_count: AtomicUsize::new(0),
         })
     }
 
@@ -247,6 +255,8 @@ impl<R: RawIndex> VectorIndex<R> {
             .next_key
             .checked_add(1)
             .expect("vector key space exhausted");
+        self.entry_count
+            .store(state.key_map.len(), Ordering::Relaxed);
         Ok(key)
     }
 
@@ -287,6 +297,8 @@ impl<R: RawIndex> VectorIndex<R> {
             if state.name_map.get(&name).copied() == Some(key) {
                 state.name_map.remove(&name);
             }
+            self.entry_count
+                .store(state.key_map.len(), Ordering::Relaxed);
         }
         Ok(())
     }
@@ -315,15 +327,13 @@ impl<R: RawIndex> VectorIndex<R> {
         } else {
             state.name_map.remove(name);
         }
+        self.entry_count
+            .store(state.key_map.len(), Ordering::Relaxed);
     }
 
     /// Return the number of entries currently in the key map.
     fn key_count(&self) -> usize {
-        let state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
-        state.key_map.len()
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     /// Return the commit SHA stored in the index metadata (if any).
@@ -619,10 +629,10 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         limit: usize,
     ) -> Result<Vec<(u64, String, f32)>, MemoryError> {
         let dimensions = query.len();
-        let scope_str = match filter {
-            ScopeFilter::GlobalOnly => "global".to_owned(),
-            ScopeFilter::All => "all".to_owned(),
-            ScopeFilter::ProjectAndGlobal(p) => format!("project+global:{p}"),
+        let scope_str: Cow<'_, str> = match filter {
+            ScopeFilter::GlobalOnly => "global".into(),
+            ScopeFilter::All => "all".into(),
+            ScopeFilter::ProjectAndGlobal(p) => format!("project+global:{p}").into(),
         };
         let span = tracing::debug_span!(
             "index.search",
@@ -700,32 +710,35 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         let marker = dir.join(".save-in-progress");
         std::fs::write(&marker, b"")?;
 
-        // Acquire scopes read lock before accessing any indexes.
-        let scopes = self.scopes.read().expect("scopes lock poisoned");
+        let result = (|| -> Result<(), MemoryError> {
+            // Acquire scopes read lock before accessing any indexes.
+            let scopes = self.scopes.read().expect("scopes lock poisoned");
 
-        // Persist all-index.
-        let all_dir = dir.join("all");
-        std::fs::create_dir_all(&all_dir)?;
-        self.all.save(&all_dir.join("index.usearch"))?;
+            // Persist all-index.
+            let all_dir = dir.join("all");
+            std::fs::create_dir_all(&all_dir)?;
+            self.all.save(&all_dir.join("index.usearch"))?;
 
-        // Persist per-scope indexes.
-        for (scope, idx) in scopes.iter() {
-            let scope_dir = dir.join(scope.dir_prefix());
-            std::fs::create_dir_all(&scope_dir)?;
-            idx.save(&scope_dir.join("index.usearch"))?;
-        }
+            // Persist per-scope indexes.
+            for (scope, idx) in scopes.iter() {
+                let scope_dir = dir.join(scope.dir_prefix());
+                std::fs::create_dir_all(&scope_dir)?;
+                idx.save(&scope_dir.join("index.usearch"))?;
+            }
 
-        // Record total key count (all-index is authoritative — it holds every entry).
-        let key_count = self.all.key_count();
-        tracing::Span::current().record("key_count", key_count);
+            // Record total key count (all-index is authoritative — it holds every entry).
+            let key_count = self.all.key_count();
+            tracing::Span::current().record("key_count", key_count);
 
-        // Drop scopes lock before filesystem cleanup.
-        drop(scopes);
+            // scopes lock dropped at end of closure scope.
+            Ok(())
+        })();
 
-        // Remove marker — save completed successfully.
+        // Always remove the marker — a transient I/O failure should not
+        // force a full reindex on next startup.
         let _ = std::fs::remove_file(&marker);
 
-        Ok(())
+        result
     }
 
     fn commit_sha(&self) -> Option<String> {
@@ -872,10 +885,6 @@ mod tests {
         }
     }
 
-    // SAFETY: The inner Index is Send+Sync, and Mutex<usize> is Send+Sync.
-    unsafe impl Send for FailingRawIndex {}
-    unsafe impl Sync for FailingRawIndex {}
-
     impl RawIndex for FailingRawIndex {
         fn create(dimensions: usize) -> Result<Self, RawIndexError> {
             Ok(FailingRawIndex::new(dimensions, FailOn::None, 0))
@@ -943,6 +952,7 @@ mod tests {
                 next_key: 0,
                 commit_sha: None,
             }),
+            entry_count: AtomicUsize::new(0),
         }
     }
 
