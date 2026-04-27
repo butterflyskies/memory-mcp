@@ -434,7 +434,7 @@ impl UsearchStore {
     /// rebuilt incrementally on next use.
     pub fn load(dir: &Path, dimensions: usize) -> Result<Self, MemoryError> {
         let span = tracing::info_span!("index.load", key_count = tracing::field::Empty,);
-        let _enter = span.entered();
+        let _enter = span.enter();
 
         // If a previous save was interrupted, the on-disk state may be
         // inconsistent (some indexes from current state, others from prior).
@@ -501,7 +501,7 @@ impl UsearchStore {
         }
 
         let key_count = all.key_count();
-        tracing::Span::current().record("key_count", key_count);
+        span.record("key_count", key_count);
 
         Ok(Self {
             inner: UsearchStoreInner {
@@ -522,13 +522,13 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         qualified_name: String,
     ) -> Result<u64, MemoryError> {
         let dimensions = vector.len();
-        let _span = tracing::debug_span!(
+        let span = tracing::debug_span!(
             "index.add",
             scope = %scope.dir_prefix(),
             dimensions,
             key_count = tracing::field::Empty,
-        )
-        .entered();
+        );
+        let _enter = span.enter();
 
         if vector.len() != self.dimensions {
             return Err(MemoryError::InvalidInput {
@@ -580,7 +580,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         }
 
         // Record key_count (all-index size) after insertion.
-        tracing::Span::current().record("key_count", self.all.key_count());
+        span.record("key_count", self.all.key_count());
 
         Ok(all_key)
     }
@@ -641,7 +641,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
             key_count = self.all.key_count(),
             count = tracing::field::Empty,
         );
-        let _enter = span.entered();
+        let _enter = span.enter();
 
         if query.len() != self.dimensions {
             return Err(MemoryError::InvalidInput {
@@ -690,7 +690,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
             }
         };
         if let Ok(ref r) = results {
-            tracing::Span::current().record("count", r.len());
+            span.record("count", r.len());
         }
         results
     }
@@ -700,8 +700,8 @@ impl<R: RawIndex> UsearchStoreInner<R> {
     }
 
     fn save(&self, dir: &Path) -> Result<(), MemoryError> {
-        let _span =
-            tracing::debug_span!("index.save", key_count = tracing::field::Empty,).entered();
+        let span = tracing::debug_span!("index.save", key_count = tracing::field::Empty,);
+        let _enter = span.enter();
 
         std::fs::create_dir_all(dir)?;
 
@@ -728,7 +728,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
 
             // Record total key count (all-index is authoritative — it holds every entry).
             let key_count = self.all.key_count();
-            tracing::Span::current().record("key_count", key_count);
+            span.record("key_count", key_count);
 
             // scopes lock dropped at end of closure scope.
             Ok(())
