@@ -690,7 +690,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
             }
         };
         if let Ok(ref r) = results {
-            tracing::Span::current().record("count", r.len());
+            span.record("count", r.len());
         }
         results
     }
