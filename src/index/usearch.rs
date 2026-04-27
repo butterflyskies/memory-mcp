@@ -641,7 +641,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
             key_count = self.all.key_count(),
             count = tracing::field::Empty,
         );
-        let _enter = span.entered();
+        let _enter = span.enter();
 
         if query.len() != self.dimensions {
             return Err(MemoryError::InvalidInput {
