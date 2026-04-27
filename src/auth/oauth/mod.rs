@@ -38,7 +38,7 @@ pub(crate) fn validate_endpoint_url(url: &str, field_name: &str) -> Result<(), M
         .map_err(|e| MemoryError::OAuth(format!("invalid {field_name} URL: {e}")))?;
     match parsed.scheme() {
         "https" => Ok(()),
-        "http" if matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1")) => Ok(()),
+        "http" if matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) => Ok(()),
         _ => Err(MemoryError::OAuth(format!(
             "{field_name} must use HTTPS (got {url})"
         ))),
@@ -50,22 +50,22 @@ pub(crate) fn validate_endpoint_url(url: &str, field_name: &str) -> Result<(), M
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
-pub(crate) struct DeviceCodeResponse {
-    pub(crate) device_code: String,
-    pub(crate) user_code: String,
-    pub(crate) verification_uri: String,
-    pub(crate) expires_in: u64,
-    pub(crate) interval: u64,
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
 }
 
 #[derive(serde::Deserialize)]
-pub(crate) struct AccessTokenResponse {
+struct AccessTokenResponse {
     #[serde(default)]
-    pub(crate) access_token: Option<String>,
+    access_token: Option<String>,
     #[serde(default)]
-    pub(crate) error: Option<String>,
+    error: Option<String>,
     #[serde(default)]
-    pub(crate) error_description: Option<String>,
+    error_description: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +324,12 @@ mod tests {
             if self.client_id.is_empty() {
                 return Err(MemoryError::OAuth("client ID must not be empty".into()));
             }
+            if self.client_id.len() < 4 || self.client_id.len() > 64 {
+                return Err(MemoryError::OAuth(format!(
+                    "client ID has unexpected length ({})",
+                    self.client_id.len()
+                )));
+            }
             validate_endpoint_url(self.device_code_url, "device_code_url")?;
             validate_endpoint_url(self.access_token_url, "access_token_url")?;
             Ok(())
@@ -414,6 +420,38 @@ mod tests {
     #[test]
     fn https_urls_pass_validation() {
         assert!(valid_mock().validate().is_ok());
+    }
+
+    // IPv6 loopback passes validation (host_str returns "[::1]" with brackets)
+    #[test]
+    fn http_ipv6_localhost_passes_validation() {
+        let mock = MockDeviceFlow {
+            device_code_url: "http://[::1]/device/code",
+            access_token_url: "http://[::1]/oauth/token",
+            ..valid_mock()
+        };
+        assert!(mock.validate().is_ok());
+    }
+
+    // Non-loopback IPv6 HTTP URL is rejected
+    #[test]
+    fn http_ipv6_non_loopback_fails_validation() {
+        let mock = MockDeviceFlow {
+            device_code_url: "http://[::2]/device/code",
+            ..valid_mock()
+        };
+        assert!(mock.validate().is_err());
+    }
+
+    // 127.0.0.1 passes validation
+    #[test]
+    fn http_127_0_0_1_passes_validation() {
+        let mock = MockDeviceFlow {
+            device_code_url: "http://127.0.0.1/device/code",
+            access_token_url: "http://127.0.0.1/oauth/token",
+            ..valid_mock()
+        };
+        assert!(mock.validate().is_ok());
     }
 
     /// Device flow requires real OAuth — skip in CI.
