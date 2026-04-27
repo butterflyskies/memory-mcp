@@ -16,7 +16,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider as OtlpProvider;
 
 use memory_mcp::auth::{self, AuthProvider, StoreBackend};
 use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend, MODEL_ID};
-use memory_mcp::index::ScopedIndex;
+use memory_mcp::index::{UsearchStore, VectorStore};
 use memory_mcp::repo::MemoryRepo;
 use memory_mcp::server::MemoryServer;
 use memory_mcp::types::{validate_branch_name, AppState};
@@ -375,10 +375,12 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         info!("removed legacy single-index files");
     }
 
-    let index = ScopedIndex::load(&index_dir, dimensions).unwrap_or_else(|e| {
-        tracing::warn!("could not load scoped index ({}), creating fresh", e);
-        ScopedIndex::new(dimensions).expect("failed to create scoped index")
-    });
+    let index: Box<dyn VectorStore> = Box::new(
+        UsearchStore::load(&index_dir, dimensions).unwrap_or_else(|e| {
+            tracing::warn!("could not load index ({}), creating fresh", e);
+            UsearchStore::new(dimensions).expect("failed to create index")
+        }),
+    );
 
     let auth = AuthProvider::new();
 

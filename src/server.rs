@@ -33,7 +33,7 @@ fn extract_session_id(parts: &http::request::Parts) -> String {
 use crate::{
     embedding::EmbeddingBackend,
     error::MemoryError,
-    index::ScopedIndex,
+    index::VectorStore,
     repo::MemoryRepo,
     types::{
         parse_qualified_name, parse_scope, parse_scope_filter, validate_name, AppState,
@@ -69,7 +69,7 @@ const MAX_CONTENT_SIZE: usize = 1_048_576;
 async fn incremental_reindex(
     repo: &Arc<MemoryRepo>,
     embedding: &dyn EmbeddingBackend,
-    index: &ScopedIndex,
+    index: &dyn VectorStore,
     changes: &ChangedMemories,
 ) -> ReindexStats {
     let mut stats = ReindexStats::default();
@@ -174,7 +174,7 @@ async fn incremental_reindex(
 
     // ---- 5. Update index entries --------------------------------------------
     for ((scope, qualified_name, _), vector) in to_embed.iter().zip(vectors.iter()) {
-        let is_update = index.find_key_by_name(qualified_name).is_some();
+        let is_update = index.find_by_name(qualified_name).is_some();
 
         match index.add(scope, vector, qualified_name.clone()) {
             Ok(_) => {}
@@ -797,7 +797,7 @@ impl MemoryServer {
                         let stats = incremental_reindex(
                             &state.repo,
                             state.embedding.as_ref(),
-                            &state.index,
+                            state.index.as_ref(),
                             &changes,
                         )
                         .instrument(tracing::info_span!("server.incremental_reindex"))
