@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend};
+use memory_mcp::health::SubsystemReporter;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -20,7 +21,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// The engine must produce 384-dimensional vectors for BGE-small-en-v1.5.
 #[tokio::test]
 async fn produces_384_dim_vectors() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
     assert_eq!(engine.dimensions(), 384);
 
     let vec = engine.embed_one("hello world").await.unwrap();
@@ -30,7 +31,7 @@ async fn produces_384_dim_vectors() {
 /// Vectors must be L2-normalised (unit length).
 #[tokio::test]
 async fn vectors_are_normalised() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
     let vec = engine.embed_one("test normalisation").await.unwrap();
     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!((norm - 1.0).abs() < 1e-4, "expected unit norm, got {norm}");
@@ -39,7 +40,7 @@ async fn vectors_are_normalised() {
 /// Same input must produce identical output (deterministic).
 #[tokio::test]
 async fn self_consistency() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
     let a = engine.embed_one("determinism check").await.unwrap();
     let b = engine.embed_one("determinism check").await.unwrap();
     assert_eq!(a, b);
@@ -48,7 +49,7 @@ async fn self_consistency() {
 /// Semantically similar texts should cluster together.
 #[tokio::test]
 async fn semantic_similarity() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
 
     let rust = engine.embed_one("Rust programming language").await.unwrap();
     let cargo = engine
@@ -72,7 +73,7 @@ async fn semantic_similarity() {
 /// Batch embed must return one vector per input, all normalised.
 #[tokio::test]
 async fn batch_embed() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
     let texts: Vec<String> = vec!["first".into(), "second".into(), "third".into()];
     let vecs = engine.embed(&texts).await.unwrap();
     assert_eq!(vecs.len(), 3);
@@ -87,7 +88,7 @@ async fn batch_embed() {
 /// This validates that the attention mask correctly excludes padding tokens.
 #[tokio::test]
 async fn batch_single_consistency() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
 
     // Deliberately different lengths to force padding in the batch path.
     let short = "hi";
@@ -119,7 +120,7 @@ async fn batch_single_consistency() {
 /// Embedding an empty batch must return an empty vec (not an error).
 #[tokio::test]
 async fn empty_batch_returns_empty() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
     let result = engine.embed(&[]).await.unwrap();
     assert!(result.is_empty());
 }
@@ -129,7 +130,7 @@ async fn empty_batch_returns_empty() {
 /// vectors are identical regardless of which chunk they land in.
 #[tokio::test]
 async fn large_batch_is_chunked() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
 
     // 65 texts: first chunk of 64, second chunk of 1.
     let texts: Vec<String> = (0..65).map(|i| format!("sentence number {i}")).collect();
@@ -159,7 +160,7 @@ async fn large_batch_is_chunked() {
 /// Text exceeding the 512-token limit must be truncated, not rejected.
 #[tokio::test]
 async fn long_text_is_truncated() {
-    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64).unwrap();
+    let engine = CandleEmbeddingEngine::new(TEST_TIMEOUT, 64, SubsystemReporter::new()).unwrap();
     let long_text = "word ".repeat(600); // ~600 tokens, well over the 512 limit
     let vec = engine.embed_one(&long_text).await.unwrap();
     assert_eq!(vec.len(), 384);

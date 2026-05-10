@@ -11,6 +11,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::{
     auth::AuthProvider,
     error::MemoryError,
+    health::SubsystemReporter,
     types::{validate_name, ChangedMemories, Memory, PullResult, Scope},
 };
 
@@ -108,6 +109,8 @@ fn build_auth_callbacks(token: SecretString) -> git2::RemoteCallbacks<'static> {
 pub struct MemoryRepo {
     inner: Mutex<Repository>,
     root: PathBuf,
+    reporter: SubsystemReporter,
+    sync_reporter: SubsystemReporter,
 }
 
 // SAFETY: Repository holds raw pointers but is documented as safe to send
@@ -121,7 +124,27 @@ impl MemoryRepo {
     ///
     /// If `remote_url` is provided, ensures an `origin` remote exists pointing
     /// at that URL (creating or updating it as necessary).
+    ///
+    /// `reporter` receives `report_ok`/`report_err` after local git operations
+    /// so `/readyz` reflects the repository's operational state passively.
     pub fn init_or_open(path: &Path, remote_url: Option<&str>) -> Result<Self, MemoryError> {
+        Self::init_or_open_with_reporter(
+            path,
+            remote_url,
+            SubsystemReporter::new(),
+            SubsystemReporter::new(),
+        )
+    }
+
+    /// Open or initialise a git repo with specific health reporters.
+    ///
+    /// `reporter` tracks local git operations; `sync_reporter` tracks push/pull.
+    pub fn init_or_open_with_reporter(
+        path: &Path,
+        remote_url: Option<&str>,
+        reporter: SubsystemReporter,
+        sync_reporter: SubsystemReporter,
+    ) -> Result<Self, MemoryError> {
         let _span = tracing::info_span!("repo.init").entered();
 
         let repo = if path.join(".git").exists() {
@@ -177,6 +200,8 @@ impl MemoryRepo {
         Ok(Self {
             inner: Mutex::new(repo),
             root: path.to_path_buf(),
+            reporter,
+            sync_reporter,
         })
     }
 
@@ -226,7 +251,7 @@ impl MemoryRepo {
         // Capture span before entering spawn_blocking so the child thread can record oid.
         let span = tracing::debug_span!("repo.save", name = %name, oid = tracing::field::Empty);
 
-        tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+        let result = tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
             let _enter = span.entered();
             let repo = arc
                 .inner
@@ -258,7 +283,13 @@ impl MemoryRepo {
             Ok(())
         })
         .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
+        .map_err(|e| MemoryError::Join(e.to_string()))?;
+
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(_) => self.reporter.report_err("save_memory failed"),
+        }
+        result
     }
 
     /// Remove a memory's file and commit the deletion.
@@ -279,7 +310,7 @@ impl MemoryRepo {
         let name = name.to_string();
         let file_path_clone = file_path.clone();
         let span = tracing::debug_span!("repo.delete", name = %name);
-        tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+        let result = tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
             let _enter = span.entered();
             let repo = arc
                 .inner
@@ -333,7 +364,13 @@ impl MemoryRepo {
             Ok(())
         })
         .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
+        .map_err(|e| MemoryError::Join(e.to_string()))?;
+
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(_) => self.reporter.report_err("delete_memory failed"),
+        }
+        result
     }
 
     /// Read and parse a memory from disk.
@@ -353,7 +390,7 @@ impl MemoryRepo {
         let arc = Arc::clone(self);
         let name = name.to_string();
         let span = tracing::debug_span!("repo.read", name = %name);
-        tokio::task::spawn_blocking(move || -> Result<Memory, MemoryError> {
+        let result = tokio::task::spawn_blocking(move || -> Result<Memory, MemoryError> {
             let _enter = span.entered();
             // Check existence/symlink status before opening.
             match std::fs::symlink_metadata(&file_path) {
@@ -372,7 +409,17 @@ impl MemoryRepo {
             Memory::from_markdown(&raw)
         })
         .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
+        .map_err(|e| MemoryError::Join(e.to_string()))?;
+
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(MemoryError::NotFound { .. }) | Err(MemoryError::InvalidInput { .. }) => {
+                // Application-level errors — the repo itself is fine.
+                self.reporter.report_ok();
+            }
+            Err(_) => self.reporter.report_err("read_memory failed"),
+        }
+        result
     }
 
     /// List all memories, optionally filtered by scope.
@@ -384,7 +431,7 @@ impl MemoryRepo {
         let scope_clone = scope.cloned();
         let span = tracing::debug_span!("repo.list", file_count = tracing::field::Empty,);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<Memory>, MemoryError> {
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<Memory>, MemoryError> {
             let _enter = span.entered();
             let dirs: Vec<PathBuf> = match scope_clone.as_ref() {
                 Some(s) => vec![root.join(s.dir_prefix())],
@@ -449,7 +496,13 @@ impl MemoryRepo {
             Ok(memories)
         })
         .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
+        .map_err(|e| MemoryError::Join(e.to_string()))?;
+
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(_) => self.reporter.report_err("list_memories failed"),
+        }
+        result
     }
 
     /// Push local commits to `origin/<branch>`.
@@ -469,7 +522,7 @@ impl MemoryRepo {
         let branch = branch.to_string();
         let span = tracing::debug_span!("repo.push", branch = %branch);
 
-        tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+        let result = tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
             let _enter = span.entered();
             let repo = arc
                 .inner
@@ -520,7 +573,13 @@ impl MemoryRepo {
             Ok(())
         })
         .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
+        .map_err(|e| MemoryError::Join(e.to_string()))?;
+
+        match &result {
+            Ok(_) => self.sync_reporter.report_ok(),
+            Err(_) => self.sync_reporter.report_err("push failed"),
+        }
+        result
     }
 
     /// Perform a normal (non-fast-forward) merge of `fetch_commit` into HEAD.
@@ -613,7 +672,7 @@ impl MemoryRepo {
         let branch = branch.to_string();
         let span = tracing::debug_span!("repo.pull", branch = %branch);
 
-        tokio::task::spawn_blocking(move || -> Result<PullResult, MemoryError> {
+        let result = tokio::task::spawn_blocking(move || -> Result<PullResult, MemoryError> {
             let _enter = span.entered();
             let repo = arc
                 .inner
@@ -681,7 +740,13 @@ impl MemoryRepo {
             arc.merge_with_remote(&repo, &fetch_commit, &branch)
         })
         .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
+        .map_err(|e| MemoryError::Join(e.to_string()))?;
+
+        match &result {
+            Ok(_) => self.sync_reporter.report_ok(),
+            Err(_) => self.sync_reporter.report_err("pull failed"),
+        }
+        result
     }
 
     /// Diff two commits and return the memory files that changed.

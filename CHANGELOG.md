@@ -1,3 +1,26 @@
+## [0.11.0] - 2026-05-10
+
+### Added
+- `/readyz` readiness probe endpoint with per-subsystem health reporting (git repo, embedding, vector index, sync)
+- `/healthz` liveness probe endpoint (always 200)
+- Passive health architecture: subsystems report their own operational state via `SubsystemReporter` backed by `arc-swap` — zero-contention, wait-free reads
+- `--require-remote-sync` flag: performs initial pull at startup, includes sync health in readiness checks
+- `--health-stale-secs` flag: opt-in staleness detection (disabled by default)
+- Transition-based logging: warn on degradation, info on recovery, debug on steady-state polling
+- ADR-0027: passive health reporting architecture
+
+### Changed
+- `CandleEmbeddingEngine::new()` now accepts a `SubsystemReporter` parameter
+- `UsearchStore` gains `new_with_reporter()` and `load_with_reporter()` constructors
+- `MemoryRepo` gains `init_or_open_with_reporter()` constructor with git + sync reporters
+- `AppState::new()` now accepts a `HealthRegistry` parameter
+- `read_memory` no longer marks git subsystem degraded on `NotFound` / `InvalidInput` errors
+- Startup health reporting is conditional on reindex success
+- Startup validation: `--require-remote-sync` without `--remote-url` is rejected immediately
+
+### Dependencies
+- Added `arc-swap` 1.x (wait-free atomic pointer swap for health state)
+
 ## [0.10.1] - 2026-05-10
 
 ### Added

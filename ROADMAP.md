@@ -57,7 +57,7 @@ Closed issues from original TODO: #60 (cargo-auditable), #62 (Trusted Publishing
 | #145 | DeviceFlowProvider trait | Small | -- | **Done** (v0.8.0, PR #178) |
 | #192 | Embed timeout — self-healing worker thread | Medium | -- | **Done** (v0.10.0, PR #199) |
 | #193 | Startup reindex after crash | Medium | -- | **Done** (v0.10.0, PR #199) |
-| #164 | `/readyz` health endpoint | Small | #94 | |
+| #164 | `/readyz` health endpoint | Small | #94 | **Done** (v0.11.0, PR #202) |
 | #114 | Surface keep-alive timeout to clients | Small | -- | |
 | #109 | Content-level secret scanning | Medium | #108 | |
 | #98 | Automate CHANGELOG without bypassing branch protection | Medium | -- | |

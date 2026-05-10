@@ -1,6 +1,6 @@
 [package]
 name = "memory-mcp"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MCP server for semantic memory — pure-Rust embeddings, vector search, git-backed storage"
@@ -49,6 +49,7 @@ async-trait = "0.1"
 dirs = "6"
 mcp-session = "0.1"
 http = "1"
+arc-swap = "1"
 
 # Candle direct — pure-Rust BERT inference for embeddings.
 candle-core = "0.10"

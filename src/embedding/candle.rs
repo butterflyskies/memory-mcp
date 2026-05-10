@@ -12,6 +12,7 @@ use tokio::time::{timeout, Duration};
 
 use super::EmbeddingBackend;
 use crate::error::MemoryError;
+use crate::health::SubsystemReporter;
 
 /// HuggingFace model ID. Only BGE-small-en-v1.5 is supported currently.
 pub const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
@@ -40,6 +41,7 @@ pub struct CandleEmbeddingEngine {
     worker: Option<std::thread::JoinHandle<()>>,
     dim: usize,
     embed_timeout: Duration,
+    reporter: SubsystemReporter,
 }
 
 struct CandleInner {
@@ -61,7 +63,15 @@ impl CandleEmbeddingEngine {
     /// `queue_size` sets the bounded channel capacity — how many requests can
     /// queue behind the one being processed. Extra callers get an immediate
     /// "busy" error.
-    pub fn new(embed_timeout: Duration, queue_size: usize) -> Result<Self, MemoryError> {
+    ///
+    /// `reporter` receives `report_ok`/`report_err` after each embed call so
+    /// the `/readyz` handler can reflect the engine's operational state without
+    /// active probing.
+    pub fn new(
+        embed_timeout: Duration,
+        queue_size: usize,
+        reporter: SubsystemReporter,
+    ) -> Result<Self, MemoryError> {
         let device = Device::Cpu;
 
         let (config, mut tokenizer, weights_path) =
@@ -112,6 +122,7 @@ impl CandleEmbeddingEngine {
             worker: Some(worker),
             dim,
             embed_timeout,
+            reporter,
         })
     }
 
@@ -132,6 +143,7 @@ impl CandleEmbeddingEngine {
             worker: None,
             dim,
             embed_timeout,
+            reporter: SubsystemReporter::new(),
         }
     }
 }
@@ -215,7 +227,7 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
                 }
             })?;
 
-        match timeout(self.embed_timeout, reply_rx).await {
+        let result = match timeout(self.embed_timeout, reply_rx).await {
             Ok(Ok(result)) => result,
             // Fires if the worker drops reply_tx without sending (e.g. a
             // double-panic that escapes catch_unwind, or a panic in span setup).
@@ -226,7 +238,15 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
                 "embedding timed out after {:.1}s — the worker will recover automatically",
                 self.embed_timeout.as_secs_f64(),
             ))),
+        };
+
+        // Report operational state passively so /readyz reflects reality without probing.
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(_) => self.reporter.report_err("embed failed"),
         }
+
+        result
     }
 
     fn dimensions(&self) -> usize {

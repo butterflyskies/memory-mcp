@@ -570,7 +570,8 @@ pub struct ReindexStats {
 use std::sync::Arc;
 
 use crate::{
-    auth::AuthProvider, embedding::EmbeddingBackend, index::VectorStore, repo::MemoryRepo,
+    auth::AuthProvider, embedding::EmbeddingBackend, health::HealthRegistry, index::VectorStore,
+    repo::MemoryRepo,
 };
 
 /// Shared application state threaded through the Axum server.
@@ -589,6 +590,8 @@ pub struct AppState {
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").
     pub branch: String,
+    /// Passive health registry — subsystems report here, `/readyz` reads here.
+    pub health: HealthRegistry,
 }
 
 impl AppState {
@@ -599,6 +602,7 @@ impl AppState {
         embedding: Box<dyn EmbeddingBackend>,
         index: Box<dyn VectorStore>,
         auth: AuthProvider,
+        health: HealthRegistry,
     ) -> Self {
         Self {
             repo,
@@ -606,6 +610,7 @@ impl AppState {
             index,
             auth,
             branch,
+            health,
         }
     }
 }

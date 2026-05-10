@@ -12,6 +12,7 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::{
     error::MemoryError,
+    health::SubsystemReporter,
     types::{validate_name, Scope, ScopeFilter},
 };
 
@@ -394,6 +395,7 @@ impl<R: RawIndex> VectorIndex<R> {
 #[non_exhaustive]
 pub struct UsearchStore {
     inner: UsearchStoreInner<UsearchRawIndex>,
+    reporter: SubsystemReporter,
 }
 
 /// Generic inner implementation, separated so tests can substitute `R`.
@@ -414,7 +416,18 @@ struct UsearchStoreInner<R: RawIndex> {
 
 impl UsearchStore {
     /// Create a new `UsearchStore` with empty global + all indexes.
+    ///
+    /// `reporter` is called with `report_ok`/`report_err` after each `add` and
+    /// `search` so `/readyz` reflects the store's operational state passively.
     pub fn new(dimensions: usize) -> Result<Self, MemoryError> {
+        Self::new_with_reporter(dimensions, SubsystemReporter::new())
+    }
+
+    /// Create a new `UsearchStore` with a specific health reporter.
+    pub fn new_with_reporter(
+        dimensions: usize,
+        reporter: SubsystemReporter,
+    ) -> Result<Self, MemoryError> {
         let global = VectorIndex::new(dimensions)?;
         let all = VectorIndex::new(dimensions)?;
         let mut scopes = HashMap::new();
@@ -425,6 +438,7 @@ impl UsearchStore {
                 all,
                 dimensions,
             },
+            reporter,
         })
     }
 
@@ -433,6 +447,15 @@ impl UsearchStore {
     /// Missing subdirectories are treated as empty — those scopes will be
     /// rebuilt incrementally on next use.
     pub fn load(dir: &Path, dimensions: usize) -> Result<Self, MemoryError> {
+        Self::load_with_reporter(dir, dimensions, SubsystemReporter::new())
+    }
+
+    /// Load all indexes from subdirectories under `dir` with a specific health reporter.
+    pub fn load_with_reporter(
+        dir: &Path,
+        dimensions: usize,
+        reporter: SubsystemReporter,
+    ) -> Result<Self, MemoryError> {
         let span = tracing::info_span!("index.load", key_count = tracing::field::Empty,);
         let _enter = span.enter();
 
@@ -444,7 +467,7 @@ impl UsearchStore {
         if dirty_marker.exists() {
             tracing::warn!("detected interrupted index save — discarding indexes");
             let _ = std::fs::remove_file(&dirty_marker);
-            return Self::new(dimensions);
+            return Self::new_with_reporter(dimensions, reporter);
         }
 
         // Load all-index.
@@ -509,6 +532,7 @@ impl UsearchStore {
                 all,
                 dimensions,
             },
+            reporter,
         })
     }
 }
@@ -773,11 +797,21 @@ impl crate::index::VectorStore for UsearchStore {
         vector: &[f32],
         qualified_name: String,
     ) -> Result<u64, MemoryError> {
-        self.inner.add(scope, vector, qualified_name)
+        let result = self.inner.add(scope, vector, qualified_name);
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(_) => self.reporter.report_err("index add failed"),
+        }
+        result
     }
 
     fn remove(&self, scope: &Scope, qualified_name: &str) -> Result<(), MemoryError> {
-        self.inner.remove(scope, qualified_name)
+        let result = self.inner.remove(scope, qualified_name);
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(_) => self.reporter.report_err("index remove failed"),
+        }
+        result
     }
 
     fn search(
@@ -786,7 +820,12 @@ impl crate::index::VectorStore for UsearchStore {
         query: &[f32],
         limit: usize,
     ) -> Result<Vec<(u64, String, f32)>, MemoryError> {
-        self.inner.search(filter, query, limit)
+        let result = self.inner.search(filter, query, limit);
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(_) => self.reporter.report_err("index search failed"),
+        }
+        result
     }
 
     fn find_by_name(&self, qualified_name: &str) -> Option<u64> {
