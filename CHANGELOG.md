@@ -1,3 +1,13 @@
+## [0.10.1] - 2026-05-10
+
+### Added
+- `--allowed-host` CLI arg / `MEMORY_MCP_ALLOWED_HOST` env var for DNS rebinding protection bypass behind reverse proxies
+- `--version` flag via clap
+- Integration tests for rmcp host header validation (accepted, rejected, allowed)
+
+### Fixed
+- Server rejected requests via reverse proxy due to rmcp DNS rebinding protection blocking unrecognized `Host` headers
+
 ## [0.10.0] - 2026-05-10
 
 ### Added

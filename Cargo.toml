@@ -1,6 +1,6 @@
 [package]
 name = "memory-mcp"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MCP server for semantic memory — pure-Rust embeddings, vector search, git-backed storage"
@@ -91,6 +91,7 @@ libz-sys = { version = "1", features = ["static"] }
 
 [dev-dependencies]
 git2 = "0.20"
+portpicker = "0.1"
 tempfile = "3"
 
 # candle 0.10 unconditionally pulls in the onig C regex library via tokenizers

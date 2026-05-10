@@ -29,7 +29,8 @@ use memory_mcp::types::{validate_branch_name, AppState};
 #[derive(Parser)]
 #[command(
     name = "memory-mcp",
-    about = "Semantic memory MCP server for AI agents"
+    about = "Semantic memory MCP server for AI agents",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -124,6 +125,12 @@ struct ServeArgs {
         env = "MEMORY_MCP_SESSION_RATE_WINDOW_SECS"
     )]
     session_rate_window_secs: u64,
+
+    /// Additional hostname to accept in the HTTP Host header. Required when
+    /// the server is accessed via a reverse proxy or gateway (e.g.
+    /// `memory-mcp.svc.echoes`). Can be specified multiple times.
+    #[arg(long, env = "MEMORY_MCP_ALLOWED_HOST")]
+    allowed_host: Vec<String>,
 
     #[command(flatten)]
     embed: EmbedArgs,
@@ -510,6 +517,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         {
             let mut server_config = StreamableHttpServerConfig::default();
             server_config.cancellation_token = ct_child;
+            for host in &args.allowed_host {
+                server_config.allowed_hosts.push(host.clone());
+            }
             server_config
         },
     );
@@ -731,6 +741,64 @@ mod tests {
     #[test]
     fn test_parse_nonzero_u64_one_is_ok() {
         assert_eq!(parse_nonzero_u64("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_cli_serve_allowed_host_single() {
+        let cli = Cli::try_parse_from([
+            "memory-mcp",
+            "serve",
+            "--allowed-host",
+            "memory-mcp.svc.echoes",
+        ])
+        .expect("serve --allowed-host should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => {
+                assert_eq!(args.allowed_host, vec!["memory-mcp.svc.echoes"]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_allowed_host_multiple() {
+        let cli = Cli::try_parse_from([
+            "memory-mcp",
+            "serve",
+            "--allowed-host",
+            "host-a.example.com",
+            "--allowed-host",
+            "host-b.example.com:8080",
+        ])
+        .expect("serve with multiple --allowed-host should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => {
+                assert_eq!(args.allowed_host.len(), 2);
+                assert_eq!(args.allowed_host[0], "host-a.example.com");
+                assert_eq!(args.allowed_host[1], "host-b.example.com:8080");
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_no_allowed_host_defaults_empty() {
+        let cli =
+            Cli::try_parse_from(["memory-mcp", "serve"]).expect("serve without hosts should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => {
+                assert!(args.allowed_host.is_empty());
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_version() {
+        match Cli::try_parse_from(["memory-mcp", "--version"]) {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion),
+            Ok(_) => panic!("--version should cause clap to exit"),
+        }
     }
 
     #[test]
