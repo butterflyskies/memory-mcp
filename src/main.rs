@@ -8,6 +8,7 @@ use mcp_session::{BoundedSessionManager, SessionConfig};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use tracing::Instrument;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // The SdkTracerProvider type is used in the otlp feature only.
@@ -124,6 +125,9 @@ struct ServeArgs {
     )]
     session_rate_window_secs: u64,
 
+    #[command(flatten)]
+    embed: EmbedArgs,
+
     /// Enable OTLP span export. The server will crash on startup if the
     /// collector is unreachable. Use --otlp-optional for graceful fallback.
     #[cfg(feature = "otlp")]
@@ -138,7 +142,34 @@ struct ServeArgs {
 }
 
 #[derive(Args)]
-struct WarmupArgs {}
+struct WarmupArgs {
+    #[command(flatten)]
+    embed: EmbedArgs,
+}
+
+#[derive(Args)]
+struct EmbedArgs {
+    /// Maximum seconds a single embedding call may block. After a timeout the
+    /// caller receives an error but the worker recovers automatically.
+    #[arg(
+        long,
+        default_value_t = 30,
+        env = "MEMORY_MCP_EMBED_TIMEOUT_SECS",
+        value_parser = parse_nonzero_u64,
+    )]
+    embed_timeout_secs: u64,
+
+    /// Maximum number of embedding requests that can queue behind the worker.
+    /// Higher values allow more concurrent callers to wait; lower values fail
+    /// fast under load.
+    #[arg(
+        long,
+        default_value_t = 64,
+        env = "MEMORY_MCP_EMBED_QUEUE_SIZE",
+        value_parser = parse_nonzero_usize,
+    )]
+    embed_queue_size: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Tracing initialisation
@@ -353,8 +384,11 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let repo = MemoryRepo::init_or_open(&repo_path, remote_url.as_deref())
         .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 
-    let embedding: Box<dyn EmbeddingBackend> =
-        Box::new(CandleEmbeddingEngine::new().context("failed to init embedding engine")?);
+    let embed_timeout = std::time::Duration::from_secs(args.embed.embed_timeout_secs);
+    let embedding: Box<dyn EmbeddingBackend> = Box::new(
+        CandleEmbeddingEngine::new(embed_timeout, args.embed.embed_queue_size)
+            .context("failed to init embedding engine")?,
+    );
 
     let dimensions = embedding.dimensions();
 
@@ -376,17 +410,71 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         info!("removed legacy single-index files");
     }
 
-    let index: Box<dyn VectorStore> = Box::new(
+    let repo = Arc::new(repo);
+
+    // Load the persisted index and check freshness against repo HEAD.
+    // If the SHA doesn't match, discard the loaded index entirely and start
+    // fresh — this prevents ghost entries from deleted memories lingering.
+    let mut index: Box<dyn VectorStore> = Box::new(
         UsearchStore::load(&index_dir, dimensions).unwrap_or_else(|e| {
             tracing::warn!("could not load index ({}), creating fresh", e);
             UsearchStore::new(dimensions).expect("failed to create index")
         }),
     );
 
+    let head_sha = repo.head_sha().await;
+    let needs_reindex = head_sha != index.commit_sha();
+    if needs_reindex {
+        info!(
+            head = ?head_sha,
+            index = ?index.commit_sha(),
+            "index SHA does not match repo HEAD — rebuilding from scratch"
+        );
+        index = Box::new(UsearchStore::new(dimensions).expect("failed to create index"));
+
+        match memory_mcp::server::full_reindex(&repo, embedding.as_ref(), index.as_ref())
+            .instrument(tracing::info_span!("startup.full_reindex"))
+            .await
+        {
+            Ok(stats) => {
+                info!(
+                    added = stats.added,
+                    errors = stats.errors,
+                    "startup reindex complete"
+                );
+                if stats.added > 0 || stats.errors == 0 {
+                    if stats.errors > 0 {
+                        tracing::warn!(
+                            added = stats.added,
+                            errors = stats.errors,
+                            "startup reindex partially failed — some memories may not be searchable"
+                        );
+                    }
+                    if let Some(sha) = &head_sha {
+                        index.set_commit_sha(Some(sha));
+                    }
+                } else {
+                    tracing::warn!(
+                        errors = stats.errors,
+                        "all embeds failed — SHA not stamped, will retry on next startup"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "startup reindex failed — SHA not stamped, will retry on next startup"
+                );
+            }
+        }
+    } else {
+        tracing::debug!(sha = ?head_sha, "index SHA matches repo HEAD — skipping reindex");
+    }
+
     let auth = AuthProvider::new();
 
     let state = Arc::new(AppState::new(
-        Arc::new(repo),
+        repo,
         args.branch.clone(),
         embedding,
         index,
@@ -460,9 +548,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Persist the scoped vector index so the next startup can skip a full reindex.
     std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
-    // TODO: set commit_sha to repo HEAD before saving so the next startup
-    // can use SHA-based freshness to skip reindexing unchanged scopes.
-    // For now, indexes are always rebuilt from scratch on startup if missing.
+    if let Some(sha) = state_for_shutdown.repo.head_sha().await {
+        state_for_shutdown.index.set_commit_sha(Some(&sha));
+    }
     if let Err(e) = state_for_shutdown.index.save(&index_dir) {
         tracing::warn!("failed to persist vector index on shutdown: {}", e);
     } else {
@@ -474,9 +562,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
 /// Load the embedding model and run a single dummy embed to warm the on-disk
 /// model cache, then exit. Intended for use as a Kubernetes init container.
-async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
+async fn run_warmup(args: WarmupArgs) -> anyhow::Result<()> {
     info!("warming up embedding model '{}'", MODEL_ID);
-    let engine = CandleEmbeddingEngine::new().context("failed to init embedding engine")?;
+    let engine = CandleEmbeddingEngine::new(
+        std::time::Duration::from_secs(args.embed.embed_timeout_secs),
+        args.embed.embed_queue_size,
+    )
+    .context("failed to init embedding engine")?;
     // Run one dummy embed to ensure the model weights are fully loaded and any
     // cached files are written to disk.
     let _ = engine
@@ -494,6 +586,17 @@ async fn run_warmup(_args: WarmupArgs) -> anyhow::Result<()> {
 /// Parse a `usize` that must be at least 1. Used as a clap `value_parser`.
 fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
     let n: usize = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid integer"))?;
+    if n == 0 {
+        return Err("value must be at least 1".to_owned());
+    }
+    Ok(n)
+}
+
+/// Parse a `u64` that must be at least 1. Used as a clap `value_parser`.
+fn parse_nonzero_u64(s: &str) -> Result<u64, String> {
+    let n: u64 = s
         .parse()
         .map_err(|_| format!("'{s}' is not a valid integer"))?;
     if n == 0 {
@@ -616,8 +719,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_nonzero_usize_hundred_is_ok() {
-        assert_eq!(parse_nonzero_usize("100").unwrap(), 100);
+    fn test_parse_nonzero_u64_zero_is_err() {
+        assert!(parse_nonzero_u64("0").is_err());
+    }
+
+    #[test]
+    fn test_parse_nonzero_u64_non_numeric_is_err() {
+        assert!(parse_nonzero_u64("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_nonzero_u64_one_is_ok() {
+        assert_eq!(parse_nonzero_u64("1").unwrap(), 1);
     }
 
     #[test]

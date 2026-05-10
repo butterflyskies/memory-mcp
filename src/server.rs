@@ -199,6 +199,91 @@ async fn incremental_reindex(
     stats
 }
 
+/// Re-embed and re-index all memories in the repository.
+///
+/// This is a full rebuild: all memories are listed, their content is embedded,
+/// and the index is updated. Intended for startup freshness checks and
+/// recovery after a crash that discarded an in-progress index.
+///
+/// Unlike delegating to `incremental_reindex`, this function uses the content
+/// already loaded by `list_memories` to avoid reading each file a second time.
+pub async fn full_reindex(
+    repo: &Arc<MemoryRepo>,
+    embedding: &dyn EmbeddingBackend,
+    index: &dyn VectorStore,
+) -> Result<ReindexStats, MemoryError> {
+    let memories = repo.list_memories(None).await?;
+    if memories.is_empty() {
+        return Ok(ReindexStats::default());
+    }
+
+    let mut stats = ReindexStats::default();
+
+    let items: Vec<(Scope, String, String)> = memories
+        .into_iter()
+        .map(|m| {
+            let qualified = format!("{}/{}", m.metadata.scope.dir_prefix(), m.name);
+            (m.metadata.scope, qualified, m.content)
+        })
+        .collect();
+
+    // Embed and index in chunks so each embed() call maps to roughly one
+    // BERT forward pass (MAX_BATCH_SIZE=64 inside the worker) and stays
+    // within the per-call timeout budget.
+    const REINDEX_BATCH_SIZE: usize = 64;
+    for chunk in items.chunks(REINDEX_BATCH_SIZE) {
+        let contents: Vec<String> = chunk.iter().map(|(_, _, c)| c.clone()).collect();
+
+        let vectors = match embedding.embed(&contents).await {
+            Ok(v) => v,
+            Err(batch_err) => {
+                warn!(error = %batch_err, "full_reindex: batch embed failed; falling back to per-item");
+                let mut vecs = Vec::with_capacity(contents.len());
+                for (i, content) in contents.iter().enumerate() {
+                    match embedding.embed(std::slice::from_ref(content)).await {
+                        Ok(mut v) => vecs.push(v.remove(0)),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                qualified_name = %chunk[i].1,
+                                "full_reindex: per-item embed failed; skipping"
+                            );
+                            stats.errors += 1;
+                            vecs.push(Vec::new());
+                        }
+                    }
+                }
+                vecs
+            }
+        };
+
+        debug_assert_eq!(
+            vectors.len(),
+            chunk.len(),
+            "embed() must return exactly one vector per input"
+        );
+
+        for ((scope, qualified_name, _), vector) in chunk.iter().zip(vectors.iter()) {
+            if vector.is_empty() {
+                continue;
+            }
+            match index.add(scope, vector, qualified_name.clone()) {
+                Ok(_) => stats.added += 1,
+                Err(e) => {
+                    warn!(
+                        qualified_name = %qualified_name,
+                        error = %e,
+                        "full_reindex: index add failed; skipping"
+                    );
+                    stats.errors += 1;
+                }
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
 #[tool_router]
 impl MemoryServer {
     /// Create a new MCP server backed by the given application state.
@@ -793,6 +878,7 @@ impl MemoryServer {
                     .map_err(ErrorData::from)?
                     .map_err(ErrorData::from)?;
 
+                    let mut reindex_failed_completely = false;
                     if !changes.is_empty() {
                         let stats = incremental_reindex(
                             &state.repo,
@@ -809,7 +895,18 @@ impl MemoryServer {
                             errors = stats.errors,
                             "incremental reindex complete"
                         );
+                        reindex_failed_completely =
+                            stats.added == 0 && stats.updated == 0 && stats.errors > 0;
                         reindex_stats = Some(stats);
+                    }
+
+                    // Advance the stored SHA so the next startup doesn't trigger
+                    // a full reindex for changes already processed. Skip when every
+                    // embed failed so the next startup retries.
+                    if !reindex_failed_completely {
+                        if let Some(sha) = state.repo.head_sha().await {
+                            state.index.set_commit_sha(Some(&sha));
+                        }
                     }
                 }
 

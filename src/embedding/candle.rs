@@ -1,12 +1,14 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use hf_hub::{api::sync::ApiBuilder, Cache, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
+use tokio::sync::oneshot;
+use tokio::time::{timeout, Duration};
 
 use super::EmbeddingBackend;
 use crate::error::MemoryError;
@@ -14,13 +16,30 @@ use crate::error::MemoryError;
 /// HuggingFace model ID. Only BGE-small-en-v1.5 is supported currently.
 pub const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
 
+// ---------------------------------------------------------------------------
+// Worker thread
+// ---------------------------------------------------------------------------
+
+type EmbedRequest = (
+    Vec<String>,
+    oneshot::Sender<Result<Vec<Vec<f32>>, MemoryError>>,
+);
+
 /// Pure-Rust embedding engine using candle for BERT inference.
 ///
 /// Uses candle-transformers' BERT implementation with tokenizers for
 /// tokenisation. No C/C++ FFI dependencies — compiles on all platforms.
+///
+/// A dedicated OS thread owns the model exclusively. Async callers send work
+/// via a channel and await a oneshot reply. If a call times out, the caller
+/// gets an error immediately; the worker finishes its current task, discards
+/// the stale reply channel, and picks up the next request — no restart needed.
 pub struct CandleEmbeddingEngine {
-    inner: Arc<Mutex<CandleInner>>,
+    // Option so Drop can take ownership of tx to close it before joining.
+    tx: Option<mpsc::SyncSender<EmbedRequest>>,
+    worker: Option<std::thread::JoinHandle<()>>,
     dim: usize,
+    embed_timeout: Duration,
 }
 
 struct CandleInner {
@@ -34,7 +53,15 @@ impl CandleEmbeddingEngine {
     ///
     /// Downloads model weights from HuggingFace Hub on first use (cached
     /// in the standard HF cache directory, respects `HF_HOME`).
-    pub fn new() -> Result<Self, MemoryError> {
+    ///
+    /// `embed_timeout` caps how long a single [`embed`](Self::embed) call may
+    /// block. If the worker is still running when the timeout fires, the caller
+    /// gets an error but the engine recovers automatically — no restart needed.
+    ///
+    /// `queue_size` sets the bounded channel capacity — how many requests can
+    /// queue behind the one being processed. Extra callers get an immediate
+    /// "busy" error.
+    pub fn new(embed_timeout: Duration, queue_size: usize) -> Result<Self, MemoryError> {
         let device = Device::Cpu;
 
         let (config, mut tokenizer, weights_path) =
@@ -66,57 +93,140 @@ impl CandleEmbeddingEngine {
 
         let dim = config.hidden_size;
 
+        let (tx, rx) = mpsc::sync_channel::<EmbedRequest>(queue_size);
+
+        let worker = std::thread::Builder::new()
+            .name("embed-worker".into())
+            .spawn(move || {
+                let inner = CandleInner {
+                    model,
+                    tokenizer,
+                    device,
+                };
+                worker_loop(inner, dim, rx);
+            })
+            .map_err(|e| MemoryError::Embedding(format!("failed to spawn embed worker: {e}")))?;
+
         Ok(Self {
-            inner: Arc::new(Mutex::new(CandleInner {
-                model,
-                tokenizer,
-                device,
-            })),
+            tx: Some(tx),
+            worker: Some(worker),
             dim,
+            embed_timeout,
         })
+    }
+
+    /// Construct an engine backed by a caller-supplied worker sender.
+    ///
+    /// Bypasses model loading entirely. The caller is responsible for spawning
+    /// a thread that reads from the other end of the channel. Used only in
+    /// tests to exercise the channel mechanics (timeout, disconnect, busy)
+    /// without needing the HuggingFace model cache.
+    #[cfg(test)]
+    fn with_worker(
+        tx: mpsc::SyncSender<EmbedRequest>,
+        dim: usize,
+        embed_timeout: Duration,
+    ) -> Self {
+        Self {
+            tx: Some(tx),
+            worker: None,
+            dim,
+            embed_timeout,
+        }
+    }
+}
+
+impl Drop for CandleEmbeddingEngine {
+    fn drop(&mut self) {
+        // Close the channel first so the worker's `for ... in rx` loop exits.
+        drop(self.tx.take());
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Main loop for the dedicated embedding worker thread.
+///
+/// Receives `(texts, reply_tx)` pairs, runs inference, and sends the result
+/// back on `reply_tx`. If the receiver was dropped (the async caller timed
+/// out), the send fails silently and the loop continues — this is the
+/// self-healing path.
+fn worker_loop(mut inner: CandleInner, dim: usize, rx: mpsc::Receiver<EmbedRequest>) {
+    for (texts, reply_tx) in rx {
+        let span = tracing::debug_span!(
+            "embedding.embed",
+            batch_size = texts.len(),
+            dimensions = dim,
+            model = MODEL_ID,
+        );
+        let _enter = span.enter();
+
+        let mut panicked = false;
+        let result = catch_unwind(AssertUnwindSafe(|| embed_batch(&inner, &texts))).unwrap_or_else(
+            |panic_payload| {
+                panicked = true;
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic in embedding engine".to_string()
+                };
+                tracing::warn!(error = %msg, "embedding engine panicked — recovering");
+                Err(MemoryError::Embedding(format!(
+                    "embedding engine panicked: {msg}"
+                )))
+            },
+        );
+
+        let _ = reply_tx.send(result);
+
+        if panicked {
+            inner.tokenizer.with_padding(Some(PaddingParams {
+                strategy: tokenizers::PaddingStrategy::BatchLongest,
+                ..Default::default()
+            }));
+            let _ = inner.tokenizer.with_truncation(Some(TruncationParams {
+                max_length: 512,
+                ..Default::default()
+            }));
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl EmbeddingBackend for CandleEmbeddingEngine {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
-        let arc = Arc::clone(&self.inner);
-        let texts = texts.to_vec();
-        let batch_size = texts.len();
-        let dim = self.dim;
+        let (reply_tx, reply_rx) = oneshot::channel();
 
-        // Capture current span before entering spawn_blocking so the
-        // child thread can enter it and keep the span hierarchy intact.
-        let span = tracing::debug_span!(
-            "embedding.embed",
-            batch_size,
-            dimensions = dim,
-            model = MODEL_ID,
-        );
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| MemoryError::Embedding("embedding engine has been shut down".into()))?;
 
-        tokio::task::spawn_blocking(move || {
-            let _enter = span.enter();
-            let guard = arc.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!("embedding mutex was poisoned — clearing poison and continuing");
-                poisoned.into_inner()
-            });
-            catch_unwind(AssertUnwindSafe(|| embed_batch(&guard, &texts))).unwrap_or_else(
-                |panic_payload| {
-                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic in embedding engine".to_string()
-                    };
-                    Err(MemoryError::Embedding(format!(
-                        "embedding engine panicked: {msg}"
-                    )))
-                },
-            )
-        })
-        .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
+        tx.try_send((texts.to_vec(), reply_tx))
+            .map_err(|e| match e {
+                mpsc::TrySendError::Full(_) => {
+                    MemoryError::Embedding("embedding worker is busy — try again".into())
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    MemoryError::Embedding("embedding worker has exited — restart required".into())
+                }
+            })?;
+
+        match timeout(self.embed_timeout, reply_rx).await {
+            Ok(Ok(result)) => result,
+            // Fires if the worker drops reply_tx without sending (e.g. a
+            // double-panic that escapes catch_unwind, or a panic in span setup).
+            Ok(Err(_)) => Err(MemoryError::Embedding(
+                "embedding worker dropped the reply channel unexpectedly".into(),
+            )),
+            Err(_elapsed) => Err(MemoryError::Embedding(format!(
+                "embedding timed out after {:.1}s — the worker will recover automatically",
+                self.embed_timeout.as_secs_f64(),
+            ))),
+        }
     }
 
     fn dimensions(&self) -> usize {
@@ -290,4 +400,139 @@ fn embed_chunk(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, M
     }
 
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Build a fake engine whose worker applies `handler` to every request.
+    ///
+    /// `handler` receives the texts and the reply sender; it can sleep, panic,
+    /// drop the sender, or send any result — enabling controlled fault injection
+    /// without touching the model loading path.
+    fn fake_engine<F>(timeout: Duration, handler: F) -> CandleEmbeddingEngine
+    where
+        F: Fn(Vec<String>, oneshot::Sender<Result<Vec<Vec<f32>>, MemoryError>>) + Send + 'static,
+    {
+        let (tx, rx) = mpsc::sync_channel::<EmbedRequest>(1);
+        std::thread::spawn(move || {
+            for (texts, reply_tx) in rx {
+                handler(texts, reply_tx);
+            }
+        });
+        CandleEmbeddingEngine::with_worker(tx, 4, timeout)
+    }
+
+    /// Worker that immediately returns a fixed-size zero vector per input.
+    fn ok_handler(
+        texts: Vec<String>,
+        reply_tx: oneshot::Sender<Result<Vec<Vec<f32>>, MemoryError>>,
+    ) {
+        let vecs = texts.iter().map(|_| vec![0.0f32; 4]).collect();
+        let _ = reply_tx.send(Ok(vecs));
+    }
+
+    #[tokio::test]
+    async fn happy_path_returns_vectors() {
+        let engine = fake_engine(Duration::from_secs(5), ok_handler);
+        let result = engine
+            .embed(&["hello".to_string(), "world".to_string()])
+            .await;
+        let vecs = result.expect("embed should succeed");
+        assert_eq!(vecs.len(), 2);
+        assert_eq!(vecs[0].len(), 4);
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_error_and_worker_recovers() {
+        // Barrier lets us prove the worker is still alive after the timeout
+        // fires on the first request.
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier2 = Arc::clone(&barrier);
+
+        let engine = fake_engine(Duration::from_millis(50), move |texts, reply_tx| {
+            if texts[0] == "slow" {
+                // Block until the test signals us to proceed (after timeout fires).
+                barrier2.wait();
+                // Reply arrives after the caller's receiver was dropped — send
+                // fails silently, which is the self-healing path.
+                let _ = reply_tx.send(Ok(vec![vec![0.0; 4]]));
+                // Signal the test that we've finished processing the stale request.
+                barrier2.wait();
+            } else {
+                ok_handler(texts, reply_tx);
+            }
+        });
+
+        // First call times out.
+        let err = engine
+            .embed(&["slow".to_string()])
+            .await
+            .expect_err("slow embed should time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
+
+        // Unblock the worker and wait for it to finish the stale request.
+        barrier.wait();
+        barrier.wait();
+
+        // Second call should succeed — the worker recovered.
+        let result = engine.embed(&["fast".to_string()]).await;
+        assert!(
+            result.is_ok(),
+            "engine should recover after timeout: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_worker_returns_error() {
+        let (tx, rx) = mpsc::sync_channel::<EmbedRequest>(1);
+        // Drop the receiver immediately — worker is "dead".
+        drop(rx);
+        let engine = CandleEmbeddingEngine::with_worker(tx, 4, Duration::from_secs(5));
+
+        let err = engine
+            .embed(&["anything".to_string()])
+            .await
+            .expect_err("disconnected worker should error");
+        assert!(
+            err.to_string().contains("exited"),
+            "expected 'exited' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_worker_returns_error() {
+        // Channel capacity 0 is not allowed by SyncSender; use capacity 1 but
+        // send two requests without the worker consuming either.
+        // Easier: use a zero-sleep worker that we pre-fill the channel for.
+        let (tx, rx) = mpsc::sync_channel::<EmbedRequest>(1);
+
+        // Pre-fill the single channel slot by sending directly, bypassing embed().
+        let (filler_tx, _filler_rx) = oneshot::channel::<Result<Vec<Vec<f32>>, MemoryError>>();
+        tx.send((vec!["fill".to_string()], filler_tx)).unwrap();
+
+        // Now embed() hits try_send on a full channel.
+        let engine = CandleEmbeddingEngine::with_worker(tx, 4, Duration::from_secs(5));
+        let err = engine
+            .embed(&["overflow".to_string()])
+            .await
+            .expect_err("full channel should error");
+        assert!(
+            err.to_string().contains("busy"),
+            "expected 'busy' in error, got: {err}"
+        );
+
+        drop(rx); // clean up
+    }
 }

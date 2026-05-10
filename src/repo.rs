@@ -180,6 +180,25 @@ impl MemoryRepo {
         })
     }
 
+    /// Return the current HEAD commit SHA as a hex string, or `None` if the
+    /// branch is unborn (no commits yet).
+    pub async fn head_sha(self: &Arc<Self>) -> Option<String> {
+        let me = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let repo = me.inner.lock().expect("repo mutex poisoned");
+            let oid_bytes = capture_head_oid(&repo).ok()?;
+            if oid_bytes == [0u8; 20] {
+                return None;
+            }
+            git2::Oid::from_bytes(&oid_bytes)
+                .ok()
+                .map(|oid| oid.to_string())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Absolute path for a memory's markdown file inside the repo.
     fn memory_path(&self, name: &str, scope: &Scope) -> PathBuf {
         self.root
