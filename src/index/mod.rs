@@ -181,13 +181,11 @@ mod tests {
             .expect("ProjectAndGlobal search should succeed");
         let pag_names: Vec<&str> = pag_results.iter().map(|(_, n, _)| n.as_str()).collect();
         assert!(
-            pag_names
-                .iter()
-                .any(|n| *n == "projects/testproj/contract-proj"),
+            pag_names.contains(&"projects/testproj/contract-proj"),
             "TC-02d: ProjectAndGlobal should include project entries"
         );
         assert!(
-            pag_names.iter().any(|n| *n == "global/contract-global"),
+            pag_names.contains(&"global/contract-global"),
             "TC-02d: ProjectAndGlobal should include global entries"
         );
         // Clean up

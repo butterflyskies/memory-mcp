@@ -598,9 +598,8 @@ fn auth_failure_produces_warn_event() {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
-        match &saved_token {
-            Some(t) => std::env::set_var("MEMORY_MCP_GITHUB_TOKEN", t),
-            None => {} // already removed above
+        if let Some(t) = &saved_token {
+            std::env::set_var("MEMORY_MCP_GITHUB_TOKEN", t);
         }
     });
     let store = store.lock().unwrap();

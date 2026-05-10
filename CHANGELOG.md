@@ -1,3 +1,33 @@
+## [0.10.0] - 2026-05-10
+
+### Added
+- Startup reindex: compare persisted index SHA against repo HEAD, rebuild from scratch on mismatch (#193)
+- `full_reindex` public function for crash recovery and startup freshness checks
+- `MemoryRepo::head_sha()` async method for reading HEAD commit SHA
+- `--embed-timeout-secs` CLI arg (default 30, env `MEMORY_MCP_EMBED_TIMEOUT_SECS`)
+- `--embed-queue-size` CLI arg (default 64, env `MEMORY_MCP_EMBED_QUEUE_SIZE`)
+- `parse_nonzero_u64` validator with tests
+- Worker thread `Drop` impl that closes channel and joins thread
+
+### Changed
+- **Breaking:** `CandleEmbeddingEngine::new()` now takes `(Duration, usize)` parameters
+- **Breaking:** `CandleEmbeddingEngine` no longer implements `UnwindSafe`/`RefUnwindSafe`
+- Replace mutex+spawn_blocking embedding design with dedicated worker thread + bounded channel (#192)
+- Embed calls self-heal after timeouts — worker continues processing next request
+- `catch_unwind` in worker loop survives panics with tokenizer state recovery
+- `head_sha()` uses `spawn_blocking` consistent with other `MemoryRepo` methods
+- Startup reindex discards loaded index to prevent ghost entries from deleted memories
+- SHA stamped on shutdown save and after sync pulls to prevent spurious reindexes
+- Upgrade OpenTelemetry stack to 0.31 and tokenizers to 0.23
+- Bump the rust-dependencies group with 2 updates
+
+### Fixed
+- Embedding timeout: hung candle inference no longer blocks all future embed calls (#192)
+- Crash recovery: index rebuilt automatically after kill -9, no more empty recall results (#193)
+- IPv6 localhost exception and review findings from #178
+- Record count on local span to prevent parent span leak
+- Pre-existing clippy lints from Rust 1.95 (`manual_contains`, `single_match`)
+
 ## [0.7.1] - 2026-04-21
 
 ### Changed
