@@ -290,6 +290,11 @@ All options can be set via CLI flags or environment variables:
 | `--mcp-path` | `MEMORY_MCP_PATH` | `/mcp` | URL path for the MCP endpoint |
 | `--remote-url` | `MEMORY_MCP_REMOTE_URL` | *(none)* | Git remote URL. Omit for local-only mode. |
 | `--branch` | `MEMORY_MCP_BRANCH` | `main` | Branch for push/pull operations |
+| `--max-sessions` | `MEMORY_MCP_MAX_SESSIONS` | `100` | Maximum concurrent MCP sessions |
+| `--session-rate-limit` | `MEMORY_MCP_SESSION_RATE_LIMIT` | `10` | Max new sessions per rate-limit window (0 to disable) |
+| `--session-rate-window-secs` | `MEMORY_MCP_SESSION_RATE_WINDOW_SECS` | `60` | Rate-limit window duration in seconds |
+| `--embed-timeout-secs` | `MEMORY_MCP_EMBED_TIMEOUT_SECS` | `30` | Max seconds per embedding call before timeout |
+| `--embed-queue-size` | `MEMORY_MCP_EMBED_QUEUE_SIZE` | `64` | Embedding request queue capacity |
 
 ## Authentication
 
@@ -316,6 +321,8 @@ Token resolution order: `MEMORY_MCP_GITHUB_TOKEN` env var → `~/.config/memory-
 ## Embedding model
 
 Embeddings are computed locally using [candle](https://github.com/huggingface/candle) with [BGE-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) (384 dimensions). The model is downloaded from HuggingFace Hub on first run — no API keys required. Use `memory-mcp warmup` to pre-download.
+
+A dedicated worker thread processes embedding requests sequentially. If a call exceeds `--embed-timeout-secs`, the caller gets an error but the worker recovers automatically and picks up the next request. Panics in the inference engine are caught and recovered from without killing the worker. On startup, the vector index is checked against the repo HEAD and rebuilt if stale or missing (e.g. after a crash).
 
 ## Deployment
 

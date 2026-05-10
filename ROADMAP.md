@@ -50,16 +50,19 @@ Closed issues from original TODO: #60 (cargo-auditable), #62 (Trusted Publishing
 
 **Goal:** Lay the observability foundation early so all subsequent work is automatically instrumented. Improve dev workflow and testing infrastructure.
 
-| Issue | Title | Effort | Depends on |
-|-------|-------|--------|------------|
-| #52 (partial) | Tracing scaffold | Medium | -- |
-| #114 | Surface keep-alive timeout to clients | Small | -- |
-| #94 | Vector index trait abstraction | Medium | -- |
-| #109 | Content-level secret scanning | Medium | #108 |
-| #98 | Automate CHANGELOG without bypassing branch protection | Medium | -- |
-| #78 | `validate` subcommand + Docker build speedup | Large | -- |
-| #145 | Extract OAuth client ID from hardcoded const into config module | Small | -- |
-| #146 | Integration tests for auth login, auth status, MEMORY_MCP_BIND | Medium | -- |
+| Issue | Title | Effort | Depends on | Status |
+|-------|-------|--------|------------|--------|
+| #52 (partial) | Tracing scaffold | Medium | -- | **Done** (v0.8.0, PR #170) |
+| #94 | Vector index trait abstraction | Medium | -- | **Done** (v0.8.0, PR #177) |
+| #145 | DeviceFlowProvider trait | Small | -- | **Done** (v0.8.0, PR #178) |
+| #192 | Embed timeout — self-healing worker thread | Medium | -- | **Done** (v0.10.0, PR #199) |
+| #193 | Startup reindex after crash | Medium | -- | **Done** (v0.10.0, PR #199) |
+| #164 | `/readyz` health endpoint | Small | #94 | |
+| #114 | Surface keep-alive timeout to clients | Small | -- | |
+| #109 | Content-level secret scanning | Medium | #108 | |
+| #98 | Automate CHANGELOG without bypassing branch protection | Medium | -- | |
+| #78 | `validate` subcommand + Docker build speedup | Large | -- | |
+| #146 | Integration tests for auth login, auth status, MEMORY_MCP_BIND | Medium | -- | |
 
 **Key insight:** #52 (comprehensive tracing) is cross-cutting. The scaffold goes in Phase 2 so every new feature gets spans for free. Structured fields: operation, scope, memory_name, duration. OTLP export behind feature flag.
 
@@ -165,7 +168,7 @@ Items without a phase assignment yet. These will be scheduled as priorities beco
 
 ```
 Phase 1 (Stabilize)           ████████████████████  Done (v0.6.0/v0.6.1)
-Phase 2 (Tracing + Quality)   ░░░████░░░░░░░░░░░░░  Next
+Phase 2 (Tracing + Quality)   ░░░████████░░░░░░░░░░  In progress (5/11 done)
   #79 (GitHub App Auth)       ░░░░░██░░░░░░░░░░░░░  Interleave anytime
 Phase 3 (Transport/Stdio)     ░░░░░░░███░░░░░░░░░░  After core quality
 Phase 4 (Search/Lifecycle)    ░░░░░░░░░░███░░░░░░░  After transport
