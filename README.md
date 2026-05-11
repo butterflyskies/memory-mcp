@@ -295,6 +295,8 @@ All options can be set via CLI flags or environment variables:
 | `--session-rate-window-secs` | `MEMORY_MCP_SESSION_RATE_WINDOW_SECS` | `60` | Rate-limit window duration in seconds |
 | `--embed-timeout-secs` | `MEMORY_MCP_EMBED_TIMEOUT_SECS` | `30` | Max seconds per embedding call before timeout |
 | `--embed-queue-size` | `MEMORY_MCP_EMBED_QUEUE_SIZE` | `64` | Embedding request queue capacity |
+| `--require-remote-sync` | `MEMORY_MCP_REQUIRE_REMOTE_SYNC` | `false` | Include sync health in readiness checks. Performs initial pull at startup. |
+| `--health-stale-secs` | `MEMORY_MCP_HEALTH_STALE_SECS` | `0` (disabled) | Seconds before a subsystem with no activity is considered stale. 0 disables. |
 
 ## Authentication
 
@@ -323,6 +325,31 @@ Token resolution order: `MEMORY_MCP_GITHUB_TOKEN` env var → `~/.config/memory-
 Embeddings are computed locally using [candle](https://github.com/huggingface/candle) with [BGE-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) (384 dimensions). The model is downloaded from HuggingFace Hub on first run — no API keys required. Use `memory-mcp warmup` to pre-download.
 
 A dedicated worker thread processes embedding requests sequentially. If a call exceeds `--embed-timeout-secs`, the caller gets an error but the worker recovers automatically and picks up the next request. Panics in the inference engine are caught and recovered from without killing the worker. On startup, the vector index is checked against the repo HEAD and rebuilt if stale or missing (e.g. after a crash).
+
+## Health endpoints
+
+| Endpoint | Purpose | Status code |
+|----------|---------|-------------|
+| `GET /healthz` | Liveness probe — process is running | Always 200 |
+| `GET /readyz` | Readiness probe — subsystems operational | 200 or 503 |
+
+`/readyz` returns structured JSON with per-subsystem status:
+
+```json
+{
+  "status": "ready",
+  "checks": {
+    "git_repo": { "status": "up" },
+    "embedding": { "status": "up" },
+    "vector_index": { "status": "up" },
+    "sync": { "status": "up" }
+  }
+}
+```
+
+The `sync` field appears only when `--require-remote-sync` is enabled. Subsystems report their own health passively during normal operations — the handler reads the latest state with zero probing.
+
+When `--health-stale-secs` is set (e.g. `300`), a subsystem with no successful operations within that window is reported as `"down"` with reason `"stale"`. Disabled by default to prevent idle pods from being evicted.
 
 ## Deployment
 
@@ -358,6 +385,7 @@ The deployment is hardened with:
 - `readOnlyRootFilesystem`, `runAsNonRoot`, `drop: [ALL]` capabilities
 - Split ServiceAccounts (runtime vs bootstrap)
 - Seccomp `RuntimeDefault` profile
+- Liveness (`/healthz`) and readiness (`/readyz`) probes
 
 See [docs/deployment.md](docs/deployment.md) for the full guide.
 

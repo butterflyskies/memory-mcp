@@ -105,6 +105,46 @@ Add to `~/.claude.json` (or your project-local `.mcp.json`):
 
 ---
 
+## Health probes
+
+The server exposes `/healthz` (liveness) and `/readyz` (readiness) on the same
+port as the MCP endpoint. Configure Kubernetes probes:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+`/readyz` returns 200 when all subsystems (git repo, embedding engine, vector
+index) are operational, and 503 with per-subsystem detail when any is degraded.
+Subsystems report health passively during normal operations — the probe does no
+active checking.
+
+### Sync readiness
+
+If `--require-remote-sync` is set, the server performs an initial pull at startup
+and includes sync health in readiness checks. Push/pull failures will cause
+`/readyz` to return 503. Requires `--remote-url` to be configured.
+
+### Staleness detection
+
+Set `--health-stale-secs` (e.g. `300`) to flag subsystems that haven't performed
+a successful operation within the threshold. Disabled by default (`0`) — enable
+only for deployments with consistent traffic where silence indicates a problem.
+
+---
+
 ## Operational notes
 
 ### Resource sizing

@@ -17,6 +17,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider as OtlpProvider;
 
 use memory_mcp::auth::{self, AuthProvider, StoreBackend};
 use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend, MODEL_ID};
+use memory_mcp::health::{healthz_handler, readyz_handler, HealthRegistry};
 use memory_mcp::index::{UsearchStore, VectorStore};
 use memory_mcp::repo::MemoryRepo;
 use memory_mcp::server::MemoryServer;
@@ -131,6 +132,16 @@ struct ServeArgs {
     /// `memory-mcp.svc.echoes`). Can be specified multiple times.
     #[arg(long, env = "MEMORY_MCP_ALLOWED_HOST")]
     allowed_host: Vec<String>,
+
+    /// Include remote sync health in readiness checks. When enabled, push/pull
+    /// failures will cause /readyz to return 503.
+    #[arg(long, default_value_t = false, env = "MEMORY_MCP_REQUIRE_REMOTE_SYNC")]
+    require_remote_sync: bool,
+
+    /// Seconds after which a subsystem with no successful operations is considered
+    /// stale. Set to 0 to disable staleness detection (default).
+    #[arg(long, default_value_t = 0, env = "MEMORY_MCP_HEALTH_STALE_SECS")]
+    health_stale_secs: u64,
 
     #[command(flatten)]
     embed: EmbedArgs,
@@ -387,14 +398,35 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
     let remote_url = args.remote_url.filter(|u| !u.is_empty());
 
+    if args.require_remote_sync && remote_url.is_none() {
+        anyhow::bail!("--require-remote-sync requires --remote-url to be set");
+    }
+
+    // Create the health registry early so reporters can be passed to subsystems.
+    let stale_threshold = if args.health_stale_secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(args.health_stale_secs))
+    };
+    let health = HealthRegistry::with_config(args.require_remote_sync, stale_threshold);
+
     // Initialise subsystems — each called function creates its own span.
-    let repo = MemoryRepo::init_or_open(&repo_path, remote_url.as_deref())
-        .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
+    let repo = MemoryRepo::init_or_open_with_reporter(
+        &repo_path,
+        remote_url.as_deref(),
+        health.git.clone(),
+        health.sync.clone(),
+    )
+    .with_context(|| format!("failed to open/init repo at {}", repo_path.display()))?;
 
     let embed_timeout = std::time::Duration::from_secs(args.embed.embed_timeout_secs);
     let embedding: Box<dyn EmbeddingBackend> = Box::new(
-        CandleEmbeddingEngine::new(embed_timeout, args.embed.embed_queue_size)
-            .context("failed to init embedding engine")?,
+        CandleEmbeddingEngine::new(
+            embed_timeout,
+            args.embed.embed_queue_size,
+            health.embedding.clone(),
+        )
+        .context("failed to init embedding engine")?,
     );
 
     let dimensions = embedding.dimensions();
@@ -423,62 +455,99 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // If the SHA doesn't match, discard the loaded index entirely and start
     // fresh — this prevents ghost entries from deleted memories lingering.
     let mut index: Box<dyn VectorStore> = Box::new(
-        UsearchStore::load(&index_dir, dimensions).unwrap_or_else(|e| {
-            tracing::warn!("could not load index ({}), creating fresh", e);
-            UsearchStore::new(dimensions).expect("failed to create index")
-        }),
+        UsearchStore::load_with_reporter(&index_dir, dimensions, health.vector_index.clone())
+            .unwrap_or_else(|e| {
+                tracing::warn!("could not load index ({}), creating fresh", e);
+                UsearchStore::new_with_reporter(dimensions, health.vector_index.clone())
+                    .expect("failed to create index")
+            }),
     );
 
     let head_sha = repo.head_sha().await;
     let needs_reindex = head_sha != index.commit_sha();
+    // Track whether the reindex (if it ran) completed without errors.
+    // Used below to gate startup report_ok for embedding and vector_index.
+    let reindex_ok;
     if needs_reindex {
         info!(
             head = ?head_sha,
             index = ?index.commit_sha(),
             "index SHA does not match repo HEAD — rebuilding from scratch"
         );
-        index = Box::new(UsearchStore::new(dimensions).expect("failed to create index"));
+        index = Box::new(
+            UsearchStore::new_with_reporter(dimensions, health.vector_index.clone())
+                .expect("failed to create index"),
+        );
 
-        match memory_mcp::server::full_reindex(&repo, embedding.as_ref(), index.as_ref())
-            .instrument(tracing::info_span!("startup.full_reindex"))
-            .await
-        {
-            Ok(stats) => {
-                info!(
-                    added = stats.added,
-                    errors = stats.errors,
-                    "startup reindex complete"
-                );
-                if stats.added > 0 || stats.errors == 0 {
-                    if stats.errors > 0 {
-                        tracing::warn!(
+        reindex_ok =
+            match memory_mcp::server::full_reindex(&repo, embedding.as_ref(), index.as_ref())
+                .instrument(tracing::info_span!("startup.full_reindex"))
+                .await
+            {
+                Ok(stats) => {
+                    info!(
+                        added = stats.added,
+                        errors = stats.errors,
+                        "startup reindex complete"
+                    );
+                    if stats.added > 0 || stats.errors == 0 {
+                        if stats.errors > 0 {
+                            tracing::warn!(
                             added = stats.added,
                             errors = stats.errors,
                             "startup reindex partially failed — some memories may not be searchable"
                         );
+                        }
+                        if let Some(sha) = &head_sha {
+                            index.set_commit_sha(Some(sha));
+                        }
+                        stats.errors == 0
+                    } else {
+                        tracing::warn!(
+                            errors = stats.errors,
+                            "all embeds failed — SHA not stamped, will retry on next startup"
+                        );
+                        false
                     }
-                    if let Some(sha) = &head_sha {
-                        index.set_commit_sha(Some(sha));
-                    }
-                } else {
-                    tracing::warn!(
-                        errors = stats.errors,
-                        "all embeds failed — SHA not stamped, will retry on next startup"
-                    );
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "startup reindex failed — SHA not stamped, will retry on next startup"
-                );
-            }
-        }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "startup reindex failed — SHA not stamped, will retry on next startup"
+                    );
+                    false
+                }
+            };
     } else {
         tracing::debug!(sha = ?head_sha, "index SHA matches repo HEAD — skipping reindex");
+        reindex_ok = true;
     }
 
     let auth = AuthProvider::new();
+
+    // When --require-remote-sync is set, perform an initial pull so the sync
+    // reporter starts with a known state (and the local repo is up-to-date).
+    if args.require_remote_sync && remote_url.is_some() {
+        info!("--require-remote-sync: performing initial pull");
+        match repo.pull(&auth, &args.branch).await {
+            Ok(result) => {
+                info!(?result, "initial pull completed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "initial pull failed — sync reporter will show degraded");
+            }
+        }
+    }
+
+    // Mark git as healthy — if we reached this point, git init/open succeeded.
+    health.git.report_ok();
+    // Only mark embedding and vector_index healthy if the reindex succeeded or
+    // was skipped (SHA matched). If the reindex had errors, the subsystems have
+    // already reported their own state via their reporters.
+    if reindex_ok {
+        health.embedding.report_ok();
+        health.vector_index.report_ok();
+    }
 
     let state = Arc::new(AppState::new(
         repo,
@@ -486,6 +555,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         embedding,
         index,
         auth,
+        health,
     ));
 
     // Keep a reference for post-shutdown index persistence.
@@ -526,16 +596,10 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let mcp_path = args.mcp_path.clone();
     let router = axum::Router::new()
-        .route(
-            // Static liveness check. Always returns 200 OK once the process is
-            // running. NOTE: a /readyz endpoint performing subsystem health checks
-            // (repo accessible, index loaded, embedding model ready) should be
-            // added when multi-replica deployments are supported.
-            "/healthz",
-            axum::routing::get(|| async {
-                axum::response::Json(serde_json::json!({"status": "ok"}))
-            }),
-        )
+        // Static liveness check. Always returns 200 OK once the process is running.
+        .route("/healthz", axum::routing::get(healthz_handler))
+        .route("/readyz", axum::routing::get(readyz_handler))
+        .with_state(Arc::clone(&state_for_shutdown))
         .nest_service(&mcp_path, service);
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
@@ -573,10 +637,12 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 /// Load the embedding model and run a single dummy embed to warm the on-disk
 /// model cache, then exit. Intended for use as a Kubernetes init container.
 async fn run_warmup(args: WarmupArgs) -> anyhow::Result<()> {
+    use memory_mcp::health::SubsystemReporter;
     info!("warming up embedding model '{}'", MODEL_ID);
     let engine = CandleEmbeddingEngine::new(
         std::time::Duration::from_secs(args.embed.embed_timeout_secs),
         args.embed.embed_queue_size,
+        SubsystemReporter::new(),
     )
     .context("failed to init embedding engine")?;
     // Run one dummy embed to ensure the model weights are fully loaded and any
