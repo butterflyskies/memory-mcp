@@ -1,4 +1,4 @@
-//! Integration tests for the `/readyz` health endpoint.
+//! Integration tests for the health and info HTTP endpoints (`/readyz`, `/version`).
 //!
 //! The healthy-path test spins up the real binary. The degraded-path test
 //! constructs its own axum server with a controlled `AppState` so we can
@@ -194,4 +194,24 @@ async fn readyz_degraded_server_returns_503_not_ready() {
     assert_eq!(body["checks"]["vector_index"]["status"], "down");
 
     handle.abort();
+}
+
+/// `/version` returns 200 with the crate version from Cargo.toml.
+#[tokio::test]
+async fn version_returns_cargo_pkg_version() {
+    let (mut child, port, _tmp) = start_server(&[]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/version"))
+        .send()
+        .await
+        .expect("version request should succeed");
+
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let body: serde_json::Value = resp.json().await.expect("body should be valid JSON");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+
+    child.kill().await.ok();
 }

@@ -311,3 +311,8 @@ pub async fn readyz_handler(
 pub async fn healthz_handler() -> impl IntoResponse {
     axum::Json(serde_json::json!({"status": "ok"}))
 }
+
+/// Handler for `GET /version`.
+pub async fn version_handler() -> impl IntoResponse {
+    axum::Json(serde_json::json!({"version": env!("CARGO_PKG_VERSION")}))
+}
