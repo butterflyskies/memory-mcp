@@ -1,3 +1,8 @@
+## [0.11.1] - 2026-05-13
+
+### Added
+- `/version` HTTP endpoint returning `{"version": "..."}` for runtime version introspection (#204)
+
 ## [0.11.0] - 2026-05-10
 
 ### Added
