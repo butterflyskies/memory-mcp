@@ -17,7 +17,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider as OtlpProvider;
 
 use memory_mcp::auth::{self, AuthProvider, StoreBackend};
 use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend, MODEL_ID};
-use memory_mcp::health::{healthz_handler, readyz_handler, HealthRegistry};
+use memory_mcp::health::{healthz_handler, readyz_handler, version_handler, HealthRegistry};
 use memory_mcp::index::{UsearchStore, VectorStore};
 use memory_mcp::repo::MemoryRepo;
 use memory_mcp::server::MemoryServer;
@@ -599,6 +599,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         // Static liveness check. Always returns 200 OK once the process is running.
         .route("/healthz", axum::routing::get(healthz_handler))
         .route("/readyz", axum::routing::get(readyz_handler))
+        .route("/version", axum::routing::get(version_handler))
         .with_state(Arc::clone(&state_for_shutdown))
         .nest_service(&mcp_path, service);
 

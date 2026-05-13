@@ -30,6 +30,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-bin: "false"
       - name: Install cargo-nextest
         run: |
           curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.131/cargo-nextest-0.9.131-x86_64-unknown-linux-gnu.tar.gz" \
@@ -77,6 +79,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
+          cache-bin: "false"
       - run: cargo build --features k8s
 
   # Verify the declared MSRV (Cargo.toml rust-version) still compiles.
@@ -94,6 +97,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: msrv
+          cache-bin: "false"
       - run: cargo check --workspace --all-features
 
   audit:
@@ -121,6 +125,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: semver
+          cache-bin: "false"
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
