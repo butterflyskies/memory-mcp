@@ -4,7 +4,7 @@ use std::{
 };
 
 use git2::{build::CheckoutBuilder, ErrorCode, MergeOptions, Repository, Signature};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -267,8 +267,7 @@ impl MemoryRepo {
         let memory = memory.clone();
         let name = memory.name.clone();
 
-        // Capture span before entering spawn_blocking so the child thread can record oid.
-        let span = tracing::debug_span!("repo.save", name = %name, oid = tracing::field::Empty);
+        let span = tracing::info_span!("repo.save", name = %name, oid = tracing::field::Empty);
 
         let result = traced_spawn_blocking(move || -> Result<(), MemoryError> {
             let _enter = span.entered();
@@ -285,19 +284,14 @@ impl MemoryRepo {
             let markdown = memory.to_markdown()?;
             arc.write_memory_file(&file_path, markdown.as_bytes())?;
 
-            arc.git_add_and_commit(
+            let oid = arc.git_add_and_commit(
                 &repo,
                 &file_path,
                 &format!("chore: save memory '{}'", memory.name),
             )?;
 
-            // Record the new HEAD OID after commit.
-            if let Ok(head) = repo.head() {
-                if let Ok(commit) = head.peel_to_commit() {
-                    tracing::Span::current().record("oid", commit.id().to_string().as_str());
-                    debug!(oid = %commit.id(), "memory saved to repo");
-                }
-            }
+            tracing::Span::current().record("oid", oid.to_string().as_str());
+            info!(oid = %oid, "memory saved to repo");
 
             Ok(())
         })
@@ -328,7 +322,7 @@ impl MemoryRepo {
         let arc = Arc::clone(self);
         let name = name.to_string();
         let file_path_clone = file_path.clone();
-        let span = tracing::debug_span!("repo.delete", name = %name);
+        let span = tracing::info_span!("repo.delete", name = %name, oid = tracing::field::Empty);
         let result = traced_spawn_blocking(move || -> Result<(), MemoryError> {
             let _enter = span.entered();
             let repo = arc
@@ -360,25 +354,12 @@ impl MemoryRepo {
                     })?;
             let mut index = repo.index()?;
             index.remove_path(relative)?;
-            index.write()?;
 
-            let tree_oid = index.write_tree()?;
-            let tree = repo.find_tree(tree_oid)?;
-            let sig = arc.signature(&repo)?;
             let message = format!("chore: delete memory '{}'", name);
+            let oid = arc.commit_index(&repo, &mut index, &message)?;
 
-            match repo.head() {
-                Ok(head) => {
-                    let parent_commit = head.peel_to_commit()?;
-                    repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent_commit])?;
-                }
-                Err(e)
-                    if e.code() == ErrorCode::UnbornBranch || e.code() == ErrorCode::NotFound =>
-                {
-                    repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[])?;
-                }
-                Err(e) => return Err(MemoryError::Git(e)),
-            }
+            tracing::Span::current().record("oid", oid.to_string().as_str());
+            info!(oid = %oid, "memory deleted from repo");
 
             Ok(())
         })
@@ -1042,13 +1023,39 @@ impl MemoryRepo {
         Ok(sig)
     }
 
+    /// Commit the current index state and return the new commit's `Oid`.
+    fn commit_index(
+        &self,
+        repo: &Repository,
+        index: &mut git2::Index,
+        message: &str,
+    ) -> Result<git2::Oid, MemoryError> {
+        index.write()?;
+        let tree_oid = index.write_tree()?;
+        let tree = repo.find_tree(tree_oid)?;
+        let sig = self.signature(repo)?;
+
+        let oid = match repo.head() {
+            Ok(head) => {
+                let parent_commit = head.peel_to_commit()?;
+                repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent_commit])?
+            }
+            Err(e) if e.code() == ErrorCode::UnbornBranch || e.code() == ErrorCode::NotFound => {
+                repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])?
+            }
+            Err(e) => return Err(MemoryError::Git(e)),
+        };
+
+        Ok(oid)
+    }
+
     /// Stage `file_path` and create a commit.
     fn git_add_and_commit(
         &self,
         repo: &Repository,
         file_path: &Path,
         message: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<git2::Oid, MemoryError> {
         let relative =
             file_path
                 .strip_prefix(&self.root)
@@ -1058,25 +1065,8 @@ impl MemoryRepo {
 
         let mut index = repo.index()?;
         index.add_path(relative)?;
-        index.write()?;
 
-        let tree_oid = index.write_tree()?;
-        let tree = repo.find_tree(tree_oid)?;
-        let sig = self.signature(repo)?;
-
-        match repo.head() {
-            Ok(head) => {
-                let parent_commit = head.peel_to_commit()?;
-                repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent_commit])?;
-            }
-            Err(e) if e.code() == ErrorCode::UnbornBranch || e.code() == ErrorCode::NotFound => {
-                // Initial commit — no parent.
-                repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])?;
-            }
-            Err(e) => return Err(MemoryError::Git(e)),
-        }
-
-        Ok(())
+        self.commit_index(repo, &mut index, message)
     }
 
     /// Assert that `path` remains under `self.root` after canonicalisation,
