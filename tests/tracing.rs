@@ -6,7 +6,7 @@
 //! - TC-06–TC-09: Subsystem spans carry the correct fields.
 //! - TC-16–TC-18: No sensitive data (tokens, content text, raw URLs) in spans.
 //! - TC-20:       Default filter passes handler info spans, suppresses debug spans.
-//! - TC-21:       Auth failure produces a warn-level event.
+//! - TC-21:       Push failure does not leak token values in traces.
 //!
 //! The in-memory subscriber collects span/event metadata so we can assert on
 //! it without touching real networking or the file system (where possible).
@@ -45,7 +45,6 @@ struct SpanRecord {
 struct EventRecord {
     /// Message / event target.
     message: String,
-    level: tracing::Level,
     /// Key=value fields as strings (values are formatted via Display).
     fields: Vec<(String, String)>,
 }
@@ -199,7 +198,6 @@ impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer
 
         self.store.lock().unwrap().events.push(EventRecord {
             message,
-            level: *event.metadata().level(),
             fields: kv,
         });
     }
@@ -594,54 +592,56 @@ fn repo_init_url_is_redacted_in_logs() {
 }
 
 // ---------------------------------------------------------------------------
-// TC-21: Auth failure produces warn-level event
+// TC-21: Push failure does not leak token in tracing output
 // ---------------------------------------------------------------------------
 
 #[test]
-fn auth_failure_produces_warn_event() {
+fn push_failure_does_not_leak_token() {
     use memory_mcp::auth::AuthProvider;
+    use memory_mcp::repo::MemoryRepo;
+    use std::sync::Arc;
 
-    // Capture real env before overriding, then restore after.
-    let real_home = std::env::var_os("HOME");
-    let saved_token = std::env::var_os("MEMORY_MCP_GITHUB_TOKEN");
-    let fake_home = tempfile::tempdir().expect("tempdir for fake HOME");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let token_value = "ghp_leaked_token_value_12345";
+
     let (_, store) = with_capturing(|| {
-        std::env::remove_var("MEMORY_MCP_GITHUB_TOKEN");
-        std::env::set_var("HOME", fake_home.path());
-        let provider = AuthProvider::new();
-        let _ = provider.resolve_token();
-        // Restore env vars so other tests are unaffected.
-        match &real_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        if let Some(t) = &saved_token {
-            std::env::set_var("MEMORY_MCP_GITHUB_TOKEN", t);
-        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let repo = Arc::new(
+                MemoryRepo::init_or_open(dir.path(), Some("https://github.com/fake/repo.git"))
+                    .expect("init repo"),
+            );
+            let auth = AuthProvider::with_token(token_value);
+            let result = repo.push(&auth, "main").await;
+            assert!(result.is_err(), "push to fake remote should fail");
+        });
     });
     let store = store.lock().unwrap();
 
-    let warn_events: Vec<&EventRecord> = store
-        .events
-        .iter()
-        .filter(|e| e.level == tracing::Level::WARN)
-        .collect();
-
-    // In CI there is no keyring daemon, so resolution fails and at least one
-    // warn event must be emitted.
-    assert!(
-        !warn_events.is_empty(),
-        "expected at least one warn event from auth failure (no keyring in CI)"
-    );
-
-    // The warn from auth failure should not contain any secret data.
-    for event in &warn_events {
-        for (k, v) in &event.fields {
+    for span in &store.spans {
+        for (k, v) in &span.fields {
             assert!(
-                !v.starts_with("ghp_") && !v.starts_with("github_pat_"),
-                "warn event field {k}={v:?} looks like a raw GitHub token"
+                !v.contains(token_value),
+                "span '{}' field '{k}' leaks token: {v}",
+                span.name
             );
         }
+    }
+    for event in &store.events {
+        for (k, v) in &event.fields {
+            assert!(
+                !v.contains(token_value),
+                "event field '{k}' leaks token: {v}"
+            );
+        }
+        assert!(
+            !event.message.contains(token_value),
+            "event message leaks token: {:?}",
+            event.message
+        );
     }
 }
 
@@ -736,7 +736,7 @@ fn repo_save_span_has_name_and_oid_fields() {
                 source: None,
             };
             let mem = Memory::new("tc08-memory".to_string(), "test content".to_string(), meta);
-            let _ = repo.save_memory(&mem).await;
+            repo.save_memory(&mem).await.expect("save");
         });
     });
     let spans = store.lock().unwrap();
@@ -758,6 +758,61 @@ fn repo_save_span_has_name_and_oid_fields() {
             .any(|(k, v)| k == "oid" && !v.is_empty()),
         "repo.save 'oid' field missing or empty; fields: {:?}",
         save_span.fields
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TC-08b: repo.delete span has name and oid fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repo_delete_span_has_name_and_oid_fields() {
+    use memory_mcp::repo::MemoryRepo;
+    use memory_mcp::types::{Memory, MemoryMetadata, Scope};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let (_, store) = with_capturing(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let repo = Arc::new(MemoryRepo::init_or_open(dir.path(), None).expect("init repo"));
+            let meta = MemoryMetadata {
+                tags: vec![],
+                scope: Scope::Global,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                source: None,
+            };
+            let mem = Memory::new("tc08b-memory".to_string(), "test content".to_string(), meta);
+            repo.save_memory(&mem).await.expect("save");
+            repo.delete_memory("tc08b-memory", &Scope::Global)
+                .await
+                .expect("delete");
+        });
+    });
+    let spans = store.lock().unwrap();
+    let delete_span = spans
+        .spans
+        .iter()
+        .find(|s| s.name == "repo.delete")
+        .expect("repo.delete span not found");
+
+    assert!(
+        delete_span.fields.iter().any(|(k, _)| k == "name"),
+        "repo.delete missing 'name' field; fields: {:?}",
+        delete_span.fields
+    );
+    assert!(
+        delete_span
+            .fields
+            .iter()
+            .any(|(k, v)| k == "oid" && !v.is_empty()),
+        "repo.delete 'oid' field missing or empty; fields: {:?}",
+        delete_span.fields
     );
 }
 
@@ -789,7 +844,7 @@ fn repo_save_does_not_log_content_text() {
                 source: None,
             };
             let mem = Memory::new("tc17-memory".to_string(), secret_content.to_string(), meta);
-            let _ = repo.save_memory(&mem).await;
+            repo.save_memory(&mem).await.expect("save");
         });
     });
     let store = store.lock().unwrap();
