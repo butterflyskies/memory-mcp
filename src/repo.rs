@@ -105,6 +105,25 @@ fn build_auth_callbacks(token: SecretString) -> git2::RemoteCallbacks<'static> {
     callbacks
 }
 
+/// Spawn a blocking task with the caller's `tracing::Dispatch` propagated.
+///
+/// Blocking-pool threads do not inherit the caller's thread-local dispatch,
+/// so `Span::current()`, events, and `Span::record()` are silently dropped
+/// unless the dispatch is explicitly re-installed. This wrapper captures the
+/// current dispatch and sets it as the thread-local default inside the closure.
+pub(crate) fn traced_spawn_blocking<F, T>(f: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+    #[allow(clippy::disallowed_methods)]
+    tokio::task::spawn_blocking(move || {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        f()
+    })
+}
+
 /// Git-backed repository for persisting and syncing memory files.
 pub struct MemoryRepo {
     inner: Mutex<Repository>,
@@ -209,7 +228,7 @@ impl MemoryRepo {
     /// branch is unborn (no commits yet).
     pub async fn head_sha(self: &Arc<Self>) -> Option<String> {
         let me = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        traced_spawn_blocking(move || {
             let repo = me.inner.lock().expect("repo mutex poisoned");
             let oid_bytes = capture_head_oid(&repo).ok()?;
             if oid_bytes == [0u8; 20] {
@@ -251,7 +270,7 @@ impl MemoryRepo {
         // Capture span before entering spawn_blocking so the child thread can record oid.
         let span = tracing::debug_span!("repo.save", name = %name, oid = tracing::field::Empty);
 
-        let result = tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+        let result = traced_spawn_blocking(move || -> Result<(), MemoryError> {
             let _enter = span.entered();
             let repo = arc
                 .inner
@@ -310,7 +329,7 @@ impl MemoryRepo {
         let name = name.to_string();
         let file_path_clone = file_path.clone();
         let span = tracing::debug_span!("repo.delete", name = %name);
-        let result = tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+        let result = traced_spawn_blocking(move || -> Result<(), MemoryError> {
             let _enter = span.entered();
             let repo = arc
                 .inner
@@ -390,7 +409,7 @@ impl MemoryRepo {
         let arc = Arc::clone(self);
         let name = name.to_string();
         let span = tracing::debug_span!("repo.read", name = %name);
-        let result = tokio::task::spawn_blocking(move || -> Result<Memory, MemoryError> {
+        let result = traced_spawn_blocking(move || -> Result<Memory, MemoryError> {
             let _enter = span.entered();
             // Check existence/symlink status before opening.
             match std::fs::symlink_metadata(&file_path) {
@@ -431,7 +450,7 @@ impl MemoryRepo {
         let scope_clone = scope.cloned();
         let span = tracing::debug_span!("repo.list", file_count = tracing::field::Empty,);
 
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<Memory>, MemoryError> {
+        let result = traced_spawn_blocking(move || -> Result<Vec<Memory>, MemoryError> {
             let _enter = span.entered();
             let dirs: Vec<PathBuf> = match scope_clone.as_ref() {
                 Some(s) => vec![root.join(s.dir_prefix())],
@@ -522,7 +541,7 @@ impl MemoryRepo {
         let branch = branch.to_string();
         let span = tracing::debug_span!("repo.push", branch = %branch);
 
-        let result = tokio::task::spawn_blocking(move || -> Result<(), MemoryError> {
+        let result = traced_spawn_blocking(move || -> Result<(), MemoryError> {
             let _enter = span.entered();
             let repo = arc
                 .inner
@@ -672,7 +691,7 @@ impl MemoryRepo {
         let branch = branch.to_string();
         let span = tracing::debug_span!("repo.pull", branch = %branch);
 
-        let result = tokio::task::spawn_blocking(move || -> Result<PullResult, MemoryError> {
+        let result = traced_spawn_blocking(move || -> Result<PullResult, MemoryError> {
             let _enter = span.entered();
             let repo = arc
                 .inner
