@@ -1,3 +1,19 @@
+## [0.12.0] - 2026-05-14
+
+### Added
+- `--idle-timeout-secs` CLI flag / `MEMORY_MCP_IDLE_TIMEOUT_SECS` env var for configurable session idle timeout (default 14400s / 4 hours) (#114)
+- `--max-session-lifetime-secs` CLI flag / `MEMORY_MCP_MAX_SESSION_LIFETIME_SECS` env var for absolute session lifetime cap (default disabled) (#114)
+- Runtime warning when both idle timeout and max session lifetime are disabled
+- Design artifacts in `docs/design/session-lifecycle/`
+
+### Changed
+- Session manager construction uses `BoundedSessionManagerBuilder` from mcp-session 0.2
+- Structured tracing events emitted on session create/close with `session_id`, `duration_secs`, and `CloseReason`
+
+### Dependencies
+- Upgraded `mcp-session` from 0.1 to 0.2 (builder API, max lifetime, lifecycle tracing)
+- Upgraded `rmcp` from 1.6 to 1.7
+
 ## [0.11.1] - 2026-05-13
 
 ### Added

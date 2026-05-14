@@ -4,11 +4,11 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use mcp_session::{BoundedSessionManager, SessionConfig};
+use mcp_session::BoundedSessionManagerBuilder;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
 use tracing::Instrument;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // The SdkTracerProvider type is used in the otlp feature only.
@@ -126,6 +126,21 @@ struct ServeArgs {
         env = "MEMORY_MCP_SESSION_RATE_WINDOW_SECS"
     )]
     session_rate_window_secs: u64,
+
+    /// Idle timeout for MCP sessions, in seconds. Sessions are closed after
+    /// this duration of inactivity. Set to 0 to disable (not recommended).
+    #[arg(long, default_value_t = 14400, env = "MEMORY_MCP_IDLE_TIMEOUT_SECS")]
+    idle_timeout_secs: u64,
+
+    /// Maximum session lifetime in seconds, regardless of activity. Sessions
+    /// are closed after this duration even if actively used. Set to 0 to
+    /// disable (default).
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "MEMORY_MCP_MAX_SESSION_LIFETIME_SECS"
+    )]
+    max_session_lifetime_secs: u64,
 
     /// Additional hostname to accept in the HTTP Host header. Required when
     /// the server is accessed via a reverse proxy or gateway (e.g.
@@ -565,25 +580,30 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let ct = CancellationToken::new();
     let ct_child = ct.child_token();
 
-    // SessionConfig and StreamableHttpServerConfig are #[non_exhaustive] in
-    // rmcp 1.4+, so struct literal syntax is unavailable from external crates.
-    // Default + field mutation is the intended pattern (see mcp-session#11).
-    #[allow(clippy::field_reassign_with_default)]
     let service = StreamableHttpService::new(
         move || Ok(MemoryServer::new(Arc::clone(&state))),
-        Arc::new({
-            let mut session_config = SessionConfig::default();
-            session_config.keep_alive = Some(std::time::Duration::from_secs(4 * 60 * 60));
-            let mgr = BoundedSessionManager::new(session_config, args.max_sessions);
+        {
+            let mut builder = BoundedSessionManagerBuilder::new(args.max_sessions);
+            if args.idle_timeout_secs == 0 && args.max_session_lifetime_secs == 0 {
+                warn!("both idle timeout and max session lifetime are disabled; sessions are only cleaned up by FIFO eviction at capacity");
+            }
+            if args.idle_timeout_secs > 0 {
+                builder =
+                    builder.idle_timeout(std::time::Duration::from_secs(args.idle_timeout_secs));
+            }
+            if args.max_session_lifetime_secs > 0 {
+                builder = builder.max_lifetime(std::time::Duration::from_secs(
+                    args.max_session_lifetime_secs,
+                ));
+            }
             if args.session_rate_limit > 0 && args.session_rate_window_secs > 0 {
-                mgr.with_rate_limit(
+                builder = builder.rate_limit(
                     args.session_rate_limit,
                     std::time::Duration::from_secs(args.session_rate_window_secs),
-                )
-            } else {
-                mgr
+                );
             }
-        }),
+            builder.build()
+        },
         {
             let mut server_config = StreamableHttpServerConfig::default();
             server_config.cancellation_token = ct_child;
@@ -901,6 +921,49 @@ mod tests {
             msg.contains("not supported"),
             "error should mention unsupported: {msg}"
         );
+    }
+
+    #[test]
+    fn test_cli_serve_idle_timeout_default() {
+        let cli = Cli::try_parse_from(["memory-mcp", "serve"]).expect("serve should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.idle_timeout_secs, 14400),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_idle_timeout_custom() {
+        let cli = Cli::try_parse_from(["memory-mcp", "serve", "--idle-timeout-secs", "300"])
+            .expect("serve with idle-timeout should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.idle_timeout_secs, 300),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_max_session_lifetime_default() {
+        let cli = Cli::try_parse_from(["memory-mcp", "serve"]).expect("serve should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.max_session_lifetime_secs, 0),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_max_session_lifetime_custom() {
+        let cli = Cli::try_parse_from([
+            "memory-mcp",
+            "serve",
+            "--max-session-lifetime-secs",
+            "86400",
+        ])
+        .expect("serve with max-session-lifetime should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.max_session_lifetime_secs, 86400),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[cfg(feature = "k8s")]

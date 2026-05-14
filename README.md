@@ -293,6 +293,8 @@ All options can be set via CLI flags or environment variables:
 | `--max-sessions` | `MEMORY_MCP_MAX_SESSIONS` | `100` | Maximum concurrent MCP sessions |
 | `--session-rate-limit` | `MEMORY_MCP_SESSION_RATE_LIMIT` | `10` | Max new sessions per rate-limit window (0 to disable) |
 | `--session-rate-window-secs` | `MEMORY_MCP_SESSION_RATE_WINDOW_SECS` | `60` | Rate-limit window duration in seconds |
+| `--idle-timeout-secs` | `MEMORY_MCP_IDLE_TIMEOUT_SECS` | `14400` | Idle timeout for sessions in seconds (0 to disable) |
+| `--max-session-lifetime-secs` | `MEMORY_MCP_MAX_SESSION_LIFETIME_SECS` | `0` (disabled) | Absolute max session lifetime in seconds (0 to disable) |
 | `--embed-timeout-secs` | `MEMORY_MCP_EMBED_TIMEOUT_SECS` | `30` | Max seconds per embedding call before timeout |
 | `--embed-queue-size` | `MEMORY_MCP_EMBED_QUEUE_SIZE` | `64` | Embedding request queue capacity |
 | `--require-remote-sync` | `MEMORY_MCP_REQUIRE_REMOTE_SYNC` | `false` | Include sync health in readiness checks. Performs initial pull at startup. |
