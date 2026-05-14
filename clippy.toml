@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "tokio::task::spawn_blocking", reason = "use crate::repo::traced_spawn_blocking to propagate tracing dispatch" },
+]

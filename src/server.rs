@@ -870,7 +870,7 @@ impl MemoryServer {
 
                 if let Some((old_head, new_head)) = oid_range {
                     let repo = Arc::clone(&state.repo);
-                    let changes = tokio::task::spawn_blocking(move || {
+                    let changes = crate::repo::traced_spawn_blocking(move || {
                         repo.diff_changed_memories(old_head, new_head)
                     })
                     .await

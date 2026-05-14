@@ -10,6 +10,10 @@
 //!
 //! The in-memory subscriber collects span/event metadata so we can assert on
 //! it without touching real networking or the file system (where possible).
+//!
+//! **Note:** `with_capturing` uses `tracing::subscriber::with_default`, which is
+//! thread-local. Production code uses `traced_spawn_blocking` to propagate the
+//! dispatch into blocking threads, so span records and events are visible to tests.
 
 use std::{
     collections::HashSet,
@@ -201,11 +205,24 @@ impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer
     }
 }
 
+/// Panic unless running under nextest (process-per-test isolation).
+///
+/// Tests that use `tracing::subscriber::with_default` + `traced_spawn_blocking`
+/// rely on thread-local dispatch propagation that is unsound under `cargo test`
+/// (shared process, concurrent tests). Nextest sets `NEXTEST=1` in every child.
+fn require_nextest() {
+    assert!(
+        std::env::var("NEXTEST").is_ok(),
+        "this test requires nextest (cargo nextest run)"
+    );
+}
+
 /// Build a subscriber with the capturing layer installed and run `f` inside it.
 fn with_capturing<F, R>(f: F) -> (R, Arc<Mutex<RecordStore>>)
 where
     F: FnOnce() -> R,
 {
+    require_nextest();
     let store = Arc::new(Mutex::new(RecordStore::default()));
     let layer = CapturingLayer {
         store: Arc::clone(&store),
@@ -634,6 +651,7 @@ fn auth_failure_produces_warn_event() {
 
 #[test]
 fn debug_spans_are_filtered_when_only_info_enabled() {
+    require_nextest();
     use memory_mcp::index::{UsearchStore, VectorStore};
     use memory_mcp::types::Scope;
 
@@ -734,8 +752,11 @@ fn repo_save_span_has_name_and_oid_fields() {
         save_span.fields
     );
     assert!(
-        save_span.fields.iter().any(|(k, _)| k == "oid"),
-        "repo.save missing 'oid' field; fields: {:?}",
+        save_span
+            .fields
+            .iter()
+            .any(|(k, v)| k == "oid" && !v.is_empty()),
+        "repo.save 'oid' field missing or empty; fields: {:?}",
         save_span.fields
     );
 }
