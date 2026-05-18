@@ -578,6 +578,11 @@ impl MemoryServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
+        if args.content.is_none() && args.tags.is_none() {
+            return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
+                reason: "nothing to update — provide content or tags".into(),
+            }));
+        }
         if let Some(ref content) = args.content {
             if content.len() > MAX_CONTENT_SIZE {
                 return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {

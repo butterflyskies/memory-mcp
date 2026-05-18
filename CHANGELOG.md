@@ -1,3 +1,8 @@
+## [0.12.1] - 2026-05-18
+
+### Fixed
+- `edit` tool now rejects calls that provide neither `content` nor `tags`, returning an `InvalidInput` error instead of silently succeeding with a timestamp-only commit (#219)
+
 ## [0.12.0] - 2026-05-14
 
 ### Added
