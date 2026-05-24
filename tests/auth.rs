@@ -160,6 +160,8 @@ async fn auth_status_no_token_prints_not_configured() {
         .args(["auth", "status"])
         .env_remove("MEMORY_MCP_GITHUB_TOKEN")
         .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .env_remove("DISPLAY")
+        .env("XDG_RUNTIME_DIR", tmp.path())
         .env("HOME", tmp.path())
         .output()
         .await
