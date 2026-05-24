@@ -1,108 +1,119 @@
 //! Integration tests for the `--allowed-host` DNS rebinding protection.
 //!
-//! These tests spin up a real HTTP server and verify that rmcp's host
-//! validation accepts or rejects requests based on the `Host` header.
+//! These tests build the full service stack in-process and call it via
+//! `tower::ServiceExt::oneshot` — no subprocess or port allocation needed.
 
-use std::time::Duration;
+mod common;
 
-use reqwest::header::{HeaderValue, HOST};
+use axum::body::Body;
+use http::{header::HOST, Request};
+use tower::ServiceExt as _;
 
-/// Start the server binary with the given args and an empty repo, wait for
-/// it to be ready, and return the child process, port, and temp dir handle.
-async fn start_server(extra_args: &[&str]) -> (tokio::process::Child, u16, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let repo_path = tmp.path().to_str().expect("non-utf8 temp path");
-    let port = portpicker::pick_unused_port().expect("no free port");
-    let bind = format!("127.0.0.1:{port}");
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_memory-mcp"));
-    cmd.args(["serve", "--bind", &bind, "--repo-path", repo_path])
-        .args(extra_args)
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let child = cmd.spawn().expect("failed to start memory-mcp");
-
-    // Wait for the server to be ready by polling /healthz.
-    let client = reqwest::Client::new();
-    let healthz_url = format!("http://{bind}/healthz");
-    for _ in 0..100 {
-        if client.get(&healthz_url).send().await.is_ok() {
-            return (child, port, tmp);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("server did not become ready within 10s");
+/// Build a GET /mcp request with the given `Host` header value.
+fn mcp_request(host: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri("/mcp")
+        .header(HOST, host)
+        .body(Body::empty())
+        .expect("valid request")
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// A request to /mcp with a default localhost Host header is not rejected with 403.
+///
+/// rmcp accepts `127.0.0.1` by default. The response may be 405 or 400
+/// (no MCP headers), but NOT 403 — the host check passed.
 #[tokio::test]
 async fn request_with_default_localhost_host_is_accepted() {
-    let (mut child, port, _tmp) = start_server(&[]).await;
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let state = common::build_healthy_state(&tmp);
+    // Use the default allowed_hosts list (localhost, 127.0.0.1, ::1).
+    let router = common::build_test_router(
+        state,
+        vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ],
+    );
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("http://127.0.0.1:{port}/mcp"))
-        .send()
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(HOST, "127.0.0.1")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
         .await
-        .expect("request should succeed");
+        .expect("service call should not fail");
 
-    // /mcp without proper MCP headers returns 405 or 400, but NOT 403 —
-    // the point is the host check passed.
     assert_ne!(
         resp.status().as_u16(),
         403,
         "localhost should not be rejected"
     );
-
-    child.kill().await.ok();
 }
 
+/// A request with an unknown Host header is rejected with 403.
 #[tokio::test]
 async fn request_with_unknown_host_is_rejected() {
-    let (mut child, port, _tmp) = start_server(&[]).await;
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let state = common::build_healthy_state(&tmp);
+    let router = common::build_test_router(
+        state,
+        vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ],
+    );
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("client");
-    let resp = client
-        .get(format!("http://127.0.0.1:{port}/mcp"))
-        .header(HOST, HeaderValue::from_static("evil.attacker.com"))
-        .send()
+    let resp = router
+        .oneshot(mcp_request("evil.attacker.com"))
         .await
-        .expect("request should succeed at TCP level");
+        .expect("service call should not fail");
 
     assert_eq!(
         resp.status().as_u16(),
         403,
         "unknown host should be rejected with 403"
     );
-
-    child.kill().await.ok();
 }
 
+/// A request with an explicitly allowed extra host is accepted.
 #[tokio::test]
 async fn request_with_allowed_host_is_accepted() {
-    let (mut child, port, _tmp) = start_server(&["--allowed-host", "memory-mcp.svc.echoes"]).await;
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let state = common::build_healthy_state(&tmp);
+    // Include the default hosts plus our custom one.
+    let router = common::build_test_router(
+        state,
+        vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+            "memory-mcp.svc.echoes".to_string(),
+        ],
+    );
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("client");
-    let resp = client
-        .get(format!("http://127.0.0.1:{port}/mcp"))
-        .header(HOST, HeaderValue::from_static("memory-mcp.svc.echoes"))
-        .send()
+    let resp = router
+        .oneshot(mcp_request("memory-mcp.svc.echoes"))
         .await
-        .expect("request should succeed");
+        .expect("service call should not fail");
 
-    // Should pass host check — NOT 403.
     assert_ne!(
         resp.status().as_u16(),
         403,
         "explicitly allowed host should not be rejected"
     );
-
-    child.kill().await.ok();
 }

@@ -95,6 +95,8 @@ git2 = "0.20"
 portpicker = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+async-trait = "0.1"
 
 # candle 0.10 unconditionally pulls in the onig C regex library via tokenizers
 # for GGUF support we don't use. Upstream PR to make it optional:
