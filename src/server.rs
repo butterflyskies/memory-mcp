@@ -36,9 +36,9 @@ use crate::{
     index::VectorStore,
     repo::MemoryRepo,
     types::{
-        parse_qualified_name, parse_scope, parse_scope_filter, validate_name, AppState,
-        ChangedMemories, EditArgs, ForgetArgs, ListArgs, Memory, MemoryMetadata, PullResult,
-        ReadArgs, RecallArgs, ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
+        parse_qualified_name, parse_scope, parse_scope_filter, AppState, ChangedMemories, EditArgs,
+        ForgetArgs, ListArgs, Memory, MemoryMetadata, MemoryName, PullResult, ReadArgs, RecallArgs,
+        ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
     },
 };
 
@@ -102,9 +102,7 @@ async fn incremental_reindex(
     }
 
     // ---- 2. Resolve (scope, name) pairs for upserts -------------------------
-    // Each qualified name is "global/foo" or "projects/<project>/foo".
-    // parse_qualified_name handles both forms.
-    let mut pairs: Vec<(Scope, String, String)> = Vec::new(); // (scope, name, qualified_name)
+    let mut pairs: Vec<(Scope, MemoryName, String)> = Vec::new();
     for qualified in &changes.upserted {
         match parse_qualified_name(qualified) {
             Ok((scope, name)) => pairs.push((scope, name, qualified.clone())),
@@ -313,7 +311,7 @@ impl MemoryServer {
         Parameters(args): Parameters<RememberArgs>,
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
-        validate_name(&args.name).map_err(ErrorData::from)?;
+        let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         if args.content.len() > MAX_CONTENT_SIZE {
             return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
                 reason: format!(
@@ -328,7 +326,7 @@ impl MemoryServer {
         let span = tracing::info_span!(
             "handler.remember",
             session_id = %session_id,
-            name = %args.name,
+            name = %name,
             scope = ?args.scope,
             content_size,
         );
@@ -336,7 +334,7 @@ impl MemoryServer {
         async move {
             let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
             let metadata = MemoryMetadata::new(scope.clone(), args.tags, args.source);
-            let memory = Memory::new(args.name, args.content, metadata);
+            let memory = Memory::new(name, args.content, metadata);
 
             // Order: (1) embed, (2) add to index, (3) save to repo.
             // If step 3 fails, index has a stale entry (harmless — recall will skip it).
@@ -517,12 +515,12 @@ impl MemoryServer {
         Parameters(args): Parameters<ForgetArgs>,
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
-        validate_name(&args.name).map_err(ErrorData::from)?;
+        let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         let session_id = extract_session_id(&parts);
         let span = tracing::info_span!(
             "handler.forget",
             session_id = %session_id,
-            name = %args.name,
+            name = %name,
             scope = ?args.scope,
         );
         let state = Arc::clone(&self.state);
@@ -534,19 +532,19 @@ impl MemoryServer {
             // Delete from repo first — if this fails, index is untouched, memory stays functional.
             state
                 .repo
-                .delete_memory(&args.name, &scope)
+                .delete_memory(&name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
 
             // Remove from index (best-effort — stale entries are skipped at recall time).
-            let qualified_name = format!("{}/{}", scope.dir_prefix(), args.name);
+            let qualified_name = format!("{}/{}", scope.dir_prefix(), name);
             if let Err(e) = state.index.remove(&scope, &qualified_name) {
-                warn!(name = %args.name, error = %e, "vector removal failed during forget; stale entry will be skipped at recall");
+                warn!(name = %name, error = %e, "vector removal failed during forget; stale entry will be skipped at recall");
             }
 
             info!(
                 ms = start.elapsed().as_millis(),
-                name = %args.name,
+                name = %name,
                 "memory forgotten"
             );
 
@@ -577,7 +575,7 @@ impl MemoryServer {
         Parameters(args): Parameters<EditArgs>,
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
-        validate_name(&args.name).map_err(ErrorData::from)?;
+        let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         if args.content.is_none() && args.tags.is_none() {
             return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
                 reason: "nothing to update — provide content or tags".into(),
@@ -599,7 +597,7 @@ impl MemoryServer {
         let span = tracing::info_span!(
             "handler.edit",
             session_id = %session_id,
-            name = %args.name,
+            name = %name,
             scope = ?args.scope,
             content_size,
         );
@@ -615,7 +613,7 @@ impl MemoryServer {
             // Read the existing memory.
             let mut memory = state
                 .repo
-                .read_memory(&args.name, &scope)
+                .read_memory(&name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
 
@@ -656,7 +654,7 @@ impl MemoryServer {
 
             info!(
                 ms = start.elapsed().as_millis(),
-                name = %args.name,
+                name = %name,
                 content_changed,
                 "memory edited"
             );
@@ -770,12 +768,12 @@ impl MemoryServer {
         Parameters(args): Parameters<ReadArgs>,
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
-        validate_name(&args.name).map_err(ErrorData::from)?;
+        let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         let session_id = extract_session_id(&parts);
         let span = tracing::info_span!(
             "handler.read",
             session_id = %session_id,
-            name = %args.name,
+            name = %name,
             scope = ?args.scope,
         );
         let state = Arc::clone(&self.state);
@@ -785,12 +783,12 @@ impl MemoryServer {
             let start = Instant::now();
             let memory = state
                 .repo
-                .read_memory(&args.name, &scope)
+                .read_memory(&name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
             info!(
                 ms = start.elapsed().as_millis(),
-                name = %args.name,
+                name = %name,
                 "read memory"
             );
 

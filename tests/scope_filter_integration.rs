@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use memory_mcp::repo::MemoryRepo;
-use memory_mcp::types::{Memory, MemoryMetadata, Scope};
+use memory_mcp::types::{Memory, MemoryMetadata, MemoryName, Scope};
 
 /// Helper: initialise a fresh in-memory repo in a temp directory.
 async fn make_repo() -> (Arc<MemoryRepo>, tempfile::TempDir) {
@@ -20,7 +20,11 @@ async fn make_repo() -> (Arc<MemoryRepo>, tempfile::TempDir) {
 /// Helper: save a memory with the given scope and name.
 async fn save(repo: &Arc<MemoryRepo>, name: &str, scope: Scope) {
     let metadata = MemoryMetadata::new(scope, vec![], None);
-    let memory = Memory::new(name.to_string(), format!("Content for {}", name), metadata);
+    let memory = Memory::new(
+        MemoryName::new(name).unwrap(),
+        format!("Content for {}", name),
+        metadata,
+    );
     repo.save_memory(&memory)
         .await
         .expect("save should succeed");
@@ -43,7 +47,7 @@ async fn list_scope_filter_global_only() {
         .expect("list should succeed");
 
     assert_eq!(memories.len(), 1, "expected only the global memory");
-    assert_eq!(memories[0].name, "global-mem");
+    assert_eq!(memories[0].name.as_str(), "global-mem");
     assert_eq!(memories[0].metadata.scope, Scope::Global);
 }
 
@@ -70,7 +74,7 @@ async fn list_scope_filter_project_specific() {
         .expect("list should succeed");
 
     assert_eq!(memories.len(), 1, "expected only the test-proj memory");
-    assert_eq!(memories[0].name, "proj-mem");
+    assert_eq!(memories[0].name.as_str(), "proj-mem");
     assert_eq!(
         memories[0].metadata.scope,
         Scope::Project("test-proj".to_string())

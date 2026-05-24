@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rmcp::schemars;
-use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::{fmt, ops::Deref, str::FromStr};
 use uuid::Uuid;
 
 use crate::error::MemoryError;
@@ -58,6 +58,86 @@ pub fn validate_name(name: &str) -> Result<(), MemoryError> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MemoryName newtype
+// ---------------------------------------------------------------------------
+
+/// A validated memory name.
+///
+/// Wraps a `String` that has been validated by [`validate_name`]. Constructing
+/// a `MemoryName` is the sole path to a valid name — once you hold one, you
+/// can use it as `&str` without re-validation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct MemoryName(String);
+
+impl MemoryName {
+    /// Validate `name` and wrap it.
+    pub fn new(name: impl Into<String>) -> Result<Self, MemoryError> {
+        let s = name.into();
+        validate_name(&s)?;
+        Ok(Self(s))
+    }
+
+    /// Consume and return the inner `String`.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Borrow as `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for MemoryName {
+    type Err = MemoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl fmt::Display for MemoryName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Deref for MemoryName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for MemoryName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for MemoryName {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("MemoryName")
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        String::json_schema(generator)
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
 }
 
 /// Validate a git branch name to prevent ref injection.
@@ -213,7 +293,7 @@ pub struct Memory {
     /// Stable UUID for vector-index keying.
     pub id: String,
     /// Human-readable name / filename stem.
-    pub name: String,
+    pub name: MemoryName,
     /// Markdown body (no frontmatter).
     pub content: String,
     /// Associated metadata (tags, scope, timestamps, source).
@@ -222,7 +302,7 @@ pub struct Memory {
 
 impl Memory {
     /// Create a new memory with a random UUID.
-    pub fn new(name: String, content: String, metadata: MemoryMetadata) -> Self {
+    pub fn new(name: MemoryName, content: String, metadata: MemoryMetadata) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             name,
@@ -256,7 +336,7 @@ impl Memory {
 
         let fm = Frontmatter {
             id: &self.id,
-            name: &self.name,
+            name: self.name.as_str(),
             tags: &self.metadata.tags,
             scope: &self.metadata.scope,
             created_at: &self.metadata.created_at,
@@ -303,7 +383,7 @@ impl Memory {
 
         Ok(Memory {
             id: fm.id,
-            name: fm.name,
+            name: MemoryName::new(fm.name)?,
             content: body.to_string(),
             metadata: MemoryMetadata {
                 tags: fm.tags,
@@ -371,18 +451,18 @@ pub fn parse_scope(scope: Option<&str>) -> Result<Scope, MemoryError> {
 }
 
 /// Parse a qualified name of the form `"global/<name>"` or
-/// `"projects/<project>/<name>"` back into a `(Scope, name)` pair.
-pub fn parse_qualified_name(qualified: &str) -> Result<(Scope, String), MemoryError> {
+/// `"projects/<project>/<name>"` back into a `(Scope, MemoryName)` pair.
+pub fn parse_qualified_name(qualified: &str) -> Result<(Scope, MemoryName), MemoryError> {
     if let Some(rest) = qualified.strip_prefix("global/") {
-        validate_name(rest)?;
-        return Ok((Scope::Global, rest.to_string()));
+        let name = MemoryName::new(rest)?;
+        return Ok((Scope::Global, name));
     }
     if let Some(rest) = qualified.strip_prefix("projects/") {
         // rest = "<project>/<memory_name>" (possibly nested)
         if let Some(slash_pos) = rest.find('/') {
             let project = &rest[..slash_pos];
-            let name = &rest[slash_pos + 1..];
-            if project.is_empty() || name.is_empty() {
+            let name_str = &rest[slash_pos + 1..];
+            if project.is_empty() || name_str.is_empty() {
                 return Err(MemoryError::InvalidInput {
                     reason: format!(
                         "malformed qualified name '{}': project or memory name is empty",
@@ -391,8 +471,8 @@ pub fn parse_qualified_name(qualified: &str) -> Result<(Scope, String), MemoryEr
                 });
             }
             validate_name(project)?;
-            validate_name(name)?;
-            return Ok((Scope::Project(project.to_string()), name.to_string()));
+            let name = MemoryName::new(name_str)?;
+            return Ok((Scope::Project(project.to_string()), name));
         }
         return Err(MemoryError::InvalidInput {
             reason: format!(
@@ -623,6 +703,55 @@ impl AppState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn memory_name_valid() {
+        let name = MemoryName::new("my-memory").unwrap();
+        assert_eq!(name.as_str(), "my-memory");
+        assert_eq!(name.into_inner(), "my-memory");
+    }
+
+    #[test]
+    fn memory_name_empty_rejected() {
+        assert!(MemoryName::new("").is_err());
+    }
+
+    #[test]
+    fn memory_name_traversal_rejected() {
+        assert!(MemoryName::new("..").is_err());
+        assert!(MemoryName::new("../etc/passwd").is_err());
+        assert!(MemoryName::new(".hidden").is_err());
+    }
+
+    #[test]
+    fn memory_name_invalid_chars_rejected() {
+        assert!(MemoryName::new("has spaces").is_err());
+        assert!(MemoryName::new("has@symbol").is_err());
+    }
+
+    #[test]
+    fn memory_name_nested_valid() {
+        let name = MemoryName::new("sub/path").unwrap();
+        assert_eq!(name.as_str(), "sub/path");
+    }
+
+    #[test]
+    fn memory_name_display() {
+        let name = MemoryName::new("test-display").unwrap();
+        assert_eq!(format!("{name}"), "test-display");
+    }
+
+    #[test]
+    fn memory_name_serde_round_trip() {
+        let valid: MemoryName = serde_json::from_str("\"my-memory\"").unwrap();
+        assert_eq!(valid.as_str(), "my-memory");
+
+        let invalid: Result<MemoryName, _> = serde_json::from_str("\"../etc\"");
+        assert!(invalid.is_err());
+
+        let empty: Result<MemoryName, _> = serde_json::from_str("\"\"");
+        assert!(empty.is_err());
+    }
+
     fn make_memory() -> Memory {
         let meta = MemoryMetadata {
             tags: vec!["test".to_string(), "round-trip".to_string()],
@@ -633,7 +762,7 @@ mod tests {
         };
         Memory {
             id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-            name: "test-memory".to_string(),
+            name: MemoryName::new("test-memory").unwrap(),
             content: "# Hello\n\nThis is a test memory.".to_string(),
             metadata: meta,
         }
@@ -664,7 +793,11 @@ mod tests {
     #[test]
     fn round_trip_global_scope() {
         let meta = MemoryMetadata::new(Scope::Global, vec!["global-tag".to_string()], None);
-        let mem = Memory::new("global-mem".to_string(), "Some content.".to_string(), meta);
+        let mem = Memory::new(
+            MemoryName::new("global-mem").unwrap(),
+            "Some content.".to_string(),
+            meta,
+        );
         let rendered = mem.to_markdown().unwrap();
         let parsed = Memory::from_markdown(&rendered).unwrap();
 
@@ -676,7 +809,11 @@ mod tests {
     #[test]
     fn round_trip_no_source() {
         let meta = MemoryMetadata::new(Scope::Project("proj".to_string()), vec![], None);
-        let mem = Memory::new("no-src".to_string(), "Body.".to_string(), meta);
+        let mem = Memory::new(
+            MemoryName::new("no-src").unwrap(),
+            "Body.".to_string(),
+            meta,
+        );
         let md = mem.to_markdown().unwrap();
         // source field should not appear in yaml
         assert!(!md.contains("source:"));
@@ -790,21 +927,21 @@ mod tests {
     fn test_parse_qualified_name_global() {
         let (scope, name) = parse_qualified_name("global/my-memory").unwrap();
         assert_eq!(scope, Scope::Global);
-        assert_eq!(name, "my-memory");
+        assert_eq!(name.as_str(), "my-memory");
     }
 
     #[test]
     fn test_parse_qualified_name_project() {
         let (scope, name) = parse_qualified_name("projects/my-project/my-memory").unwrap();
         assert_eq!(scope, Scope::Project("my-project".to_string()));
-        assert_eq!(name, "my-memory");
+        assert_eq!(name.as_str(), "my-memory");
     }
 
     #[test]
     fn test_parse_qualified_name_nested() {
         let (scope, name) = parse_qualified_name("projects/my-project/nested/memory").unwrap();
         assert_eq!(scope, Scope::Project("my-project".to_string()));
-        assert_eq!(name, "nested/memory");
+        assert_eq!(name.as_str(), "nested/memory");
     }
 
     // validate_branch_name tests
