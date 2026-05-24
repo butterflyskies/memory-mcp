@@ -10,7 +10,7 @@ use memory_mcp::auth::AuthProvider;
 #[cfg(unix)]
 use memory_mcp::error::MemoryError;
 use memory_mcp::repo::MemoryRepo;
-use memory_mcp::types::{Memory, MemoryMetadata, PullResult, Scope};
+use memory_mcp::types::{Memory, MemoryMetadata, MemoryName, PullResult, Scope};
 
 /// Full round-trip: init repo → save memory → read it back → list → delete → pull.
 ///
@@ -29,7 +29,7 @@ async fn repo_round_trip_with_test_auth_provider() {
     // Save a memory.
     let metadata = MemoryMetadata::new(Scope::Global, vec!["test".into()], None);
     let memory = Memory::new(
-        "test-memory".into(),
+        MemoryName::new("test-memory").unwrap(),
         "Hello from integration test.".into(),
         metadata,
     );
@@ -42,13 +42,13 @@ async fn repo_round_trip_with_test_auth_provider() {
         .read_memory("test-memory", &Scope::Global)
         .await
         .expect("read should find the memory");
-    assert_eq!(loaded.name, "test-memory");
+    assert_eq!(loaded.name.as_str(), "test-memory");
     assert_eq!(loaded.content, "Hello from integration test.");
 
     // List all memories.
     let list = repo.list_memories(None).await.expect("list should succeed");
     assert_eq!(list.len(), 1);
-    assert_eq!(list[0].name, "test-memory");
+    assert_eq!(list[0].name.as_str(), "test-memory");
 
     // Pull with no remote — exercises auth resolution path via with_token.
     let pull_result = repo.pull(&auth, "main").await.expect("pull should succeed");
@@ -92,7 +92,7 @@ async fn push_pull_with_bare_remote() {
     // Save a memory so there's something to push.
     let metadata = MemoryMetadata::new(Scope::Global, vec!["push-test".into()], None);
     let memory = Memory::new(
-        "push-memory".into(),
+        MemoryName::new("push-memory").unwrap(),
         "Content for push test.".into(),
         metadata,
     );
@@ -137,7 +137,7 @@ async fn push_pull_with_bare_remote() {
         .await
         .expect("list should succeed");
     assert_eq!(memories.len(), 1);
-    assert_eq!(memories[0].name, "push-memory");
+    assert_eq!(memories[0].name.as_str(), "push-memory");
     assert_eq!(memories[0].content, "Content for push test.");
 }
 
@@ -242,7 +242,7 @@ async fn push_rejected_by_server_hook() {
 
     let metadata = MemoryMetadata::new(Scope::Global, vec!["rejected".into()], None);
     let memory = Memory::new(
-        "rejected-memory".into(),
+        MemoryName::new("rejected-memory").unwrap(),
         "This push should be rejected.".into(),
         metadata,
     );

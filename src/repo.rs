@@ -255,7 +255,6 @@ impl MemoryRepo {
     /// All blocking work (mutex lock + fs ops + git2 ops) is performed inside
     /// `tokio::task::spawn_blocking` so the async executor is not stalled.
     pub async fn save_memory(self: &Arc<Self>, memory: &Memory) -> Result<(), MemoryError> {
-        validate_name(&memory.name)?;
         if let Scope::Project(ref project_name) = memory.metadata.scope {
             validate_name(project_name)?;
         }
@@ -311,7 +310,6 @@ impl MemoryRepo {
         name: &str,
         scope: &Scope,
     ) -> Result<(), MemoryError> {
-        validate_name(name)?;
         if let Scope::Project(ref project_name) = *scope {
             validate_name(project_name)?;
         }
@@ -379,7 +377,6 @@ impl MemoryRepo {
         name: &str,
         scope: &Scope,
     ) -> Result<Memory, MemoryError> {
-        validate_name(name)?;
         if let Scope::Project(ref project_name) = *scope {
             validate_name(project_name)?;
         }
@@ -1242,7 +1239,7 @@ impl MemoryRepo {
 mod tests {
     use super::*;
     use crate::auth::AuthProvider;
-    use crate::types::{Memory, MemoryMetadata, PullResult, Scope};
+    use crate::types::{Memory, MemoryMetadata, MemoryName, PullResult, Scope};
     use std::sync::Arc;
 
     fn test_auth() -> AuthProvider {
@@ -1257,7 +1254,7 @@ mod tests {
             updated_at: chrono::DateTime::from_timestamp(updated_at_secs, 0).unwrap(),
             source: None,
         };
-        Memory::new(name.to_string(), content.to_string(), meta)
+        Memory::new(MemoryName::new(name).unwrap(), content.to_string(), meta)
     }
 
     fn setup_bare_remote() -> (tempfile::TempDir, String) {
