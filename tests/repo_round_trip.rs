@@ -27,7 +27,7 @@ async fn repo_round_trip_with_test_auth_provider() {
     let auth = AuthProvider::with_token("ghp_fake_test_token");
 
     // Save a memory.
-    let metadata = MemoryMetadata::new(Scope::Global, vec!["test".into()], None);
+    let metadata = MemoryMetadata::new(Scope::Root, vec!["test".into()], None);
     let memory = Memory::new("test-memory", "Hello from integration test.", metadata).unwrap();
     repo.save_memory(&memory)
         .await
@@ -35,7 +35,7 @@ async fn repo_round_trip_with_test_auth_provider() {
 
     // Read it back.
     let loaded = repo
-        .read_memory("test-memory", &Scope::Global)
+        .read_memory("test-memory", &Scope::Root)
         .await
         .expect("read should find the memory");
     assert_eq!(loaded.name.as_str(), "test-memory");
@@ -54,7 +54,7 @@ async fn repo_round_trip_with_test_auth_provider() {
     );
 
     // Delete the memory.
-    repo.delete_memory("test-memory", &Scope::Global)
+    repo.delete_memory("test-memory", &Scope::Root)
         .await
         .expect("delete should succeed");
 
@@ -86,7 +86,7 @@ async fn push_pull_with_bare_remote() {
     let auth = AuthProvider::with_token("ghp_fake_push_token");
 
     // Save a memory so there's something to push.
-    let metadata = MemoryMetadata::new(Scope::Global, vec!["push-test".into()], None);
+    let metadata = MemoryMetadata::new(Scope::Root, vec!["push-test".into()], None);
     let memory = Memory::new("push-memory", "Content for push test.", metadata).unwrap();
     repo.save_memory(&memory)
         .await
@@ -232,7 +232,7 @@ async fn push_rejected_by_server_hook() {
     );
     let auth = AuthProvider::with_token("ghp_fake_token");
 
-    let metadata = MemoryMetadata::new(Scope::Global, vec!["rejected".into()], None);
+    let metadata = MemoryMetadata::new(Scope::Root, vec!["rejected".into()], None);
     let memory = Memory::new("rejected-memory", "This push should be rejected.", metadata).unwrap();
     repo.save_memory(&memory)
         .await

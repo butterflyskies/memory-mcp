@@ -84,10 +84,10 @@ fn similarity_to_distance(sim: f32) -> f32 {
 impl crate::index::sealed::Sealed for InMemoryStore {}
 
 impl VectorStore for InMemoryStore {
-    // Scope filtering relies on qualified_name encoding the scope (e.g.
-    // "global:foo" or "project:bar:baz"), which UsearchStoreInner guarantees.
-    // The scope parameter is stored alongside the entry for search filtering
-    // but is not used as a separate index key.
+    // Scope filtering relies on the scope parameter stored alongside the entry
+    // (e.g. Scope::Root or Scope::Path("org/team")). The qualified_name
+    // (e.g. "v1:scope=global;name=foo") is the stable index key used for lookup
+    // and telemetry; scope filtering is done separately via scope_matches.
     fn add(
         &self,
         scope: &Scope,
@@ -152,7 +152,7 @@ impl VectorStore for InMemoryStore {
         let mut candidates: Vec<(u64, String, f32)> = state
             .entries
             .iter()
-            .filter(|(_, (scope, _))| scope_matches(filter, scope))
+            .filter(|(_, (scope, _))| filter.matches(scope))
             .map(|(name, (_, vec))| {
                 let key = state
                     .key_map
@@ -209,18 +209,6 @@ impl VectorStore for InMemoryStore {
     }
 }
 
-/// Returns `true` if `scope` should be included given `filter`.
-fn scope_matches(filter: &ScopeFilter, scope: &Scope) -> bool {
-    match filter {
-        ScopeFilter::All => true,
-        ScopeFilter::GlobalOnly => matches!(scope, Scope::Global),
-        ScopeFilter::ProjectAndGlobal(project_name) => match scope {
-            Scope::Global => true,
-            Scope::Project(p) => p == project_name,
-        },
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -229,6 +217,7 @@ fn scope_matches(filter: &ScopeFilter, scope: &Scope) -> bool {
 mod tests {
     use super::*;
     use crate::index::VectorStore;
+    use crate::types::ScopePath;
 
     fn make_store() -> InMemoryStore {
         InMemoryStore::new(4)
@@ -251,7 +240,7 @@ mod tests {
     fn tc02a_add_and_find_by_name() {
         let store: &dyn VectorStore = &make_store();
         store
-            .add(&Scope::Global, &vec_a(), "global/mem1".to_string())
+            .add(&Scope::Root, &vec_a(), "global/mem1".to_string())
             .expect("add failed");
         assert!(
             store.find_by_name("global/mem1").is_some(),
@@ -264,10 +253,10 @@ mod tests {
     fn tc02b_remove_clears_entry() {
         let store: &dyn VectorStore = &make_store();
         store
-            .add(&Scope::Global, &vec_a(), "global/mem2".to_string())
+            .add(&Scope::Root, &vec_a(), "global/mem2".to_string())
             .expect("add failed");
         store
-            .remove(&Scope::Global, "global/mem2")
+            .remove(&Scope::Root, "global/mem2")
             .expect("remove failed");
         assert!(
             store.find_by_name("global/mem2").is_none(),
@@ -275,39 +264,39 @@ mod tests {
         );
     }
 
-    // TC-02c: search with GlobalOnly filter
+    // TC-02c: search with RootOnly filter
     #[test]
-    fn tc02c_search_global_only() {
+    fn tc02c_search_root_only() {
         let store: &dyn VectorStore = &make_store();
-        let proj = Scope::Project("p".to_string());
+        let proj = Scope::Path(ScopePath::new("p").unwrap());
 
         store
-            .add(&Scope::Global, &vec_a(), "global/g1".to_string())
+            .add(&Scope::Root, &vec_a(), "global/g1".to_string())
             .expect("add global");
         store
             .add(&proj, &vec_b(), "projects/p/p1".to_string())
-            .expect("add project");
+            .expect("add namespace");
 
         let results = store
-            .search(&ScopeFilter::GlobalOnly, &vec_a(), 10)
+            .search(&ScopeFilter::RootOnly, &vec_a(), 10)
             .expect("search failed");
         let names: Vec<&str> = results.iter().map(|(_, n, _)| n.as_str()).collect();
         assert!(names.contains(&"global/g1"), "should contain global");
         assert!(
             !names.contains(&"projects/p/p1"),
-            "should NOT contain project"
+            "should NOT contain namespace"
         );
     }
 
-    // TC-02d: search with ProjectAndGlobal filter
+    // TC-02d: search with Subtree filter
     #[test]
-    fn tc02d_search_project_and_global() {
+    fn tc02d_search_subtree() {
         let store: &dyn VectorStore = &make_store();
-        let proj_a = Scope::Project("alpha".to_string());
-        let proj_b = Scope::Project("beta".to_string());
+        let proj_a = Scope::Path(ScopePath::new("alpha").unwrap());
+        let proj_b = Scope::Path(ScopePath::new("beta").unwrap());
 
         store
-            .add(&Scope::Global, &vec_a(), "global/g1".to_string())
+            .add(&Scope::Root, &vec_a(), "global/g1".to_string())
             .expect("add global");
         store
             .add(&proj_a, &vec_b(), "projects/alpha/a1".to_string())
@@ -318,7 +307,7 @@ mod tests {
 
         let results = store
             .search(
-                &ScopeFilter::ProjectAndGlobal("alpha".to_string()),
+                &ScopeFilter::Subtree(ScopePath::new("alpha").unwrap()),
                 &vec_a(),
                 10,
             )
@@ -336,14 +325,14 @@ mod tests {
     #[test]
     fn tc02e_search_all() {
         let store: &dyn VectorStore = &make_store();
-        let proj = Scope::Project("foo".to_string());
+        let proj = Scope::Path(ScopePath::new("foo").unwrap());
 
         store
-            .add(&Scope::Global, &vec_a(), "global/x".to_string())
+            .add(&Scope::Root, &vec_a(), "global/x".to_string())
             .expect("add global");
         store
             .add(&proj, &vec_b(), "projects/foo/y".to_string())
-            .expect("add project");
+            .expect("add namespace");
 
         let results = store
             .search(&ScopeFilter::All, &vec_a(), 10)
@@ -352,7 +341,7 @@ mod tests {
         assert!(names.contains(&"global/x"), "all should include global");
         assert!(
             names.contains(&"projects/foo/y"),
-            "all should include project"
+            "all should include namespace"
         );
     }
 
@@ -362,7 +351,7 @@ mod tests {
     #[test]
     fn tc05c_in_memory_store_returns_ok_variants() {
         let store: &dyn VectorStore = &make_store();
-        let result = store.add(&Scope::Global, &vec_a(), "global/tc05c".to_string());
+        let result = store.add(&Scope::Root, &vec_a(), "global/tc05c".to_string());
         assert!(
             result.is_ok(),
             "TC-05c: add should return Ok, got: {:?}",
@@ -370,7 +359,7 @@ mod tests {
         );
         let result = store.search(&ScopeFilter::All, &vec_a(), 5);
         assert!(result.is_ok(), "TC-05c: search should return Ok");
-        let result = store.remove(&Scope::Global, "global/tc05c");
+        let result = store.remove(&Scope::Root, "global/tc05c");
         assert!(result.is_ok(), "TC-05c: remove should return Ok");
     }
 
@@ -414,7 +403,7 @@ mod tests {
         let store: &dyn VectorStore = &make_store();
         let dir = tempfile::tempdir().expect("tempdir");
         store
-            .add(&Scope::Global, &vec_a(), "global/save-test".to_string())
+            .add(&Scope::Root, &vec_a(), "global/save-test".to_string())
             .expect("add");
         let result = store.save(dir.path());
         assert!(result.is_ok(), "save should be a no-op Ok");
@@ -425,10 +414,10 @@ mod tests {
         let store: &dyn VectorStore = &make_store();
         // vec_a is [1,0,0,0]; searching for [1,0,0,0] should rank it first.
         store
-            .add(&Scope::Global, &vec_a(), "global/closest".to_string())
+            .add(&Scope::Root, &vec_a(), "global/closest".to_string())
             .expect("add a");
         store
-            .add(&Scope::Global, &vec_b(), "global/farther".to_string())
+            .add(&Scope::Root, &vec_b(), "global/farther".to_string())
             .expect("add b");
 
         let results = store
@@ -448,7 +437,7 @@ mod tests {
         let store = InMemoryStore::new(4);
         let wrong_dims = vec![1.0_f32, 0.0]; // 2 dims, store expects 4
         let err = store
-            .add(&Scope::Global, &wrong_dims, "global/bad-dims".to_string())
+            .add(&Scope::Root, &wrong_dims, "global/bad-dims".to_string())
             .unwrap_err();
         assert!(
             matches!(err, MemoryError::InvalidInput { .. }),
@@ -462,14 +451,45 @@ mod tests {
         let store: &dyn VectorStore = &make_store();
         let name = "global/upsert-me".to_string();
         let key1 = store
-            .add(&Scope::Global, &vec_a(), name.clone())
+            .add(&Scope::Root, &vec_a(), name.clone())
             .expect("first add");
         let key2 = store
-            .add(&Scope::Global, &vec_b(), name.clone())
+            .add(&Scope::Root, &vec_b(), name.clone())
             .expect("second add");
         // Keys should differ (monotonic counter).
         assert_ne!(key1, key2);
         // The latest key wins in find_by_name.
         assert_eq!(store.find_by_name(&name), Some(key2));
+    }
+
+    // Subtree filter matching tests
+    fn sp(s: &str) -> ScopePath {
+        ScopePath::new(s).unwrap()
+    }
+
+    #[test]
+    fn subtree_filter_matches_root() {
+        assert!(ScopeFilter::Subtree(sp("eng")).matches(&Scope::Root));
+    }
+
+    #[test]
+    fn subtree_filter_matches_exact_path() {
+        assert!(ScopeFilter::Subtree(sp("eng")).matches(&Scope::Path(sp("eng"))));
+    }
+
+    #[test]
+    fn subtree_filter_matches_child_path() {
+        assert!(ScopeFilter::Subtree(sp("eng")).matches(&Scope::Path(sp("eng/ml"))));
+    }
+
+    #[test]
+    fn subtree_filter_does_not_match_prefix_string() {
+        // "eng" must NOT match "engineering" (not an exact segment prefix)
+        assert!(!ScopeFilter::Subtree(sp("eng")).matches(&Scope::Path(sp("engineering"))));
+    }
+
+    #[test]
+    fn subtree_filter_does_not_match_unrelated_path() {
+        assert!(!ScopeFilter::Subtree(sp("eng")).matches(&Scope::Path(sp("marketing"))));
     }
 }

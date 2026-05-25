@@ -37,10 +37,9 @@ use crate::{
     recall_log::{RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
     types::{
-        parse_qualified_name, parse_scope, parse_scope_filter, AppState, ChangedMemories, EditArgs,
-        ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
-        PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, Scope,
-        ScopeFilter, SyncArgs,
+        parse_qualified_name, AppState, ChangedMemories, EditArgs, ForgetArgs, ListArgs,
+        MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, PullResult, ReadArgs,
+        RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
     },
 };
 
@@ -80,15 +79,42 @@ async fn incremental_reindex(
     for name in &changes.removed {
         match parse_qualified_name(name) {
             Ok(mref) => {
-                if let Err(e) = index.remove(&mref.scope, name) {
-                    warn!(
-                        qualified_name = %name,
-                        error = %e,
-                        "incremental_reindex: failed to remove vector; skipping"
-                    );
-                    stats.errors += 1;
-                } else {
-                    stats.removed += 1;
+                let canonical = mref.qualified_path();
+                match index.remove(&mref.scope, &canonical) {
+                    Ok(()) => {
+                        stats.removed += 1;
+                    }
+                    Err(e) => {
+                        // For on-disk path keys with multi-segment hierarchical scopes,
+                        // parse_qualified_name splits at the first slash, producing the
+                        // wrong scope/name split. The canonical key computed here will
+                        // then not match the actual index entry, and the remove is a
+                        // no-op. This is acceptable: hierarchical scopes are new in this
+                        // release, so no existing index entries use the legacy on-disk
+                        // path form with multi-segment scopes. A full reindex resolves
+                        // any stale entries if they exist.
+                        let is_multi_segment_legacy = name.starts_with("projects/")
+                            && name
+                                .strip_prefix("projects/")
+                                .map(|rest| rest.matches('/').count() >= 2)
+                                .unwrap_or(false);
+                        if is_multi_segment_legacy {
+                            warn!(
+                                qualified_name = %name,
+                                canonical = %canonical,
+                                error = %e,
+                                "incremental_reindex: removal of multi-segment legacy path key \
+                                 failed (scope ambiguity); a full reindex may be needed"
+                            );
+                        } else {
+                            warn!(
+                                qualified_name = %name,
+                                error = %e,
+                                "incremental_reindex: failed to remove vector; skipping"
+                            );
+                            stats.errors += 1;
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -306,8 +332,8 @@ impl MemoryServer {
     #[tool(
         name = "remember",
         description = "Store a new memory. Saves the content to the git-backed repository and \
-        indexes it for semantic search. Use scope 'project:<basename-of-your-cwd>' for \
-        project-specific memories or omit for global. Returns the assigned memory ID. \
+        indexes it for semantic search. Use scope '<basename-of-your-cwd>' or 'org/team' for \
+        scoped memories, or omit for global. Returns the assigned memory ID. \
         IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets — \
         memories are plaintext files in a git repo and may be synced to a remote."
     )]
@@ -337,7 +363,7 @@ impl MemoryServer {
         );
         let state = Arc::clone(&self.state);
         async move {
-            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
             let metadata = MemoryMetadata::new(scope.clone(), args.tags, args.source);
             let memory = Memory::from_validated(name, args.content, metadata);
 
@@ -352,7 +378,7 @@ impl MemoryServer {
                 .map_err(ErrorData::from)?;
             info!(embed_ms = start.elapsed().as_millis(), "embedded");
 
-            let qualified_name = format!("{}/{}", memory.metadata.scope.dir_prefix(), memory.name);
+            let qualified_name = memory.mem_ref().qualified_path();
 
             state
                 .index
@@ -391,7 +417,7 @@ impl MemoryServer {
         Each result includes `truncated` (bool) and `content_length` (total character count). \
         When `truncated` is true, the snippet is incomplete — use the `read` tool with the memory's name and scope \
         to retrieve the full content before acting on it.\n\n\
-        Scope: pass 'project:<basename-of-your-cwd>' to search your current project + global memories, \
+        Scope: pass '<basename-of-your-cwd>' or 'org/team' to search that scope + global memories, \
         'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
     async fn recall(
@@ -414,7 +440,7 @@ impl MemoryServer {
         async move {
             // Parse optional scope filter.
             let scope_filter =
-                parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
+                ScopeFilter::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let limit = args.limit.unwrap_or(5).min(100);
 
@@ -529,7 +555,7 @@ impl MemoryServer {
     /// Returns `"ok"` on success.
     #[tool(
         name = "forget",
-        description = "Delete a memory by name. Use scope 'project:<basename-of-your-cwd>' for project-scoped \
+        description = "Delete a memory by name. Use a bare path scope like '<basename-of-your-cwd>' for scoped \
         memories or omit for global. Removes the file from git and the vector from the search index. \
         Returns 'ok' on success."
     )]
@@ -548,7 +574,7 @@ impl MemoryServer {
         );
         let state = Arc::clone(&self.state);
         async move {
-            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
 
@@ -560,7 +586,7 @@ impl MemoryServer {
                 .map_err(ErrorData::from)?;
 
             // Remove from index (best-effort — stale entries are skipped at recall time).
-            let qualified_name = format!("{}/{}", scope.dir_prefix(), name);
+            let qualified_name = MemoryRef::new(scope.clone(), name.clone()).qualified_path();
             if let Err(e) = state.index.remove(&scope, &qualified_name) {
                 warn!(name = %name, error = %e, "vector removal failed during forget; stale entry will be skipped at recall");
             }
@@ -588,8 +614,8 @@ impl MemoryServer {
     #[tool(
         name = "edit",
         description = "Edit an existing memory. Supports partial updates — omit content or \
-        tags to preserve existing values. Re-embeds and re-indexes the memory. Use scope \
-        'project:<basename-of-your-cwd>' for project-scoped memories. Returns the memory ID. \
+        tags to preserve existing values. Re-embeds and re-indexes the memory. Use a bare path \
+        scope like '<basename-of-your-cwd>' for scoped memories. Returns the memory ID. \
         IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets — \
         memories are plaintext files in a git repo and may be synced to a remote."
     )]
@@ -626,7 +652,7 @@ impl MemoryServer {
         );
         let state = Arc::clone(&self.state);
         async move {
-            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
 
@@ -652,8 +678,7 @@ impl MemoryServer {
             // Only re-embed and re-index when content changed.
             // Order: (1) embed, (2) upsert index entry, (3) save to repo.
             if content_changed {
-                let qualified_name =
-                    format!("{}/{}", memory.metadata.scope.dir_prefix(), memory.name);
+                let qualified_name = memory.mem_ref().qualified_path();
 
                 // Re-embed updated content.
                 let vector = state
@@ -699,7 +724,7 @@ impl MemoryServer {
     /// created_at, updated_at). Full content bodies are omitted for brevity.
     #[tool(
         name = "list",
-        description = "List stored memories. Pass 'project:<basename-of-your-cwd>' for project + global memories, \
+        description = "List stored memories. Pass a bare path like '<basename-of-your-cwd>' for that scope + global memories, \
         'global' for global-only, or 'all' for everything. Omitting scope defaults to global-only. \
         Returns a JSON array of memory summaries without full content."
     )]
@@ -718,13 +743,13 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             let scope_filter =
-                parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
+                ScopeFilter::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
             let memories = match &scope_filter {
-                ScopeFilter::GlobalOnly => state
+                ScopeFilter::RootOnly => state
                     .repo
-                    .list_memories(Some(&Scope::Global))
+                    .list_memories(Some(&Scope::Root))
                     .await
                     .map_err(ErrorData::from)?,
                 ScopeFilter::All => state
@@ -732,20 +757,20 @@ impl MemoryServer {
                     .list_memories(None)
                     .await
                     .map_err(ErrorData::from)?,
-                ScopeFilter::ProjectAndGlobal(project_name) => {
-                    let project_scope = Scope::Project(project_name.clone());
-                    let mut global = state
+                ScopeFilter::Subtree(sp) => {
+                    let path_scope = Scope::Path(sp.clone());
+                    let mut root_memories = state
                         .repo
-                        .list_memories(Some(&Scope::Global))
+                        .list_memories(Some(&Scope::Root))
                         .await
                         .map_err(ErrorData::from)?;
-                    let project = state
+                    let path_memories = state
                         .repo
-                        .list_memories(Some(&project_scope))
+                        .list_memories(Some(&path_scope))
                         .await
                         .map_err(ErrorData::from)?;
-                    global.extend(project);
-                    global
+                    root_memories.extend(path_memories);
+                    root_memories
                 }
             };
             let count = memories.len();
@@ -782,8 +807,8 @@ impl MemoryServer {
     /// metadata (id, scope, tags, timestamps) as a JSON object.
     #[tool(
         name = "read",
-        description = "Read a specific memory by name. Use scope 'project:<basename-of-your-cwd>' for \
-        project-scoped memories or omit for global. Returns the full markdown content and metadata \
+        description = "Read a specific memory by name. Use a bare path scope like '<basename-of-your-cwd>' for \
+        scoped memories or omit for global. Returns the full markdown content and metadata \
         (id, scope, tags, timestamps) as a JSON object."
     )]
     async fn read(
@@ -801,7 +826,7 @@ impl MemoryServer {
         );
         let state = Arc::clone(&self.state);
         async move {
-            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
             let memory = state
@@ -1151,17 +1176,24 @@ impl ServerHandler for MemoryServer {
             in a git repository and indexed for semantic retrieval. Use `remember` to store, `recall` \
             to search, `read` to fetch a specific memory, `edit` to update, `forget` to delete, \
             `list` to browse, and `sync` to push/pull the remote.\n\n\
-            Scope convention: always pass scope='project:<basename-of-your-cwd>' when working within \
-            a project. This returns project memories alongside global ones. Omitting scope defaults to \
-            global-only for queries (recall, list) and targets a single memory for point operations \
-            (remember, edit, read, forget). Use scope='all' to search across all projects.\n\n\
+            Scope convention: pass a bare namespace path like 'my-project' or 'org/team' when \
+            working within a namespace. Paths may be hierarchical (e.g. 'org/team/project'). \
+            This returns that namespace's memories alongside global ones. \
+            Omitting scope defaults to global-only for queries (recall, list) and targets a single \
+            memory for point operations (remember, edit, read, forget). Use scope='all' to search \
+            across all scopes.\n\n\
             IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets in \
             memory content. Memories are stored as plaintext markdown files committed to a git \
             repository and may be synced to a remote. Treat all memory content as public.\n\n\
             Recall feedback: after acting on recalled memories, call `mark_applied` for each result \
             with your verdict ('applied', 'maybe', or 'not_applied'). Every recall response includes \
             a `recall_id` — pass it back with each verdict. This bidirectional feedback calibrates \
-            recall thresholds. Use `recall_stats` to inspect precision by distance bucket."
+            recall thresholds. Use `recall_stats` to inspect precision by distance bucket.\n\n\
+            Breaking change (v0.14.0): the 'project:<name>' scope format is no longer accepted \
+            as tool input. If your prompts or configuration pass scope values like \
+            'project:my-project', replace them with the bare path: 'my-project'. The 'global' \
+            scope is unchanged. Stored memories are unaffected — old scope formats in YAML \
+            frontmatter are read correctly without migration."
                 .to_string(),
         )
     }

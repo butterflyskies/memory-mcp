@@ -278,7 +278,7 @@ fn index_add_span_has_correct_name() {
     let (_, store) = with_capturing(|| {
         let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let _ = idx.add(&Scope::Global, &v, "global/tc01-test".to_string());
+        let _ = idx.add(&Scope::Root, &v, "global/tc01-test".to_string());
     });
     let spans = store.lock().unwrap();
     let names: Vec<&str> = spans.spans.iter().map(|s| s.name.as_str()).collect();
@@ -296,8 +296,8 @@ fn index_remove_span_has_correct_name() {
     let (_, store) = with_capturing(|| {
         let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let _ = idx.add(&Scope::Global, &v, "global/tc01-remove".to_string());
-        let _ = idx.remove(&Scope::Global, "global/tc01-remove");
+        let _ = idx.add(&Scope::Root, &v, "global/tc01-remove".to_string());
+        let _ = idx.remove(&Scope::Root, "global/tc01-remove");
     });
     let spans = store.lock().unwrap();
     let names: Vec<&str> = spans.spans.iter().map(|s| s.name.as_str()).collect();
@@ -315,8 +315,8 @@ fn index_search_span_has_correct_name() {
     let (_, store) = with_capturing(|| {
         let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let _ = idx.add(&Scope::Global, &v, "global/tc01-search".to_string());
-        let _ = idx.search(&ScopeFilter::GlobalOnly, &v, 5);
+        let _ = idx.add(&Scope::Root, &v, "global/tc01-search".to_string());
+        let _ = idx.search(&ScopeFilter::RootOnly, &v, 5);
     });
     let spans = store.lock().unwrap();
     let names: Vec<&str> = spans.spans.iter().map(|s| s.name.as_str()).collect();
@@ -335,7 +335,7 @@ fn index_save_load_spans_have_correct_names() {
     let (_, store) = with_capturing(|| {
         let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let _ = idx.add(&Scope::Global, &v, "global/tc01-save".to_string());
+        let _ = idx.add(&Scope::Root, &v, "global/tc01-save".to_string());
         let _ = idx.save(dir.path());
         let _ = UsearchStore::load(dir.path(), 4);
     });
@@ -366,8 +366,8 @@ fn index_spans_only_use_canonical_fields() {
     let (_, store) = with_capturing(|| {
         let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let _ = idx.add(&Scope::Global, &v, "global/tc04-test".to_string());
-        let _ = idx.remove(&Scope::Global, "global/tc04-test");
+        let _ = idx.add(&Scope::Root, &v, "global/tc04-test".to_string());
+        let _ = idx.remove(&Scope::Root, "global/tc04-test");
         let _ = idx.search(&ScopeFilter::All, &v, 5);
         let _ = idx.save(dir.path());
         let _ = UsearchStore::load(dir.path(), 4);
@@ -407,7 +407,7 @@ fn index_add_span_has_scope_and_dimensions_fields() {
     let (_, store) = with_capturing(|| {
         let idx = UsearchStore::new(8).expect("create index");
         let v = vec![0.0_f32; 8];
-        let _ = idx.add(&Scope::Global, &v, "global/tc06-test".to_string());
+        let _ = idx.add(&Scope::Root, &v, "global/tc06-test".to_string());
     });
     let spans = store.lock().unwrap();
     let add_span = spans
@@ -442,8 +442,8 @@ fn index_search_span_has_required_fields() {
     let (_, store) = with_capturing(|| {
         let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let _ = idx.add(&Scope::Global, &v, "global/tc07".to_string());
-        let _ = idx.search(&ScopeFilter::GlobalOnly, &v, 5);
+        let _ = idx.add(&Scope::Root, &v, "global/tc07".to_string());
+        let _ = idx.search(&ScopeFilter::RootOnly, &v, 5);
     });
     let spans = store.lock().unwrap();
     let search_span = spans
@@ -483,7 +483,7 @@ fn index_save_span_has_key_count_field() {
     let (_, store) = with_capturing(|| {
         let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let _ = idx.add(&Scope::Global, &v, "global/tc09-save".to_string());
+        let _ = idx.add(&Scope::Root, &v, "global/tc09-save".to_string());
         let _ = idx.save(dir.path());
     });
     let spans = store.lock().unwrap();
@@ -666,7 +666,7 @@ fn debug_spans_are_filtered_when_only_info_enabled() {
         with_default(subscriber, || {
             let idx = UsearchStore::new(4).expect("create index");
             let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-            let _ = idx.add(&Scope::Global, &v, "global/tc20-baseline".to_string());
+            let _ = idx.add(&Scope::Root, &v, "global/tc20-baseline".to_string());
         });
     }
     {
@@ -693,7 +693,7 @@ fn debug_spans_are_filtered_when_only_info_enabled() {
     with_default(subscriber, || {
         let idx = UsearchStore::new(4).expect("create index");
         let v = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let _ = idx.add(&Scope::Global, &v, "global/tc20-filter".to_string());
+        let _ = idx.add(&Scope::Root, &v, "global/tc20-filter".to_string());
     });
 
     let spans = store.lock().unwrap();
@@ -730,7 +730,7 @@ fn repo_save_span_has_name_and_oid_fields() {
             let repo = Arc::new(MemoryRepo::init_or_open(dir.path(), None).expect("init repo"));
             let meta = MemoryMetadata {
                 tags: vec![],
-                scope: Scope::Global,
+                scope: Scope::Root,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 source: None,
@@ -782,14 +782,14 @@ fn repo_delete_span_has_name_and_oid_fields() {
             let repo = Arc::new(MemoryRepo::init_or_open(dir.path(), None).expect("init repo"));
             let meta = MemoryMetadata {
                 tags: vec![],
-                scope: Scope::Global,
+                scope: Scope::Root,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 source: None,
             };
             let mem = Memory::new("tc08b-memory", "test content", meta).unwrap();
             repo.save_memory(&mem).await.expect("save");
-            repo.delete_memory("tc08b-memory", &Scope::Global)
+            repo.delete_memory("tc08b-memory", &Scope::Root)
                 .await
                 .expect("delete");
         });
@@ -838,7 +838,7 @@ fn repo_save_does_not_log_content_text() {
             let repo = Arc::new(MemoryRepo::init_or_open(dir.path(), None).expect("init repo"));
             let meta = MemoryMetadata {
                 tags: vec![],
-                scope: Scope::Global,
+                scope: Scope::Root,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 source: None,

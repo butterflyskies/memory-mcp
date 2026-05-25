@@ -258,7 +258,7 @@ impl RecallLog {
 pub struct RecallResult {
     /// Name of the memory that was returned.
     pub memory_name: String,
-    /// Scope of the memory (e.g. "global" or "project:foo").
+    /// Scope of the memory (e.g. "global" or "my-project" or "org/team").
     pub scope: String,
     /// Zero-based rank in the result set (lower is more relevant).
     pub rank: usize,

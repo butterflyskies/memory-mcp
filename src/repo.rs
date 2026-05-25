@@ -12,7 +12,7 @@ use crate::{
     auth::AuthProvider,
     error::MemoryError,
     health::SubsystemReporter,
-    types::{validate_name, ChangedMemories, Memory, PullResult, Scope},
+    types::{ChangedMemories, Memory, PullResult, Scope},
 };
 
 // ---------------------------------------------------------------------------
@@ -246,7 +246,7 @@ impl MemoryRepo {
     /// Absolute path for a memory's markdown file inside the repo.
     fn memory_path(&self, name: &str, scope: &Scope) -> PathBuf {
         self.root
-            .join(scope.dir_prefix())
+            .join(scope.dir_prefix().as_ref())
             .join(format!("{}.md", name))
     }
 
@@ -255,10 +255,6 @@ impl MemoryRepo {
     /// All blocking work (mutex lock + fs ops + git2 ops) is performed inside
     /// `tokio::task::spawn_blocking` so the async executor is not stalled.
     pub async fn save_memory(self: &Arc<Self>, memory: &Memory) -> Result<(), MemoryError> {
-        if let Scope::Project(ref project_name) = memory.metadata.scope {
-            validate_name(project_name)?;
-        }
-
         let file_path = self.memory_path(&memory.name, &memory.metadata.scope);
         self.assert_within_root(&file_path)?;
 
@@ -310,10 +306,6 @@ impl MemoryRepo {
         name: &str,
         scope: &Scope,
     ) -> Result<(), MemoryError> {
-        if let Scope::Project(ref project_name) = *scope {
-            validate_name(project_name)?;
-        }
-
         let file_path = self.memory_path(name, scope);
         self.assert_within_root(&file_path)?;
 
@@ -377,10 +369,6 @@ impl MemoryRepo {
         name: &str,
         scope: &Scope,
     ) -> Result<Memory, MemoryError> {
-        if let Scope::Project(ref project_name) = *scope {
-            validate_name(project_name)?;
-        }
-
         let file_path = self.memory_path(name, scope);
         self.assert_within_root(&file_path)?;
 
@@ -431,9 +419,9 @@ impl MemoryRepo {
         let result = traced_spawn_blocking(move || -> Result<Vec<Memory>, MemoryError> {
             let _enter = span.entered();
             let dirs: Vec<PathBuf> = match scope_clone.as_ref() {
-                Some(s) => vec![root.join(s.dir_prefix())],
+                Some(s) => vec![root.join(s.dir_prefix().as_ref())],
                 None => {
-                    // Walk both global/ and projects/*
+                    // Walk both global/ and projects/* (on-disk namespace directories)
                     let mut dirs = Vec::new();
                     let global = root.join("global");
                     if global.exists() {
@@ -748,7 +736,7 @@ impl MemoryRepo {
 
     /// Diff two commits and return the memory files that changed.
     ///
-    /// Only `.md` files under `global/` or `projects/` are considered.
+    /// Only `.md` files under `global/` or `projects/` (namespace directories) are considered.
     /// Added/modified files go into `upserted`; deleted files go into `removed`.
     /// Qualified names are returned without the `.md` suffix (e.g. `"global/foo"`).
     ///
@@ -792,7 +780,7 @@ impl MemoryRepo {
                     None => return true,
                 };
 
-                // Only care about .md files under global/ or projects/
+                // Only care about .md files under global/ or projects/ (namespace directories)
                 if !path_str.ends_with(".md") {
                     return true;
                 }
@@ -1249,7 +1237,7 @@ mod tests {
     fn make_memory(name: &str, content: &str, updated_at_secs: i64) -> Memory {
         let meta = MemoryMetadata {
             tags: vec![],
-            scope: Scope::Global,
+            scope: Scope::Root,
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             updated_at: chrono::DateTime::from_timestamp(updated_at_secs, 0).unwrap(),
             source: None,
