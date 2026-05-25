@@ -57,6 +57,7 @@ pub fn build_stub_state(tmp: &tempfile::TempDir, health: HealthRegistry) -> Arc<
         Box::new(InMemoryStore::new(4)),
         AuthProvider::new(),
         health,
+        None,
     ))
 }
 

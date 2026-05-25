@@ -34,6 +34,7 @@ use crate::{
     embedding::EmbeddingBackend,
     error::MemoryError,
     index::VectorStore,
+    recall_log::{RecallLog, RecallResult},
     repo::MemoryRepo,
     types::{
         parse_qualified_name, parse_scope, parse_scope_filter, AppState, ChangedMemories, EditArgs,
@@ -398,10 +399,12 @@ impl MemoryServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
         let session_id = extract_session_id(&parts);
+        let recall_id = RecallLog::generate_recall_id();
         // Note: query text is intentionally omitted from the span (R-17 privacy decision).
         let span = tracing::info_span!(
             "handler.recall",
             session_id = %session_id,
+            recall_id = %recall_id,
             scope = ?args.scope,
             limit = ?args.limit,
             count = tracing::field::Empty,
@@ -435,6 +438,7 @@ impl MemoryServer {
 
             let pre_filter_count = results.len();
             let mut results_vec = Vec::new();
+            let mut log_entries: Vec<RecallResult> = Vec::new();
             let mut skipped_errors: usize = 0;
 
             for (_key, qualified_name, distance) in results {
@@ -470,7 +474,15 @@ impl MemoryServer {
                     }
                 };
 
+                let rank = results_vec.len();
                 let (snippet, content_length, truncated) = build_snippet(&memory.content);
+
+                log_entries.push(RecallResult {
+                    memory_name: memory.name.to_string(),
+                    scope: memory.metadata.scope.to_string(),
+                    rank,
+                    distance,
+                });
 
                 results_vec.push(serde_json::json!({
                     "id": memory.id,
@@ -484,11 +496,18 @@ impl MemoryServer {
                 }));
             }
 
+            if let Some(ref log) = state.recall_log {
+                if let Err(e) = log.log_results(&recall_id, &session_id, &log_entries) {
+                    warn!(error = %e, "failed to write recall log entries");
+                }
+            }
+
             let count = results_vec.len();
             tracing::Span::current().record("count", count);
             info!(returned = count, skipped_errors, "recall complete");
 
             Ok(serde_json::json!({
+                "recall_id": recall_id,
                 "results": results_vec,
                 "count": count,
                 "limit": limit,

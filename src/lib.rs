@@ -18,6 +18,8 @@ pub(crate) mod fs_util;
 pub mod health;
 /// HNSW vector index for approximate nearest-neighbour search.
 pub mod index;
+/// Append-only SQLite event log for recall telemetry and threshold calibration.
+pub mod recall_log;
 /// Git-backed memory repository — read, write, sync, and diff operations.
 pub mod repo;
 /// MCP server implementation — tool handlers for the memory protocol.

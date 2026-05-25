@@ -721,6 +721,8 @@ pub struct AppState {
     pub branch: String,
     /// Passive health registry — subsystems report here, `/readyz` reads here.
     pub health: HealthRegistry,
+    /// Optional append-only recall event log for threshold calibration.
+    pub recall_log: Option<crate::recall_log::RecallLog>,
 }
 
 impl AppState {
@@ -732,6 +734,7 @@ impl AppState {
         index: Box<dyn VectorStore>,
         auth: AuthProvider,
         health: HealthRegistry,
+        recall_log: Option<crate::recall_log::RecallLog>,
     ) -> Self {
         Self {
             repo,
@@ -740,6 +743,7 @@ impl AppState {
             auth,
             branch,
             health,
+            recall_log,
         }
     }
 }

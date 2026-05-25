@@ -1,3 +1,26 @@
+## [0.13.0] - 2026-05-25
+
+### Added
+- `MemoryName` newtype: validated memory name with `FromStr`, `Deserialize`, `JsonSchema` — construction is the sole validation path (#224)
+- `MemoryRef` newtype pairing `Scope` + `MemoryName` with `qualified_path()` method (#228)
+- `RecallLog`: SQLite-backed append-only event log for recall threshold calibration (#213)
+- `recall_id` field in recall responses for correlating results with telemetry
+- SIGTERM handler for graceful shutdown alongside existing SIGINT (Ctrl+C) (#195)
+
+### Changed
+- `Memory.name` changed from `String` to `MemoryName` (**breaking**) (#224)
+- `Memory::new()` now takes `impl Into<String>` for name and content, validates internally, returns `Result<Self, MemoryError>` (#230)
+- `Memory::from_validated()` added as `pub(crate)` constructor for pre-validated names
+- `AppState::new()` gains `recall_log: Option<RecallLog>` parameter (**breaking**)
+- `parse_qualified_name()` returns `MemoryRef` instead of `(Scope, MemoryName)` tuple
+
+### Fixed
+- Auth tests isolated from system keyring backends (`DBUS_SESSION_BUS_ADDRESS`, `DISPLAY`) (#225)
+- Flaky subprocess integration tests converted to in-process tower oneshot tests (#227)
+
+### Dependencies
+- Added `rusqlite` 0.34 (bundled) for recall event logging
+
 ## [0.12.1] - 2026-05-18
 
 ### Fixed
