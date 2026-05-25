@@ -67,11 +67,11 @@ impl RawIndex for UsearchRawIndex {
     }
 
     fn add(&self, key: u64, vector: &[f32]) -> Result<(), RawIndexError> {
-        self.inner.add(key, vector).map_err(|e| e.into())
+        self.inner.add(key, vector).map_err(Into::into)
     }
 
     fn remove(&self, key: u64) -> Result<(), RawIndexError> {
-        self.inner.remove(key).map(|_| ()).map_err(|e| e.into())
+        self.inner.remove(key).map(|_| ()).map_err(Into::into)
     }
 
     fn search(&self, query: &[f32], count: usize) -> Result<RawSearchResults, RawIndexError> {
@@ -83,11 +83,11 @@ impl RawIndex for UsearchRawIndex {
     }
 
     fn save(&self, path: &str) -> Result<(), RawIndexError> {
-        self.inner.save(path).map_err(|e| e.into())
+        self.inner.save(path).map_err(Into::into)
     }
 
     fn reserve(&self, capacity: usize) -> Result<(), RawIndexError> {
-        self.inner.reserve(capacity).map_err(|e| e.into())
+        self.inner.reserve(capacity).map_err(Into::into)
     }
 
     fn size(&self) -> usize {
@@ -125,6 +125,19 @@ struct VectorIndex<R: RawIndex = UsearchRawIndex> {
     entry_count: AtomicUsize,
 }
 
+/// Lock the mutex, panicking with a consistent message if the lock is poisoned.
+///
+/// Lock poisoning means a prior thread panicked while holding the lock, leaving
+/// the protected data in an unknown state. There is no safe recovery path, so
+/// we panic rather than propagate corrupt state to callers.
+macro_rules! lock {
+    ($mutex:expr) => {
+        $mutex
+            .lock()
+            .expect("VectorIndex state lock poisoned — prior panic corrupted state")
+    };
+}
+
 impl VectorIndex<UsearchRawIndex> {
     /// Load an existing index from `path`. Also reads `<path>.keys.json`.
     fn load(path: &Path) -> Result<Self, MemoryError> {
@@ -147,35 +160,11 @@ impl VectorIndex<UsearchRawIndex> {
             .load(path_str)
             .map_err(|e| MemoryError::Index(format!("load: {}", e)))?;
 
-        // Load the key map and counter.
-        let keys_path = format!("{}.keys.json", path_str);
-        let (key_map, next_key, commit_sha): (HashMap<u64, String>, u64, Option<String>) =
-            if std::path::Path::new(&keys_path).exists() {
-                let json = std::fs::read_to_string(&keys_path)?;
-                // Support both old format (bare HashMap) and new format ({key_map, next_key}).
-                let value: serde_json::Value = serde_json::from_str(&json)
-                    .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
-                if value.is_object() && value.get("key_map").is_some() {
-                    let km: HashMap<u64, String> = serde_json::from_value(value["key_map"].clone())
-                        .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
-                    let nk: u64 = value["next_key"]
-                        .as_u64()
-                        .unwrap_or_else(|| km.keys().max().map(|k| k + 1).unwrap_or(0));
-                    let sha: Option<String> = value
-                        .get("commit_sha")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    (km, nk, sha)
-                } else {
-                    // Legacy format: bare HashMap.
-                    let km: HashMap<u64, String> = serde_json::from_value(value)
-                        .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
-                    let nk = km.keys().max().map(|k| k + 1).unwrap_or(0);
-                    (km, nk, None)
-                }
-            } else {
-                (HashMap::new(), 0, None)
-            };
+        let KeyMapData {
+            key_map,
+            next_key,
+            commit_sha,
+        } = load_key_map(path_str)?;
 
         let name_map: HashMap<String, u64> = key_map.iter().map(|(&k, v)| (v.clone(), k)).collect();
         if key_map.len() != name_map.len() {
@@ -196,6 +185,60 @@ impl VectorIndex<UsearchRawIndex> {
                 commit_sha,
             }),
             entry_count: AtomicUsize::new(count),
+        })
+    }
+}
+
+/// Parsed contents of a `<index>.keys.json` file.
+struct KeyMapData {
+    key_map: HashMap<u64, String>,
+    next_key: u64,
+    commit_sha: Option<String>,
+}
+
+/// Load and deserialise the key map from `<path_str>.keys.json`.
+///
+/// Supports both the legacy bare-HashMap format and the current
+/// `{key_map, next_key, commit_sha}` envelope format.
+fn load_key_map(path_str: &str) -> Result<KeyMapData, MemoryError> {
+    let keys_path = format!("{}.keys.json", path_str);
+    if !std::path::Path::new(&keys_path).exists() {
+        return Ok(KeyMapData {
+            key_map: HashMap::new(),
+            next_key: 0,
+            commit_sha: None,
+        });
+    }
+
+    let json = std::fs::read_to_string(&keys_path)?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
+
+    if value.is_object() && value.get("key_map").is_some() {
+        // Current format: {key_map, next_key, commit_sha}.
+        let key_map: HashMap<u64, String> = serde_json::from_value(value["key_map"].clone())
+            .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
+        let next_key = value["next_key"]
+            .as_u64()
+            .unwrap_or_else(|| key_map.keys().max().map(|k| k + 1).unwrap_or(0));
+        let commit_sha = value
+            .get("commit_sha")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        Ok(KeyMapData {
+            key_map,
+            next_key,
+            commit_sha,
+        })
+    } else {
+        // Legacy format: bare HashMap.
+        let key_map: HashMap<u64, String> = serde_json::from_value(value)
+            .map_err(|e| MemoryError::Index(format!("keymap deserialise: {}", e)))?;
+        let next_key = key_map.keys().max().map(|k| k + 1).unwrap_or(0);
+        Ok(KeyMapData {
+            key_map,
+            next_key,
+            commit_sha: None,
         })
     }
 }
@@ -233,20 +276,13 @@ impl<R: RawIndex> VectorIndex<R> {
 
     /// Find the vector key associated with a qualified memory name.
     fn find_key_by_name(&self, name: &str) -> Option<u64> {
-        let state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
-        state.name_map.get(name).copied()
+        lock!(self.state).name_map.get(name).copied()
     }
 
     /// Atomically allocate the next key and add the vector in one lock acquisition.
     /// Returns the assigned key on success. On failure the counter is not advanced.
     fn add_with_next_key(&self, vector: &[f32], name: String) -> Result<u64, MemoryError> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
+        let mut state = lock!(self.state);
         Self::grow_if_needed_inner(&state, 1)?;
         let key = state.next_key;
         state.index.add(key, vector).map_err(raw_err)?;
@@ -265,10 +301,7 @@ impl<R: RawIndex> VectorIndex<R> {
     ///
     /// Returns `(key, name, distance)` triples sorted by ascending distance.
     fn search(&self, query: &[f32], limit: usize) -> Result<Vec<(u64, String, f32)>, MemoryError> {
-        let state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
+        let state = lock!(self.state);
         let raw = state.index.search(query, limit).map_err(raw_err)?;
 
         let results = raw
@@ -287,10 +320,7 @@ impl<R: RawIndex> VectorIndex<R> {
 
     /// Remove a vector by key.
     fn remove(&self, key: u64) -> Result<(), MemoryError> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
+        let mut state = lock!(self.state);
         state.index.remove(key).map_err(raw_err)?;
         if let Some(name) = state.key_map.remove(&key) {
             // Only remove from name_map if it still points to this key.
@@ -312,10 +342,7 @@ impl<R: RawIndex> VectorIndex<R> {
     /// acquisition, preventing a partial rollback from leaving inconsistent
     /// state.
     fn rollback_add(&self, new_key: u64, old_key: Option<u64>, name: &str) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
+        let mut state = lock!(self.state);
         // Remove the new entry from raw index (best-effort; log on failure).
         if let Err(e) = state.index.remove(new_key) {
             tracing::warn!(error = %e, "rollback: raw index remove failed");
@@ -323,11 +350,10 @@ impl<R: RawIndex> VectorIndex<R> {
         // Remove the new key from key_map.
         state.key_map.remove(&new_key);
         // Restore name_map to point to the old key (or remove if no old key).
-        if let Some(old) = old_key {
-            state.name_map.insert(name.to_owned(), old);
-        } else {
-            state.name_map.remove(name);
-        }
+        match old_key {
+            Some(old) => state.name_map.insert(name.to_owned(), old),
+            None => state.name_map.remove(name),
+        };
         self.entry_count
             .store(state.key_map.len(), Ordering::Relaxed);
     }
@@ -339,20 +365,12 @@ impl<R: RawIndex> VectorIndex<R> {
 
     /// Return the commit SHA stored in the index metadata (if any).
     fn commit_sha(&self) -> Option<String> {
-        let state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
-        state.commit_sha.clone()
+        lock!(self.state).commit_sha.clone()
     }
 
     /// Set the commit SHA in the index metadata.
     fn set_commit_sha(&self, sha: Option<&str>) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
-        state.commit_sha = sha.map(|s| s.to_owned());
+        lock!(self.state).commit_sha = sha.map(str::to_owned);
     }
 
     /// Persist the index to `path`. Also writes `<path>.keys.json`.
@@ -361,10 +379,7 @@ impl<R: RawIndex> VectorIndex<R> {
             reason: "non-UTF-8 index path".to_string(),
         })?;
 
-        let state = self
-            .state
-            .lock()
-            .expect("lock poisoned — prior panic corrupted state");
+        let state = lock!(self.state);
         state.index.save(path_str).map_err(raw_err)?;
 
         // Persist the key map and counter alongside the index.
@@ -379,6 +394,61 @@ impl<R: RawIndex> VectorIndex<R> {
         std::fs::write(&keys_path, json)?;
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ScopeRegistry — typed wrapper around the per-scope index map
+// ---------------------------------------------------------------------------
+
+/// Owns all per-scope `VectorIndex` instances.
+///
+/// Invariant: after `new`, the `Root` scope is always present. New scopes are
+/// created on demand by `get_or_create`.
+struct ScopeRegistry<R: RawIndex> {
+    scopes: HashMap<Scope, VectorIndex<R>>,
+}
+
+impl<R: RawIndex> ScopeRegistry<R> {
+    fn new(root: VectorIndex<R>) -> Self {
+        let mut scopes = HashMap::new();
+        scopes.insert(Scope::Root, root);
+        Self { scopes }
+    }
+
+    fn get(&self, scope: &Scope) -> Option<&VectorIndex<R>> {
+        self.scopes.get(scope)
+    }
+
+    fn get_or_create(
+        &mut self,
+        scope: &Scope,
+        dimensions: usize,
+    ) -> Result<&VectorIndex<R>, MemoryError> {
+        // Use the entry API to avoid a redundant lookup after insertion.
+        if let std::collections::hash_map::Entry::Vacant(e) = self.scopes.entry(scope.clone()) {
+            e.insert(VectorIndex::new(dimensions)?);
+        }
+        Ok(self
+            .scopes
+            .get(scope)
+            .expect("just inserted or already present"))
+    }
+
+    fn insert(&mut self, scope: Scope, index: VectorIndex<R>) {
+        self.scopes.insert(scope, index);
+    }
+
+    /// Return all indexes whose scope matches `filter`.
+    fn matching(&self, filter: &ScopeFilter) -> Vec<(&Scope, &VectorIndex<R>)> {
+        self.scopes
+            .iter()
+            .filter(|(scope, _)| filter.matches(scope))
+            .collect()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Scope, &VectorIndex<R>)> {
+        self.scopes.iter()
     }
 }
 
@@ -401,7 +471,13 @@ pub struct UsearchStore {
 /// Generic inner implementation, separated so tests can substitute `R`.
 struct UsearchStoreInner<R: RawIndex> {
     /// Per-scope indexes (global + each namespace).
-    scopes: RwLock<HashMap<Scope, VectorIndex<R>>>,
+    ///
+    /// `RwLock` is used here because searches are the dominant operation and
+    /// must not block each other. Writes (add/remove) are serialised with a
+    /// write lock to prevent concurrent upserts for the same name from
+    /// interleaving. `std::sync::RwLock` is sufficient — no async boundary
+    /// crosses these locks.
+    scopes: RwLock<ScopeRegistry<R>>,
     /// Combined index containing all vectors.
     all: VectorIndex<R>,
     /// Embedding dimensions (needed to create new scope indexes).
@@ -413,6 +489,24 @@ struct UsearchStoreInner<R: RawIndex> {
 // acquiring `scopes`. The `all` index is accessed directly (not through
 // `scopes`), but always while `scopes` is already held or after it has
 // been released — never in the reverse order.
+
+/// Acquire the scopes `RwLock` for reading, panicking on poison.
+macro_rules! scopes_read {
+    ($lock:expr) => {
+        $lock
+            .read()
+            .expect("scopes RwLock poisoned — prior panic corrupted state")
+    };
+}
+
+/// Acquire the scopes `RwLock` for writing, panicking on poison.
+macro_rules! scopes_write {
+    ($lock:expr) => {
+        $lock
+            .write()
+            .expect("scopes RwLock poisoned — prior panic corrupted state")
+    };
+}
 
 impl UsearchStore {
     /// Create a new `UsearchStore` with empty global + all indexes.
@@ -430,11 +524,9 @@ impl UsearchStore {
     ) -> Result<Self, MemoryError> {
         let global = VectorIndex::new(dimensions)?;
         let all = VectorIndex::new(dimensions)?;
-        let mut scopes = HashMap::new();
-        scopes.insert(Scope::Root, global);
         Ok(Self {
             inner: UsearchStoreInner {
-                scopes: RwLock::new(scopes),
+                scopes: RwLock::new(ScopeRegistry::new(global)),
                 all,
                 dimensions,
             },
@@ -478,8 +570,6 @@ impl UsearchStore {
             VectorIndex::new(dimensions)?
         };
 
-        let mut scopes: HashMap<Scope, VectorIndex<UsearchRawIndex>> = HashMap::new();
-
         // Load global/root index.
         let global_path = dir.join("global").join("index.usearch");
         let global = if global_path.exists() {
@@ -487,12 +577,12 @@ impl UsearchStore {
         } else {
             VectorIndex::new(dimensions)?
         };
-        scopes.insert(Scope::Root, global);
+        let mut registry = ScopeRegistry::new(global);
 
         // Scan for namespace indexes under projects/*/ (may be nested).
         let projects_dir = dir.join("projects");
         if projects_dir.is_dir() {
-            load_namespace_indexes(&projects_dir, &projects_dir, &mut scopes)?;
+            load_namespace_indexes(&projects_dir, &projects_dir, &mut registry)?;
         }
 
         let key_count = all.key_count();
@@ -500,7 +590,7 @@ impl UsearchStore {
 
         Ok(Self {
             inner: UsearchStoreInner {
-                scopes: RwLock::new(scopes),
+                scopes: RwLock::new(registry),
                 all,
                 dimensions,
             },
@@ -519,7 +609,7 @@ impl UsearchStore {
 fn load_namespace_indexes(
     dir: &Path,
     namespaces_root: &Path,
-    scopes: &mut HashMap<Scope, VectorIndex<UsearchRawIndex>>,
+    registry: &mut ScopeRegistry<UsearchRawIndex>,
 ) -> Result<(), MemoryError> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| MemoryError::Index(format!("read namespaces dir: {e}")))?;
@@ -546,11 +636,10 @@ fn load_namespace_indexes(
 
         let index_path = path.join("index.usearch");
         if index_path.exists() {
-            let idx = VectorIndex::load(&index_path)?;
-            scopes.insert(Scope::Path(scope), idx);
+            registry.insert(Scope::Path(scope), VectorIndex::load(&index_path)?);
         }
 
-        load_namespace_indexes(&path, namespaces_root, scopes)?;
+        load_namespace_indexes(&path, namespaces_root, registry)?;
     }
     Ok(())
 }
@@ -585,16 +674,9 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         // Write lock serialises the full find→insert→remove composite so
         // concurrent upserts for the same name cannot interleave. Reads
         // (via `search`) use a read lock and are not blocked by other reads.
-        let mut scopes = self.scopes.write().expect("scopes lock poisoned");
+        let mut scopes = scopes_write!(self.scopes);
 
-        // Ensure scope index exists (inline, since we already hold write lock).
-        if !scopes.contains_key(scope) {
-            scopes.insert(scope.clone(), Self::new_index(self.dimensions)?);
-        }
-
-        let scope_idx = scopes
-            .get(scope)
-            .expect("scope index must exist after insert");
+        let scope_idx = scopes.get_or_create(scope, self.dimensions)?;
 
         // Capture old keys before inserting new ones.
         let old_scope_key = scope_idx.find_key_by_name(&qualified_name);
@@ -635,7 +717,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         .entered();
 
         // Write lock serialises with concurrent adds for the same name.
-        let scopes = self.scopes.write().expect("scopes lock poisoned");
+        let scopes = scopes_write!(self.scopes);
 
         // Remove from scope index (best-effort).
         if let Some(scope_idx) = scopes.get(scope) {
@@ -699,7 +781,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
             ScopeFilter::All => self.all.search(query, limit),
 
             ScopeFilter::RootOnly => {
-                let scopes = self.scopes.read().expect("scopes lock poisoned");
+                let scopes = scopes_read!(self.scopes);
                 match scopes.get(&Scope::Root) {
                     Some(root_idx) => root_idx.search(query, limit),
                     None => Ok(Vec::new()),
@@ -707,22 +789,15 @@ impl<R: RawIndex> UsearchStoreInner<R> {
             }
 
             ScopeFilter::Subtree(_) => {
-                let scopes = self.scopes.read().expect("scopes lock poisoned");
-                let mut combined: Vec<(u64, String, f32)> = Vec::new();
-
-                // Include all scopes matched by the filter (Root + exact/child Paths).
-                // Uses exact segment matching — "eng" does NOT match "engineering".
-                for (scope, idx) in scopes.iter() {
-                    if filter.matches(scope) {
-                        let mut results = idx.search(query, limit)?;
-                        combined.append(&mut results);
-                    }
+                let scopes = scopes_read!(self.scopes);
+                let mut combined = Vec::new();
+                for (_, idx) in scopes.matching(filter) {
+                    combined.extend(idx.search(query, limit)?);
                 }
 
-                // Deduplicate by qualified name (HashSet ensures non-adjacent dupes are caught).
+                // Deduplicate by qualified name, sort by ascending distance, top-k.
                 let mut seen = std::collections::HashSet::new();
                 combined.retain(|(_, name, _)| seen.insert(name.clone()));
-                // Sort by ascending distance and take top-k.
                 combined.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
                 combined.truncate(limit);
                 Ok(combined)
@@ -749,29 +824,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         let marker = dir.join(".save-in-progress");
         std::fs::write(&marker, b"")?;
 
-        let result = (|| -> Result<(), MemoryError> {
-            // Acquire scopes read lock before accessing any indexes.
-            let scopes = self.scopes.read().expect("scopes lock poisoned");
-
-            // Persist all-index.
-            let all_dir = dir.join("all");
-            std::fs::create_dir_all(&all_dir)?;
-            self.all.save(&all_dir.join("index.usearch"))?;
-
-            // Persist per-scope indexes.
-            for (scope, idx) in scopes.iter() {
-                let scope_dir = dir.join(scope.dir_prefix().as_ref());
-                std::fs::create_dir_all(&scope_dir)?;
-                idx.save(&scope_dir.join("index.usearch"))?;
-            }
-
-            // Record total key count (all-index is authoritative — it holds every entry).
-            let key_count = self.all.key_count();
-            span.record("key_count", key_count);
-
-            // scopes lock dropped at end of closure scope.
-            Ok(())
-        })();
+        let result = self.save_inner(dir, &span);
 
         // Always remove the marker — a transient I/O failure should not
         // force a full reindex on next startup.
@@ -780,22 +833,39 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         result
     }
 
+    fn save_inner(&self, dir: &Path, span: &tracing::Span) -> Result<(), MemoryError> {
+        // Acquire scopes read lock before accessing any indexes.
+        let scopes = scopes_read!(self.scopes);
+
+        // Persist all-index.
+        let all_dir = dir.join("all");
+        std::fs::create_dir_all(&all_dir)?;
+        self.all.save(&all_dir.join("index.usearch"))?;
+
+        // Persist per-scope indexes.
+        for (scope, idx) in scopes.iter() {
+            let scope_dir = dir.join(scope.dir_prefix().as_ref());
+            std::fs::create_dir_all(&scope_dir)?;
+            idx.save(&scope_dir.join("index.usearch"))?;
+        }
+
+        // Record total key count (all-index is authoritative — it holds every entry).
+        span.record("key_count", self.all.key_count());
+
+        // scopes lock dropped at end of function.
+        Ok(())
+    }
+
     fn commit_sha(&self) -> Option<String> {
         self.all.commit_sha()
     }
 
     fn set_commit_sha(&self, sha: Option<&str>) {
-        let scopes = self.scopes.read().expect("scopes lock poisoned");
+        let scopes = scopes_read!(self.scopes);
         self.all.set_commit_sha(sha);
-        for idx in scopes.values() {
+        for (_, idx) in scopes.iter() {
             idx.set_commit_sha(sha);
         }
-    }
-}
-
-impl<R: RawIndex> UsearchStoreInner<R> {
-    fn new_index(dimensions: usize) -> Result<VectorIndex<R>, MemoryError> {
-        VectorIndex::new(dimensions)
     }
 }
 
@@ -948,14 +1018,14 @@ mod tests {
             if self.should_fail(FailOn::Add) {
                 return Err(Self::injected_error("add"));
             }
-            self.inner.add(key, vector).map_err(|e| e.into())
+            self.inner.add(key, vector).map_err(Into::into)
         }
 
         fn remove(&self, key: u64) -> Result<(), RawIndexError> {
             if self.should_fail(FailOn::Remove) {
                 return Err(Self::injected_error("remove"));
             }
-            self.inner.remove(key).map(|_| ()).map_err(|e| e.into())
+            self.inner.remove(key).map(|_| ()).map_err(Into::into)
         }
 
         fn search(&self, query: &[f32], count: usize) -> Result<RawSearchResults, RawIndexError> {
@@ -973,14 +1043,14 @@ mod tests {
             if self.should_fail(FailOn::Save) {
                 return Err(Self::injected_error("save"));
             }
-            self.inner.save(path).map_err(|e| e.into())
+            self.inner.save(path).map_err(Into::into)
         }
 
         fn reserve(&self, capacity: usize) -> Result<(), RawIndexError> {
             if self.should_fail(FailOn::Reserve) {
                 return Err(Self::injected_error("reserve"));
             }
-            self.inner.reserve(capacity).map_err(|e| e.into())
+            self.inner.reserve(capacity).map_err(Into::into)
         }
 
         fn size(&self) -> usize {
@@ -1023,11 +1093,9 @@ mod tests {
     ) -> FailableStore {
         let all = make_failing_index(dimensions, all_fail_on, all_fail_after);
         let scope = make_failing_index(dimensions, FailOn::None, 0);
-        let mut scopes = HashMap::new();
-        scopes.insert(Scope::Root, scope);
         FailableStore {
             inner: UsearchStoreInner {
-                scopes: RwLock::new(scopes),
+                scopes: RwLock::new(ScopeRegistry::new(scope)),
                 all,
                 dimensions,
             },

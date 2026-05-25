@@ -37,10 +37,9 @@ use crate::{
     recall_log::{RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
     types::{
-        parse_qualified_name, parse_scope, parse_scope_filter, AppState, ChangedMemories, EditArgs,
-        ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
-        PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, Scope,
-        ScopeFilter, SyncArgs,
+        parse_qualified_name, AppState, ChangedMemories, EditArgs, ForgetArgs, ListArgs,
+        MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, PullResult, ReadArgs,
+        RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
     },
 };
 
@@ -81,15 +80,41 @@ async fn incremental_reindex(
         match parse_qualified_name(name) {
             Ok(mref) => {
                 let canonical = mref.qualified_path();
-                if let Err(e) = index.remove(&mref.scope, &canonical) {
-                    warn!(
-                        qualified_name = %name,
-                        error = %e,
-                        "incremental_reindex: failed to remove vector; skipping"
-                    );
-                    stats.errors += 1;
-                } else {
-                    stats.removed += 1;
+                match index.remove(&mref.scope, &canonical) {
+                    Ok(()) => {
+                        stats.removed += 1;
+                    }
+                    Err(e) => {
+                        // For on-disk path keys with multi-segment hierarchical scopes,
+                        // parse_qualified_name splits at the first slash, producing the
+                        // wrong scope/name split. The canonical key computed here will
+                        // then not match the actual index entry, and the remove is a
+                        // no-op. This is acceptable: hierarchical scopes are new in this
+                        // release, so no existing index entries use the legacy on-disk
+                        // path form with multi-segment scopes. A full reindex resolves
+                        // any stale entries if they exist.
+                        let is_multi_segment_legacy = name.starts_with("projects/")
+                            && name
+                                .strip_prefix("projects/")
+                                .map(|rest| rest.matches('/').count() >= 2)
+                                .unwrap_or(false);
+                        if is_multi_segment_legacy {
+                            warn!(
+                                qualified_name = %name,
+                                canonical = %canonical,
+                                error = %e,
+                                "incremental_reindex: removal of multi-segment legacy path key \
+                                 failed (scope ambiguity); a full reindex may be needed"
+                            );
+                        } else {
+                            warn!(
+                                qualified_name = %name,
+                                error = %e,
+                                "incremental_reindex: failed to remove vector; skipping"
+                            );
+                            stats.errors += 1;
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -338,7 +363,7 @@ impl MemoryServer {
         );
         let state = Arc::clone(&self.state);
         async move {
-            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
             let metadata = MemoryMetadata::new(scope.clone(), args.tags, args.source);
             let memory = Memory::from_validated(name, args.content, metadata);
 
@@ -415,7 +440,7 @@ impl MemoryServer {
         async move {
             // Parse optional scope filter.
             let scope_filter =
-                parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
+                ScopeFilter::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let limit = args.limit.unwrap_or(5).min(100);
 
@@ -549,7 +574,7 @@ impl MemoryServer {
         );
         let state = Arc::clone(&self.state);
         async move {
-            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
 
@@ -627,7 +652,7 @@ impl MemoryServer {
         );
         let state = Arc::clone(&self.state);
         async move {
-            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
 
@@ -718,7 +743,7 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             let scope_filter =
-                parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
+                ScopeFilter::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
             let memories = match &scope_filter {
@@ -801,7 +826,7 @@ impl MemoryServer {
         );
         let state = Arc::clone(&self.state);
         async move {
-            let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
+            let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
             let memory = state
@@ -1152,18 +1177,23 @@ impl ServerHandler for MemoryServer {
             to search, `read` to fetch a specific memory, `edit` to update, `forget` to delete, \
             `list` to browse, and `sync` to push/pull the remote.\n\n\
             Scope convention: pass a bare namespace path like 'my-project' or 'org/team' when \
-            working within a namespace. This returns that scope's memories alongside global ones. \
+            working within a namespace. Paths may be hierarchical (e.g. 'org/team/project'). \
+            This returns that namespace's memories alongside global ones. \
             Omitting scope defaults to global-only for queries (recall, list) and targets a single \
             memory for point operations (remember, edit, read, forget). Use scope='all' to search \
-            across all scopes. The legacy 'project:<name>' form is also accepted for backward \
-            compatibility.\n\n\
+            across all scopes.\n\n\
             IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets in \
             memory content. Memories are stored as plaintext markdown files committed to a git \
             repository and may be synced to a remote. Treat all memory content as public.\n\n\
             Recall feedback: after acting on recalled memories, call `mark_applied` for each result \
             with your verdict ('applied', 'maybe', or 'not_applied'). Every recall response includes \
             a `recall_id` — pass it back with each verdict. This bidirectional feedback calibrates \
-            recall thresholds. Use `recall_stats` to inspect precision by distance bucket."
+            recall thresholds. Use `recall_stats` to inspect precision by distance bucket.\n\n\
+            Breaking change (v0.14.0): the 'project:<name>' scope format is no longer accepted \
+            as tool input. If your prompts or configuration pass scope values like \
+            'project:my-project', replace them with the bare path: 'my-project'. The 'global' \
+            scope is unchanged. Stored memories are unaffected — old scope formats in YAML \
+            frontmatter are read correctly without migration."
                 .to_string(),
         )
     }

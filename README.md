@@ -219,7 +219,7 @@ Tool: remember
   "name": "postgres/connection-pool-timeout",
   "content": "When the connection pool times out under load, the issue is usually...",
   "tags": ["postgres", "debugging", "performance"],
-  "scope": "project:my-api"
+  "scope": "my-api"
 }
 ```
 
@@ -229,7 +229,7 @@ Tool: remember
 Tool: recall
 {
   "query": "database connection issues under high load",
-  "scope": "project:my-api",
+  "scope": "my-api",
   "limit": 5
 }
 ```
@@ -262,7 +262,7 @@ id: 550e8400-e29b-41d4-a716-446655440000
 name: postgres/connection-pool-timeout
 tags: [postgres, debugging, performance]
 scope:
-  type: Project
+  type: Path
   name: my-api
 created_at: 2026-03-18T12:00:00Z
 updated_at: 2026-03-18T12:00:00Z
@@ -274,10 +274,12 @@ When the connection pool times out under load, the issue is usually...
 
 ### Scoping
 
-Memories are scoped to control visibility:
+Memories are organized into namespaces:
 
-- **`global`** — available to all projects (preferences, standards, general knowledge)
-- **`project:{name}`** — scoped to a specific project (architecture decisions, debugging context, team conventions)
+- **`global`** — root namespace, available everywhere (preferences, standards, general knowledge)
+- **`my-project`** or **`org/team/project`** — path-based namespaces with hierarchical subtree queries (architecture decisions, debugging context, team conventions)
+
+Namespaces organize recall — they are not a security boundary. The legacy `project:{name}` form is still accepted but deprecated; use bare paths instead.
 
 ## Configuration
 

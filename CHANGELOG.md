@@ -4,21 +4,29 @@
 
 - `Scope::Global` renamed to `Scope::Root`; `Scope::Project(String)` replaced with `Scope::Path(ScopePath)` — update all match arms and constructors
 - `ScopeFilter::GlobalOnly` renamed to `RootOnly`; `ProjectAndGlobal` replaced with `Subtree(ScopePath)` — update all match arms
+- The `"project:{name}"` scope format is no longer accepted in tool input — use bare namespace paths (e.g. `"my-project"` instead of `"project:my-project"`). Existing YAML frontmatter with `type: Project` is still deserialized for migration purposes; a future startup migration (#256) will rewrite these on disk.
 
 ### Added
 
 - `ScopePath` validated newtype wrapping a scope path string — construction via `ScopePath::new()` is the sole validation path
+- `ValidatedString` trait unifying `ScopePath` and `MemoryName` — shared construction, validation, and deserialization pattern
 - Hierarchical path-based namespaces: scope paths may contain `/` for org/team/project nesting (e.g. `"org/team/project"`)
 - `ScopeFilter::matches()` method — predicate to test whether a `Scope` passes a filter, usable outside the index layer
-- `scope_path_matches()` helper for segment-aware prefix matching (exact match or `"prefix/"` child, never bare-string prefix)
-- `validate_scope_path()` with traversal prevention (`..` components, absolute paths, null bytes, depth limit)
-- `Memory::mem_ref()` convenience method — returns `MemoryRef::new(scope.clone(), name.clone())` without the boilerplate
+- `ScopePath::from_dir()` — derive a validated scope path from a filesystem directory relative to the namespace root
+- `Memory::mem_ref()` convenience method — returns a `MemoryRef` without manual field extraction
 
 ### Changed
 
 - Canonical index key format changed to `v1:scope=...;name=...` — old `scope=...;name=...` form is still parsed for backward compatibility
 - Serde: new variant names (`Root`, `Path`) are serialized; legacy names (`Global`, `Project`) are accepted on deserialisation
 - `Scope::dir_prefix()` now returns `Cow<'static, str>` — `Root` avoids allocation, `Path` variants produce an owned string
+- `ScopeRegistry` type extracted in index layer — replaces raw `HashMap<Scope, VectorIndex>` with named type and methods
+- Lock macros replace scattered `.expect("lock poisoned")` calls in usearch index
+- Code and comments use "namespace" terminology; "project" retained only for on-disk backward compat
+
+### Migration guide
+
+Agents using `scope: "project:my-api"` in tool calls must switch to `scope: "my-api"`. The server instructions document the new format; agents that read them will adapt automatically. For agents with hardcoded scope strings in CLAUDE.md or similar config, update the strings manually.
 
 ## [0.13.3] - 2026-05-25
 
