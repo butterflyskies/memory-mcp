@@ -5,6 +5,12 @@ on:
   push:
     branches: [main]
   pull_request:
+    paths:
+      - '**.rs'
+      - '**.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile*'
+      - '.github/**'
 
 concurrency:
   group: ci-${{ github.ref }}
