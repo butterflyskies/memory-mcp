@@ -37,8 +37,8 @@ use crate::{
     repo::MemoryRepo,
     types::{
         parse_qualified_name, parse_scope, parse_scope_filter, AppState, ChangedMemories, EditArgs,
-        ForgetArgs, ListArgs, Memory, MemoryMetadata, MemoryName, PullResult, ReadArgs, RecallArgs,
-        ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
+        ForgetArgs, ListArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, PullResult, ReadArgs,
+        RecallArgs, ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
     },
 };
 
@@ -77,8 +77,8 @@ async fn incremental_reindex(
     // ---- 1. Removals --------------------------------------------------------
     for name in &changes.removed {
         match parse_qualified_name(name) {
-            Ok((scope, _)) => {
-                if let Err(e) = index.remove(&scope, name) {
+            Ok(mref) => {
+                if let Err(e) = index.remove(&mref.scope, name) {
                     warn!(
                         qualified_name = %name,
                         error = %e,
@@ -101,11 +101,11 @@ async fn incremental_reindex(
         // If not in index, remove is a no-op — not an error.
     }
 
-    // ---- 2. Resolve (scope, name) pairs for upserts -------------------------
-    let mut pairs: Vec<(Scope, MemoryName, String)> = Vec::new();
+    // ---- 2. Resolve MemoryRefs for upserts ----------------------------------
+    let mut refs: Vec<MemoryRef> = Vec::new();
     for qualified in &changes.upserted {
         match parse_qualified_name(qualified) {
-            Ok((scope, name)) => pairs.push((scope, name, qualified.clone())),
+            Ok(mref) => refs.push(mref),
             Err(e) => {
                 warn!(
                     qualified_name = %qualified,
@@ -118,10 +118,11 @@ async fn incremental_reindex(
     }
 
     // ---- 3. Read memories from disk -----------------------------------------
-    // (scope, qualified_name, content)
-    let mut to_embed: Vec<(Scope, String, String)> = Vec::new();
-    for (scope, name, qualified) in &pairs {
-        let memory = match repo.read_memory(name, scope).await {
+    // (MemoryRef, content)
+    let mut to_embed: Vec<(MemoryRef, String)> = Vec::new();
+    for mref in &refs {
+        let qualified = mref.qualified_path();
+        let memory = match repo.read_memory(&mref.name, &mref.scope).await {
             Ok(m) => m,
             Err(e) => {
                 warn!(
@@ -133,7 +134,7 @@ async fn incremental_reindex(
                 continue;
             }
         };
-        to_embed.push((scope.clone(), qualified.clone(), memory.content));
+        to_embed.push((mref.clone(), memory.content));
     }
 
     if to_embed.is_empty() {
@@ -141,7 +142,7 @@ async fn incremental_reindex(
     }
 
     // ---- 4. Batch embed all content -----------------------------------------
-    let contents: Vec<String> = to_embed.iter().map(|(_, _, c)| c.clone()).collect();
+    let contents: Vec<String> = to_embed.iter().map(|(_, c)| c.clone()).collect();
     let vectors = match embedding.embed(&contents).await {
         Ok(v) => v,
         Err(batch_err) => {
@@ -154,7 +155,7 @@ async fn incremental_reindex(
                     Err(e) => {
                         warn!(
                             error = %e,
-                            qualified_name = %to_embed[i].1,
+                            qualified_name = %to_embed[i].0.qualified_path(),
                             "incremental_reindex: per-item embed failed; skipping"
                         );
                         failed.push(i);
@@ -171,10 +172,11 @@ async fn incremental_reindex(
     };
 
     // ---- 5. Update index entries --------------------------------------------
-    for ((scope, qualified_name, _), vector) in to_embed.iter().zip(vectors.iter()) {
-        let is_update = index.find_by_name(qualified_name).is_some();
+    for ((mref, _), vector) in to_embed.iter().zip(vectors.iter()) {
+        let qualified_name = mref.qualified_path();
+        let is_update = index.find_by_name(&qualified_name).is_some();
 
-        match index.add(scope, vector, qualified_name.clone()) {
+        match index.add(&mref.scope, vector, qualified_name.clone()) {
             Ok(_) => {}
             Err(e) => {
                 warn!(
@@ -217,11 +219,11 @@ pub async fn full_reindex(
 
     let mut stats = ReindexStats::default();
 
-    let items: Vec<(Scope, String, String)> = memories
+    let items: Vec<(MemoryRef, String)> = memories
         .into_iter()
         .map(|m| {
-            let qualified = format!("{}/{}", m.metadata.scope.dir_prefix(), m.name);
-            (m.metadata.scope, qualified, m.content)
+            let mref = MemoryRef::new(m.metadata.scope, m.name);
+            (mref, m.content)
         })
         .collect();
 
@@ -230,7 +232,7 @@ pub async fn full_reindex(
     // within the per-call timeout budget.
     const REINDEX_BATCH_SIZE: usize = 64;
     for chunk in items.chunks(REINDEX_BATCH_SIZE) {
-        let contents: Vec<String> = chunk.iter().map(|(_, _, c)| c.clone()).collect();
+        let contents: Vec<String> = chunk.iter().map(|(_, c)| c.clone()).collect();
 
         let vectors = match embedding.embed(&contents).await {
             Ok(v) => v,
@@ -243,7 +245,7 @@ pub async fn full_reindex(
                         Err(e) => {
                             warn!(
                                 error = %e,
-                                qualified_name = %chunk[i].1,
+                                qualified_name = %chunk[i].0.qualified_path(),
                                 "full_reindex: per-item embed failed; skipping"
                             );
                             stats.errors += 1;
@@ -261,11 +263,12 @@ pub async fn full_reindex(
             "embed() must return exactly one vector per input"
         );
 
-        for ((scope, qualified_name, _), vector) in chunk.iter().zip(vectors.iter()) {
+        for ((mref, _), vector) in chunk.iter().zip(vectors.iter()) {
             if vector.is_empty() {
                 continue;
             }
-            match index.add(scope, vector, qualified_name.clone()) {
+            let qualified_name = mref.qualified_path();
+            match index.add(&mref.scope, vector, qualified_name.clone()) {
                 Ok(_) => stats.added += 1,
                 Err(e) => {
                     warn!(
@@ -440,8 +443,8 @@ impl MemoryServer {
                 if results_vec.len() >= limit {
                     break;
                 }
-                let (scope, name) = match parse_qualified_name(&qualified_name) {
-                    Ok(pair) => pair,
+                let mref = match parse_qualified_name(&qualified_name) {
+                    Ok(r) => r,
                     Err(e) => {
                         warn!(
                             qualified_name = %qualified_name,
@@ -454,11 +457,11 @@ impl MemoryServer {
                 };
 
                 // Read the memory; if it was deleted but still in the index, skip it.
-                let memory = match state.repo.read_memory(&name, &scope).await {
+                let memory = match state.repo.read_memory(&mref.name, &mref.scope).await {
                     Ok(m) => m,
                     Err(e) => {
                         warn!(
-                            name = %name,
+                            name = %mref.name,
                             error = %e,
                             "could not read memory from repo (deleted?); skipping"
                         );

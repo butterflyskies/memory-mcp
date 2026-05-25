@@ -439,6 +439,37 @@ pub fn parse_scope_filter(scope: Option<&str>) -> Result<ScopeFilter, MemoryErro
 }
 
 // ---------------------------------------------------------------------------
+// MemoryRef — a scope+name pair
+// ---------------------------------------------------------------------------
+
+/// A reference to a specific memory: scope + validated name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemoryRef {
+    /// Where this memory lives (global or project-scoped).
+    pub scope: Scope,
+    /// Validated memory name.
+    pub name: MemoryName,
+}
+
+impl MemoryRef {
+    /// Create a reference from a scope and a validated name.
+    pub fn new(scope: Scope, name: MemoryName) -> Self {
+        Self { scope, name }
+    }
+
+    /// The on-disk qualified path: `"global/<name>"` or `"projects/<project>/<name>"`.
+    pub fn qualified_path(&self) -> String {
+        format!("{}/{}", self.scope.dir_prefix(), self.name)
+    }
+}
+
+impl fmt::Display for MemoryRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.scope, self.name)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
@@ -451,11 +482,11 @@ pub fn parse_scope(scope: Option<&str>) -> Result<Scope, MemoryError> {
 }
 
 /// Parse a qualified name of the form `"global/<name>"` or
-/// `"projects/<project>/<name>"` back into a `(Scope, MemoryName)` pair.
-pub fn parse_qualified_name(qualified: &str) -> Result<(Scope, MemoryName), MemoryError> {
+/// `"projects/<project>/<name>"` back into a [`MemoryRef`].
+pub fn parse_qualified_name(qualified: &str) -> Result<MemoryRef, MemoryError> {
     if let Some(rest) = qualified.strip_prefix("global/") {
         let name = MemoryName::new(rest)?;
-        return Ok((Scope::Global, name));
+        return Ok(MemoryRef::new(Scope::Global, name));
     }
     if let Some(rest) = qualified.strip_prefix("projects/") {
         // rest = "<project>/<memory_name>" (possibly nested)
@@ -472,7 +503,7 @@ pub fn parse_qualified_name(qualified: &str) -> Result<(Scope, MemoryName), Memo
             }
             validate_name(project)?;
             let name = MemoryName::new(name_str)?;
-            return Ok((Scope::Project(project.to_string()), name));
+            return Ok(MemoryRef::new(Scope::Project(project.to_string()), name));
         }
         return Err(MemoryError::InvalidInput {
             reason: format!(
@@ -925,23 +956,58 @@ mod tests {
 
     #[test]
     fn test_parse_qualified_name_global() {
-        let (scope, name) = parse_qualified_name("global/my-memory").unwrap();
-        assert_eq!(scope, Scope::Global);
-        assert_eq!(name.as_str(), "my-memory");
+        let r = parse_qualified_name("global/my-memory").unwrap();
+        assert_eq!(r.scope, Scope::Global);
+        assert_eq!(r.name.as_str(), "my-memory");
+        assert_eq!(r.qualified_path(), "global/my-memory");
     }
 
     #[test]
     fn test_parse_qualified_name_project() {
-        let (scope, name) = parse_qualified_name("projects/my-project/my-memory").unwrap();
-        assert_eq!(scope, Scope::Project("my-project".to_string()));
-        assert_eq!(name.as_str(), "my-memory");
+        let r = parse_qualified_name("projects/my-project/my-memory").unwrap();
+        assert_eq!(r.scope, Scope::Project("my-project".to_string()));
+        assert_eq!(r.name.as_str(), "my-memory");
+        assert_eq!(r.qualified_path(), "projects/my-project/my-memory");
     }
 
     #[test]
     fn test_parse_qualified_name_nested() {
-        let (scope, name) = parse_qualified_name("projects/my-project/nested/memory").unwrap();
-        assert_eq!(scope, Scope::Project("my-project".to_string()));
-        assert_eq!(name.as_str(), "nested/memory");
+        let r = parse_qualified_name("projects/my-project/nested/memory").unwrap();
+        assert_eq!(r.scope, Scope::Project("my-project".to_string()));
+        assert_eq!(r.name.as_str(), "nested/memory");
+        assert_eq!(r.qualified_path(), "projects/my-project/nested/memory");
+    }
+
+    // MemoryRef tests
+
+    #[test]
+    fn memory_ref_qualified_path_global() {
+        let r = MemoryRef::new(Scope::Global, MemoryName::new("my-mem").unwrap());
+        assert_eq!(r.qualified_path(), "global/my-mem");
+    }
+
+    #[test]
+    fn memory_ref_qualified_path_project() {
+        let r = MemoryRef::new(
+            Scope::Project("proj".to_string()),
+            MemoryName::new("my-mem").unwrap(),
+        );
+        assert_eq!(r.qualified_path(), "projects/proj/my-mem");
+    }
+
+    #[test]
+    fn memory_ref_display() {
+        let r = MemoryRef::new(
+            Scope::Project("proj".to_string()),
+            MemoryName::new("my-mem").unwrap(),
+        );
+        assert_eq!(format!("{r}"), "project:proj:my-mem");
+    }
+
+    #[test]
+    fn memory_ref_display_global() {
+        let r = MemoryRef::new(Scope::Global, MemoryName::new("foo").unwrap());
+        assert_eq!(format!("{r}"), "global:foo");
     }
 
     // validate_branch_name tests
