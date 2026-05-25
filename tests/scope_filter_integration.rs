@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use memory_mcp::repo::MemoryRepo;
-use memory_mcp::types::{Memory, MemoryMetadata, MemoryName, Scope};
+use memory_mcp::types::{Memory, MemoryMetadata, Scope};
 
 /// Helper: initialise a fresh in-memory repo in a temp directory.
 async fn make_repo() -> (Arc<MemoryRepo>, tempfile::TempDir) {
