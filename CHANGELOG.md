@@ -1,3 +1,25 @@
+## [0.13.1] - 2026-05-25
+
+### Added
+- `mark_applied` MCP tool — agents report whether recalled memories were useful with a verdict tristate (`applied`, `maybe`, `not_applied`) (#213)
+- `recall_stats` MCP tool — returns precision statistics bucketed by distance range, accessible over the wire for agent-driven threshold calibration
+- `recall-stats` CLI subcommand for local inspection of recall precision data
+- Read-recall correlation: `read` handler auto-marks `was_read=1` on recall events for the same session
+- `Verdict` enum (`Applied`, `Maybe`, `NotApplied`) replacing boolean `applied` field
+- `--recall-log-busy-timeout` CLI flag / `MEMORY_MCP_RECALL_LOG_BUSY_TIMEOUT` env var (default 5s)
+
+### Changed
+- `RecallLog` uses connection-per-call pattern — no in-process Mutex, SQLite WAL handles concurrency
+- All SQLite calls wrapped in `traced_spawn_blocking` to avoid blocking the async runtime
+- `mark_applied` scoped by `session_id` (prevents cross-session tampering)
+- `mark_applied` enforces first-call-wins via `WHERE was_applied IS NULL`
+- `recall_stats` SQL uses `GROUP BY` aggregation instead of full table scan
+- `RecallResult.distance` widened from `f32` to `f64` to prevent bucket boundary imprecision
+- `AppState.recall_log` changed from `Option<RecallLog>` to `Option<Arc<RecallLog>>`
+
+### Fixed
+- SQL bucketing precision: `CAST(distance * 20 AS INTEGER)` instead of `ROUND(distance / 0.05)` which misplaced f32 boundary values
+
 ## [0.13.0] - 2026-05-25
 
 ### Added

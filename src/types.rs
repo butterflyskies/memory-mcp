@@ -617,6 +617,56 @@ pub struct ReadArgs {
     pub scope: Option<String>,
 }
 
+/// Agent's assessment of whether a recalled memory was useful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Memory materially influenced the session.
+    Applied,
+    /// Memory was partially relevant or influence was uncertain.
+    Maybe,
+    /// Memory was not relevant to the session.
+    NotApplied,
+}
+
+impl Verdict {
+    /// String representation for SQLite storage.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Verdict::Applied => "applied",
+            Verdict::Maybe => "maybe",
+            Verdict::NotApplied => "not_applied",
+        }
+    }
+}
+
+impl fmt::Display for Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Arguments for the `mark_applied` tool — report memory usage back to the recall log.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MarkAppliedArgs {
+    /// The recall_id from the recall response that returned this memory.
+    pub recall_id: String,
+    /// Name of the memory that was (or was not) applied.
+    pub memory: String,
+    /// Agent's assessment of whether the memory was useful: 'applied', 'maybe', or 'not_applied'.
+    pub verdict: Verdict,
+    /// Brief description of how the memory influenced the session.
+    #[serde(default)]
+    pub application: Option<String>,
+    /// Confidence level: "high", "medium", or "low".
+    #[serde(default = "default_confidence")]
+    pub confidence: String,
+}
+
+fn default_confidence() -> String {
+    "medium".to_string()
+}
+
 /// Arguments for the `sync` tool — push/pull the git remote.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SyncArgs {
@@ -627,6 +677,10 @@ pub struct SyncArgs {
 
 // ---------------------------------------------------------------------------
 // PullResult
+/// Arguments for the `recall_stats` tool — no parameters required.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecallStatsArgs {}
+
 // ---------------------------------------------------------------------------
 
 /// The outcome of a `pull()` operation.
@@ -722,7 +776,7 @@ pub struct AppState {
     /// Passive health registry — subsystems report here, `/readyz` reads here.
     pub health: HealthRegistry,
     /// Optional append-only recall event log for threshold calibration.
-    pub recall_log: Option<crate::recall_log::RecallLog>,
+    pub recall_log: Option<Arc<crate::recall_log::RecallLog>>,
 }
 
 impl AppState {
@@ -734,7 +788,7 @@ impl AppState {
         index: Box<dyn VectorStore>,
         auth: AuthProvider,
         health: HealthRegistry,
-        recall_log: Option<crate::recall_log::RecallLog>,
+        recall_log: Option<Arc<crate::recall_log::RecallLog>>,
     ) -> Self {
         Self {
             repo,
