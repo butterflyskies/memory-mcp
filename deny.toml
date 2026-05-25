@@ -10,9 +10,7 @@ all-features = true
 [advisories]
 ignore = [
     # Transitive deps we can't control — unmaintained, not vulnerable.
-    { id = "RUSTSEC-2025-0119", reason = "number_prefix: transitive via indicatif → hf-hub" },
     { id = "RUSTSEC-2024-0436", reason = "paste: transitive via thiserror/serde derive macros" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: transitive via rustls-native-certs 0.7 → ureq 2 (native-certs feature)" },
 ]
 
 # --- Licenses -------------------------------------------------------------
@@ -31,8 +29,9 @@ allow = [
 ]
 confidence-threshold = 0.8
 exceptions = [
-    # Mozilla root certificate data — permissive data license.
+    # Mozilla root certificate data — both crates carry the same permissive data license.
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
 ]
 
 # --- Bans ------------------------------------------------------------------
