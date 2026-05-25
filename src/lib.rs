@@ -26,3 +26,4 @@ pub mod repo;
 pub mod server;
 /// Domain types: memories, scopes, metadata, validation, and application state.
 pub mod types;
+// ci: trigger build after path-filter removal
