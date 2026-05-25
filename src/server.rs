@@ -1150,15 +1150,18 @@ impl ServerHandler for MemoryServer {
             "A semantic memory system for AI coding agents. Memories are stored as markdown files \
             in a git repository and indexed for semantic retrieval. Use `remember` to store, `recall` \
             to search, `read` to fetch a specific memory, `edit` to update, `forget` to delete, \
-            `list` to browse, `sync` to push/pull the remote, and `recall_stats` to inspect recall \
-            precision statistics bucketed by distance for threshold calibration.\n\n\
+            `list` to browse, and `sync` to push/pull the remote.\n\n\
             Scope convention: always pass scope='project:<basename-of-your-cwd>' when working within \
             a project. This returns project memories alongside global ones. Omitting scope defaults to \
             global-only for queries (recall, list) and targets a single memory for point operations \
             (remember, edit, read, forget). Use scope='all' to search across all projects.\n\n\
             IMPORTANT: Never store credentials, API keys, tokens, passwords, or other secrets in \
             memory content. Memories are stored as plaintext markdown files committed to a git \
-            repository and may be synced to a remote. Treat all memory content as public."
+            repository and may be synced to a remote. Treat all memory content as public.\n\n\
+            Recall feedback: after acting on recalled memories, call `mark_applied` for each result \
+            with your verdict ('applied', 'maybe', or 'not_applied'). Every recall response includes \
+            a `recall_id` — pass it back with each verdict. This bidirectional feedback calibrates \
+            recall thresholds. Use `recall_stats` to inspect precision by distance bucket."
                 .to_string(),
         )
     }

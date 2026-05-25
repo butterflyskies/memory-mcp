@@ -1,3 +1,8 @@
+## [0.13.3] - 2026-05-25
+
+### Changed
+- Server instructions now guide agents to call `mark_applied` after acting on recalled memories, closing the feedback loop for threshold calibration
+
 ## [0.13.2] - 2026-05-25
 
 ### Fixed
