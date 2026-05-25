@@ -7,7 +7,11 @@
 use std::sync::Arc;
 
 use memory_mcp::repo::MemoryRepo;
-use memory_mcp::types::{Memory, MemoryMetadata, Scope};
+use memory_mcp::types::{Memory, MemoryMetadata, Scope, ScopePath};
+
+fn path(s: &str) -> Scope {
+    Scope::Path(ScopePath::new(s).unwrap())
+}
 
 /// Helper: initialise a fresh in-memory repo in a temp directory.
 async fn make_repo() -> (Arc<MemoryRepo>, tempfile::TempDir) {
@@ -34,17 +38,17 @@ async fn save(repo: &Arc<MemoryRepo>, name: &str, scope: Scope) {
 async fn list_scope_filter_global_only() {
     let (repo, _tmp) = make_repo().await;
 
-    save(&repo, "global-mem", Scope::Global).await;
-    save(&repo, "proj-mem", Scope::Project("test-proj".to_string())).await;
+    save(&repo, "global-mem", Scope::Root).await;
+    save(&repo, "proj-mem", path("test-proj")).await;
 
     let memories = repo
-        .list_memories(Some(&Scope::Global))
+        .list_memories(Some(&Scope::Root))
         .await
         .expect("list should succeed");
 
     assert_eq!(memories.len(), 1, "expected only the global memory");
     assert_eq!(memories[0].name.as_str(), "global-mem");
-    assert_eq!(memories[0].metadata.scope, Scope::Global);
+    assert_eq!(memories[0].metadata.scope, Scope::Root);
 }
 
 // ---------------------------------------------------------------------------
@@ -55,26 +59,18 @@ async fn list_scope_filter_global_only() {
 async fn list_scope_filter_project_specific() {
     let (repo, _tmp) = make_repo().await;
 
-    save(&repo, "global-mem", Scope::Global).await;
-    save(&repo, "proj-mem", Scope::Project("test-proj".to_string())).await;
-    save(
-        &repo,
-        "other-proj-mem",
-        Scope::Project("other-proj".to_string()),
-    )
-    .await;
+    save(&repo, "global-mem", Scope::Root).await;
+    save(&repo, "proj-mem", path("test-proj")).await;
+    save(&repo, "other-proj-mem", path("other-proj")).await;
 
     let memories = repo
-        .list_memories(Some(&Scope::Project("test-proj".to_string())))
+        .list_memories(Some(&path("test-proj")))
         .await
         .expect("list should succeed");
 
     assert_eq!(memories.len(), 1, "expected only the test-proj memory");
     assert_eq!(memories[0].name.as_str(), "proj-mem");
-    assert_eq!(
-        memories[0].metadata.scope,
-        Scope::Project("test-proj".to_string())
-    );
+    assert_eq!(memories[0].metadata.scope, path("test-proj"));
 }
 
 // ---------------------------------------------------------------------------
@@ -85,8 +81,8 @@ async fn list_scope_filter_project_specific() {
 async fn list_scope_filter_all() {
     let (repo, _tmp) = make_repo().await;
 
-    save(&repo, "global-mem", Scope::Global).await;
-    save(&repo, "proj-mem", Scope::Project("test-proj".to_string())).await;
+    save(&repo, "global-mem", Scope::Root).await;
+    save(&repo, "proj-mem", path("test-proj")).await;
 
     let memories = repo.list_memories(None).await.expect("list should succeed");
 
@@ -104,21 +100,16 @@ async fn list_scope_filter_all() {
 async fn list_scope_filter_project_and_global() {
     let (repo, _tmp) = make_repo().await;
 
-    save(&repo, "global-mem", Scope::Global).await;
-    save(&repo, "proj-mem", Scope::Project("test-proj".to_string())).await;
-    save(
-        &repo,
-        "other-proj-mem",
-        Scope::Project("other-proj".to_string()),
-    )
-    .await;
+    save(&repo, "global-mem", Scope::Root).await;
+    save(&repo, "proj-mem", path("test-proj")).await;
+    save(&repo, "other-proj-mem", path("other-proj")).await;
 
     // Mirror the production code path in server.rs: two targeted calls merged.
-    let project_scope = Scope::Project("test-proj".to_string());
+    let project_scope = path("test-proj");
     let mut memories = repo
-        .list_memories(Some(&Scope::Global))
+        .list_memories(Some(&Scope::Root))
         .await
-        .expect("global list should succeed");
+        .expect("root list should succeed");
     memories.extend(
         repo.list_memories(Some(&project_scope))
             .await

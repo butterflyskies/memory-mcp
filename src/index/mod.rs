@@ -97,6 +97,7 @@ pub trait VectorStore: Send + Sync + sealed::Sealed {
 mod tests {
     use super::*;
     use crate::index::{InMemoryStore, UsearchStore};
+    use crate::types::ScopePath;
 
     fn vec_a() -> Vec<f32> {
         vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -108,7 +109,7 @@ mod tests {
 
     /// Run all trait-level contract tests against a given `VectorStore`.
     fn check_contract(store: &dyn VectorStore) {
-        let scope = Scope::Global;
+        let scope = Scope::Root;
         let name = "global/contract-test".to_string();
 
         // TC-02a: add + find_by_name returns Some
@@ -122,7 +123,7 @@ mod tests {
 
         // TC-02a: search returns the added entry
         let results = store
-            .search(&ScopeFilter::GlobalOnly, &vec_a(), 5)
+            .search(&ScopeFilter::RootOnly, &vec_a(), 5)
             .expect("search should succeed");
         assert!(
             results.iter().any(|(_, n, _)| n == &name),
@@ -149,21 +150,17 @@ mod tests {
             "TC-02b: find_by_name should return None after remove"
         );
         let results_after = store
-            .search(&ScopeFilter::GlobalOnly, &vec_a(), 5)
+            .search(&ScopeFilter::RootOnly, &vec_a(), 5)
             .expect("search after remove should succeed");
         assert!(
             !results_after.iter().any(|(_, n, _)| n == &name),
             "TC-02b: search should not return removed entry"
         );
 
-        // TC-02d: search with ProjectAndGlobal returns correct entries.
-        let proj_scope = Scope::Project("testproj".to_string());
+        // TC-02d: search with Subtree returns correct entries.
+        let proj_scope = Scope::Path(ScopePath::new("testproj").unwrap());
         store
-            .add(
-                &Scope::Global,
-                &vec_a(),
-                "global/contract-global".to_string(),
-            )
+            .add(&Scope::Root, &vec_a(), "global/contract-global".to_string())
             .expect("re-add global entry for TC-02d");
         store
             .add(
@@ -171,29 +168,29 @@ mod tests {
                 &vec_b(),
                 "projects/testproj/contract-proj".to_string(),
             )
-            .expect("add project entry should succeed");
+            .expect("add namespace entry should succeed");
         let pag_results = store
             .search(
-                &ScopeFilter::ProjectAndGlobal("testproj".to_string()),
+                &ScopeFilter::Subtree(ScopePath::new("testproj").unwrap()),
                 &vec_a(),
                 10,
             )
-            .expect("ProjectAndGlobal search should succeed");
+            .expect("Subtree search should succeed");
         let pag_names: Vec<&str> = pag_results.iter().map(|(_, n, _)| n.as_str()).collect();
         assert!(
             pag_names.contains(&"projects/testproj/contract-proj"),
-            "TC-02d: ProjectAndGlobal should include project entries"
+            "TC-02d: Subtree should include namespace entries"
         );
         assert!(
             pag_names.contains(&"global/contract-global"),
-            "TC-02d: ProjectAndGlobal should include global entries"
+            "TC-02d: Subtree should include global entries"
         );
         // Clean up
         store
             .remove(&proj_scope, "projects/testproj/contract-proj")
-            .expect("remove project entry");
+            .expect("remove namespace entry");
         store
-            .remove(&Scope::Global, "global/contract-global")
+            .remove(&Scope::Root, "global/contract-global")
             .expect("remove global entry");
 
         // TC-06: is_ready() returns true for a freshly created store.

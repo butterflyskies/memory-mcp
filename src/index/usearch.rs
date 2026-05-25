@@ -13,7 +13,7 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 use crate::{
     error::MemoryError,
     health::SubsystemReporter,
-    types::{validate_name, Scope, ScopeFilter},
+    types::{Scope, ScopeFilter, ScopePath},
 };
 
 // ---------------------------------------------------------------------------
@@ -387,7 +387,7 @@ impl<R: RawIndex> VectorIndex<R> {
 // ---------------------------------------------------------------------------
 
 /// Manages multiple `VectorIndex` instances — one per scope (global, each
-/// project) plus a combined "all" index. Every memory exists in exactly two
+/// namespace) plus a combined "all" index. Every memory exists in exactly two
 /// indexes: its scope-specific index + the "all" index.
 ///
 /// `UsearchStore` is `Send + Sync` because all inner state is protected by
@@ -400,7 +400,7 @@ pub struct UsearchStore {
 
 /// Generic inner implementation, separated so tests can substitute `R`.
 struct UsearchStoreInner<R: RawIndex> {
-    /// Per-scope indexes (global + each project).
+    /// Per-scope indexes (global + each namespace).
     scopes: RwLock<HashMap<Scope, VectorIndex<R>>>,
     /// Combined index containing all vectors.
     all: VectorIndex<R>,
@@ -431,7 +431,7 @@ impl UsearchStore {
         let global = VectorIndex::new(dimensions)?;
         let all = VectorIndex::new(dimensions)?;
         let mut scopes = HashMap::new();
-        scopes.insert(Scope::Global, global);
+        scopes.insert(Scope::Root, global);
         Ok(Self {
             inner: UsearchStoreInner {
                 scopes: RwLock::new(scopes),
@@ -480,47 +480,19 @@ impl UsearchStore {
 
         let mut scopes: HashMap<Scope, VectorIndex<UsearchRawIndex>> = HashMap::new();
 
-        // Load global index.
+        // Load global/root index.
         let global_path = dir.join("global").join("index.usearch");
         let global = if global_path.exists() {
             VectorIndex::load(&global_path)?
         } else {
             VectorIndex::new(dimensions)?
         };
-        scopes.insert(Scope::Global, global);
+        scopes.insert(Scope::Root, global);
 
-        // Scan for project indexes under projects/*/
+        // Scan for namespace indexes under projects/*/ (may be nested).
         let projects_dir = dir.join("projects");
         if projects_dir.is_dir() {
-            let entries = std::fs::read_dir(&projects_dir)
-                .map_err(|e| MemoryError::Index(format!("read projects dir: {}", e)))?;
-            for entry in entries {
-                let entry =
-                    entry.map_err(|e| MemoryError::Index(format!("read dir entry: {}", e)))?;
-                let path = entry.path();
-                if path.is_dir() {
-                    let project_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string())
-                        .ok_or_else(|| {
-                            MemoryError::Index("non-UTF-8 project directory name".to_string())
-                        })?;
-                    if let Err(e) = validate_name(&project_name) {
-                        tracing::warn!(
-                            project_name = %project_name,
-                            error = %e,
-                            "skipping project index with invalid name"
-                        );
-                        continue;
-                    }
-                    let index_path = path.join("index.usearch");
-                    if index_path.exists() {
-                        let idx = VectorIndex::load(&index_path)?;
-                        scopes.insert(Scope::Project(project_name), idx);
-                    }
-                }
-            }
+            load_namespace_indexes(&projects_dir, &projects_dir, &mut scopes)?;
         }
 
         let key_count = all.key_count();
@@ -535,6 +507,52 @@ impl UsearchStore {
             reporter,
         })
     }
+}
+
+/// Recursively load namespace scope indexes from `dir`, building scope paths
+/// relative to `namespaces_root`.
+///
+/// A directory that contains an `index.usearch` file is loaded as a scope index.
+/// Subdirectories are recursed to support hierarchical paths like `org/team`.
+/// If a directory resolves to an invalid scope path, it is skipped entirely —
+/// its children are not visited, since they would inherit the invalid prefix.
+fn load_namespace_indexes(
+    dir: &Path,
+    namespaces_root: &Path,
+    scopes: &mut HashMap<Scope, VectorIndex<UsearchRawIndex>>,
+) -> Result<(), MemoryError> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| MemoryError::Index(format!("read namespaces dir: {e}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| MemoryError::Index(format!("read dir entry: {e}")))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let scope = match ScopePath::from_dir(&path, namespaces_root) {
+            Ok(sp) => sp,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping namespace index with invalid scope path"
+                );
+                // Don't recurse: children inherit this invalid prefix and will
+                // also fail, so pruning here avoids pointless work.
+                continue;
+            }
+        };
+
+        let index_path = path.join("index.usearch");
+        if index_path.exists() {
+            let idx = VectorIndex::load(&index_path)?;
+            scopes.insert(Scope::Path(scope), idx);
+        }
+
+        load_namespace_indexes(&path, namespaces_root, scopes)?;
+    }
+    Ok(())
 }
 
 // Shared logic for both production and test-generic paths.
@@ -654,9 +672,9 @@ impl<R: RawIndex> UsearchStoreInner<R> {
     ) -> Result<Vec<(u64, String, f32)>, MemoryError> {
         let dimensions = query.len();
         let scope_str: Cow<'_, str> = match filter {
-            ScopeFilter::GlobalOnly => "global".into(),
+            ScopeFilter::RootOnly => "global".into(),
             ScopeFilter::All => "all".into(),
-            ScopeFilter::ProjectAndGlobal(p) => format!("project+global:{p}").into(),
+            ScopeFilter::Subtree(p) => format!("subtree:{p}").into(),
         };
         let span = tracing::debug_span!(
             "index.search",
@@ -680,28 +698,25 @@ impl<R: RawIndex> UsearchStoreInner<R> {
         let results = match filter {
             ScopeFilter::All => self.all.search(query, limit),
 
-            ScopeFilter::GlobalOnly => {
+            ScopeFilter::RootOnly => {
                 let scopes = self.scopes.read().expect("scopes lock poisoned");
-                match scopes.get(&Scope::Global) {
-                    Some(global_idx) => global_idx.search(query, limit),
+                match scopes.get(&Scope::Root) {
+                    Some(root_idx) => root_idx.search(query, limit),
                     None => Ok(Vec::new()),
                 }
             }
 
-            ScopeFilter::ProjectAndGlobal(project_name) => {
+            ScopeFilter::Subtree(_) => {
                 let scopes = self.scopes.read().expect("scopes lock poisoned");
-                let project_scope = Scope::Project(project_name.clone());
-
                 let mut combined: Vec<(u64, String, f32)> = Vec::new();
 
-                if let Some(global_idx) = scopes.get(&Scope::Global) {
-                    let mut global_results = global_idx.search(query, limit)?;
-                    combined.append(&mut global_results);
-                }
-
-                if let Some(proj_idx) = scopes.get(&project_scope) {
-                    let mut proj_results = proj_idx.search(query, limit)?;
-                    combined.append(&mut proj_results);
+                // Include all scopes matched by the filter (Root + exact/child Paths).
+                // Uses exact segment matching — "eng" does NOT match "engineering".
+                for (scope, idx) in scopes.iter() {
+                    if filter.matches(scope) {
+                        let mut results = idx.search(query, limit)?;
+                        combined.append(&mut results);
+                    }
                 }
 
                 // Deduplicate by qualified name (HashSet ensures non-adjacent dupes are caught).
@@ -745,7 +760,7 @@ impl<R: RawIndex> UsearchStoreInner<R> {
 
             // Persist per-scope indexes.
             for (scope, idx) in scopes.iter() {
-                let scope_dir = dir.join(scope.dir_prefix());
+                let scope_dir = dir.join(scope.dir_prefix().as_ref());
                 std::fs::create_dir_all(&scope_dir)?;
                 idx.save(&scope_dir.join("index.usearch"))?;
             }
@@ -1009,7 +1024,7 @@ mod tests {
         let all = make_failing_index(dimensions, all_fail_on, all_fail_after);
         let scope = make_failing_index(dimensions, FailOn::None, 0);
         let mut scopes = HashMap::new();
-        scopes.insert(Scope::Global, scope);
+        scopes.insert(Scope::Root, scope);
         FailableStore {
             inner: UsearchStoreInner {
                 scopes: RwLock::new(scopes),
@@ -1097,7 +1112,7 @@ mod tests {
     #[test]
     fn usearch_store_add_inserts_into_scope_and_all() {
         let si: &dyn VectorStore = &make_store();
-        let scope = Scope::Global;
+        let scope = Scope::Root;
         let name = "global/memory-a".to_string();
 
         si.add(&scope, &vec_a(), name.clone()).expect("add failed");
@@ -1105,7 +1120,7 @@ mod tests {
         assert!(si.find_by_name(&name).is_some(), "should be in all-index");
 
         let results = si
-            .search(&ScopeFilter::GlobalOnly, &vec_a(), 5)
+            .search(&ScopeFilter::RootOnly, &vec_a(), 5)
             .expect("search failed");
         assert!(
             results.iter().any(|(_, n, _)| n == &name),
@@ -1116,7 +1131,7 @@ mod tests {
     #[test]
     fn usearch_store_remove_removes_from_both() {
         let si: &dyn VectorStore = &make_store();
-        let scope = Scope::Global;
+        let scope = Scope::Root;
         let name = "global/memory-rm".to_string();
 
         si.add(&scope, &vec_a(), name.clone()).expect("add failed");
@@ -1130,7 +1145,7 @@ mod tests {
         );
 
         let results = si
-            .search(&ScopeFilter::GlobalOnly, &vec_a(), 5)
+            .search(&ScopeFilter::RootOnly, &vec_a(), 5)
             .expect("search failed");
         assert!(
             !results.iter().any(|(_, n, _)| n == &name),
@@ -1139,17 +1154,17 @@ mod tests {
     }
 
     #[test]
-    fn usearch_store_search_global_only() {
+    fn usearch_store_search_root_only() {
         let si: &dyn VectorStore = &make_store();
-        let proj = Scope::Project("myproj".to_string());
+        let proj = Scope::Path(ScopePath::new("myproj").unwrap());
 
-        si.add(&Scope::Global, &vec_a(), "global/mem-global".to_string())
+        si.add(&Scope::Root, &vec_a(), "global/mem-global".to_string())
             .expect("add global failed");
         si.add(&proj, &vec_b(), "projects/myproj/mem-proj".to_string())
-            .expect("add project failed");
+            .expect("add namespace failed");
 
         let results = si
-            .search(&ScopeFilter::GlobalOnly, &vec_a(), 5)
+            .search(&ScopeFilter::RootOnly, &vec_a(), 5)
             .expect("search failed");
 
         let names: Vec<&str> = results.iter().map(|(_, n, _)| n.as_str()).collect();
@@ -1159,17 +1174,17 @@ mod tests {
         );
         assert!(
             !names.contains(&"projects/myproj/mem-proj"),
-            "should NOT contain project memory"
+            "should NOT contain namespace memory"
         );
     }
 
     #[test]
-    fn usearch_store_search_project_and_global() {
+    fn usearch_store_search_subtree() {
         let si: &dyn VectorStore = &make_store();
-        let proj_a = Scope::Project("alpha".to_string());
-        let proj_b = Scope::Project("beta".to_string());
+        let proj_a = Scope::Path(ScopePath::new("alpha").unwrap());
+        let proj_b = Scope::Path(ScopePath::new("beta").unwrap());
 
-        si.add(&Scope::Global, &vec_a(), "global/g1".to_string())
+        si.add(&Scope::Root, &vec_a(), "global/g1".to_string())
             .expect("add global failed");
         si.add(&proj_a, &vec_b(), "projects/alpha/a1".to_string())
             .expect("add alpha failed");
@@ -1178,7 +1193,7 @@ mod tests {
 
         let results = si
             .search(
-                &ScopeFilter::ProjectAndGlobal("alpha".to_string()),
+                &ScopeFilter::Subtree(ScopePath::new("alpha").unwrap()),
                 &vec_a(),
                 10,
             )
@@ -1196,12 +1211,12 @@ mod tests {
     #[test]
     fn usearch_store_search_all() {
         let si: &dyn VectorStore = &make_store();
-        let proj = Scope::Project("foo".to_string());
+        let proj = Scope::Path(ScopePath::new("foo").unwrap());
 
-        si.add(&Scope::Global, &vec_a(), "global/x".to_string())
+        si.add(&Scope::Root, &vec_a(), "global/x".to_string())
             .expect("add global");
         si.add(&proj, &vec_b(), "projects/foo/y".to_string())
-            .expect("add project");
+            .expect("add namespace");
 
         let results = si
             .search(&ScopeFilter::All, &vec_a(), 10)
@@ -1211,7 +1226,7 @@ mod tests {
         assert!(names.contains(&"global/x"), "all should include global");
         assert!(
             names.contains(&"projects/foo/y"),
-            "all should include project"
+            "all should include namespace"
         );
     }
 
@@ -1219,8 +1234,8 @@ mod tests {
     fn usearch_store_upsert_replaces_old_entry() {
         let si: &dyn VectorStore = &make_store();
         let name = "global/memo".to_string();
-        si.add(&Scope::Global, &vec_a(), name.clone()).unwrap();
-        si.add(&Scope::Global, &vec_b(), name.clone()).unwrap();
+        si.add(&Scope::Root, &vec_a(), name.clone()).unwrap();
+        si.add(&Scope::Root, &vec_b(), name.clone()).unwrap();
         let results = si.search(&ScopeFilter::All, &vec_b(), 10).unwrap();
         assert_eq!(
             results.iter().filter(|(_, n, _)| n == &name).count(),
@@ -1235,7 +1250,7 @@ mod tests {
         let si = UsearchStore::new(8).expect("create");
         let store: &dyn VectorStore = &si;
         store
-            .add(&Scope::Global, &vec_a(), "global/test-mem".to_string())
+            .add(&Scope::Root, &vec_a(), "global/test-mem".to_string())
             .expect("add");
         store.set_commit_sha(Some("abc123"));
         store.save(dir.path()).expect("save");
@@ -1263,14 +1278,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let si = UsearchStore::new(8).expect("create");
         let store: &dyn VectorStore = &si;
-        let proj = Scope::Project("rtrip".to_string());
+        let proj = Scope::Path(ScopePath::new("rtrip").unwrap());
 
         store
-            .add(&Scope::Global, &vec_a(), "global/rt-global".to_string())
+            .add(&Scope::Root, &vec_a(), "global/rt-global".to_string())
             .expect("add global");
         store
             .add(&proj, &vec_b(), "projects/rtrip/rt-proj".to_string())
-            .expect("add project");
+            .expect("add namespace");
 
         store.save(dir.path()).expect("save failed");
 
@@ -1283,12 +1298,12 @@ mod tests {
         );
         assert!(
             loaded.find_by_name("projects/rtrip/rt-proj").is_some(),
-            "project memory should survive round-trip"
+            "namespace memory should survive round-trip"
         );
 
         let results = loaded
             .search(
-                &ScopeFilter::ProjectAndGlobal("rtrip".to_string()),
+                &ScopeFilter::Subtree(ScopePath::new("rtrip").unwrap()),
                 &vec_a(),
                 10,
             )
@@ -1301,10 +1316,10 @@ mod tests {
     #[test]
     fn usearch_store_same_short_name_different_scopes_coexist() {
         let si: &dyn VectorStore = &make_store();
-        si.add(&Scope::Global, &vec_a(), "global/foo".to_string())
+        si.add(&Scope::Root, &vec_a(), "global/foo".to_string())
             .unwrap();
         si.add(
-            &Scope::Project("p".into()),
+            &Scope::Path(ScopePath::new("p").unwrap()),
             &vec_b(),
             "projects/p/foo".to_string(),
         )
@@ -1342,7 +1357,7 @@ mod tests {
         // Build a store where the all-index fails immediately.
         let fs = make_failable_store(8, FailOn::Add, 0);
 
-        let scope = Scope::Global;
+        let scope = Scope::Root;
         let name = "global/rollback-test".to_string();
 
         // This add should fail because all-index.add fails.
@@ -1369,7 +1384,7 @@ mod tests {
         // all-index: first add succeeds, second fails.
         let fs = make_failable_store(8, FailOn::Add, 1);
 
-        let scope = Scope::Global;
+        let scope = Scope::Root;
 
         // First add should succeed (fail_after=1 means first call succeeds).
         let first_name = "global/existing".to_string();
@@ -1404,7 +1419,7 @@ mod tests {
         // entry must still be reachable via find_key_by_name afterwards.
         let fs = make_failable_store(8, FailOn::Add, 1);
 
-        let scope = Scope::Global;
+        let scope = Scope::Root;
         let name = "global/upsert-rollback".to_string();
 
         // First add: both scope and all-index succeed (fail_after=1).
@@ -1483,7 +1498,7 @@ mod tests {
         let wrong_dims = vec![1.0_f32, 0.0, 0.0]; // 3 dims, store expects 8
         let err = store
             .inner
-            .add(&Scope::Global, &wrong_dims, "global/bad-dims".to_string())
+            .add(&Scope::Root, &wrong_dims, "global/bad-dims".to_string())
             .unwrap_err();
         let display = format!("{}", err);
         assert!(

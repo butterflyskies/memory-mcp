@@ -1,3 +1,25 @@
+## [0.14.0] - 2026-05-25
+
+### Breaking
+
+- `Scope::Global` renamed to `Scope::Root`; `Scope::Project(String)` replaced with `Scope::Path(ScopePath)` — update all match arms and constructors
+- `ScopeFilter::GlobalOnly` renamed to `RootOnly`; `ProjectAndGlobal` replaced with `Subtree(ScopePath)` — update all match arms
+
+### Added
+
+- `ScopePath` validated newtype wrapping a scope path string — construction via `ScopePath::new()` is the sole validation path
+- Hierarchical path-based namespaces: scope paths may contain `/` for org/team/project nesting (e.g. `"org/team/project"`)
+- `ScopeFilter::matches()` method — predicate to test whether a `Scope` passes a filter, usable outside the index layer
+- `scope_path_matches()` helper for segment-aware prefix matching (exact match or `"prefix/"` child, never bare-string prefix)
+- `validate_scope_path()` with traversal prevention (`..` components, absolute paths, null bytes, depth limit)
+- `Memory::mem_ref()` convenience method — returns `MemoryRef::new(scope.clone(), name.clone())` without the boilerplate
+
+### Changed
+
+- Canonical index key format changed to `v1:scope=...;name=...` — old `scope=...;name=...` form is still parsed for backward compatibility
+- Serde: new variant names (`Root`, `Path`) are serialized; legacy names (`Global`, `Project`) are accepted on deserialisation
+- `Scope::dir_prefix()` now returns `Cow<'static, str>` — `Root` avoids allocation, `Path` variants produce an owned string
+
 ## [0.13.3] - 2026-05-25
 
 ### Changed
