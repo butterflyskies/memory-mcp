@@ -35,11 +35,12 @@ use crate::{
     error::MemoryError,
     index::VectorStore,
     recall_log::{RecallLog, RecallResult},
-    repo::MemoryRepo,
+    repo::{traced_spawn_blocking, MemoryRepo},
     types::{
         parse_qualified_name, parse_scope, parse_scope_filter, AppState, ChangedMemories, EditArgs,
-        ForgetArgs, ListArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, PullResult, ReadArgs,
-        RecallArgs, ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
+        ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
+        PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, Scope,
+        ScopeFilter, SyncArgs,
     },
 };
 
@@ -481,7 +482,7 @@ impl MemoryServer {
                     memory_name: memory.name.to_string(),
                     scope: memory.metadata.scope.to_string(),
                     rank,
-                    distance,
+                    distance: distance as f64,
                 });
 
                 results_vec.push(serde_json::json!({
@@ -975,6 +976,171 @@ impl MemoryServer {
         .instrument(span)
         .await
     }
+
+    /// Return recall precision statistics bucketed by distance range.
+    ///
+    /// Reads all rows in the recall event log and groups them into 0.05-wide
+    /// distance buckets. Each bucket reports applied / maybe / not_applied /
+    /// unknown counts, which agents can use to calibrate their recall distance
+    /// Report that a recalled memory influenced this session.
+    ///
+    /// Writes the agent's feedback back to the recall log — whether the memory
+    /// was applied, an optional note about how it was used, and a confidence
+    /// level. This data feeds into threshold calibration via `recall-stats`.
+    ///
+    /// Returns a JSON object with `rows_affected`.
+    #[tool(
+        name = "mark_applied",
+        description = "Report whether a recalled memory was useful. Call for each memory in the \
+        recall results after you have decided whether to use it. Pass verdict='applied' if it \
+        influenced the session, 'maybe' if partially relevant, or 'not_applied' if not relevant. \
+        This bidirectional feedback calibrates recall thresholds. Pass the recall_id from the \
+        recall response, the memory name, the verdict, an optional application note, and a \
+        confidence level ('high', 'medium', or 'low')."
+    )]
+    async fn mark_applied(
+        &self,
+        Parameters(args): Parameters<MarkAppliedArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
+        let session_id = extract_session_id(&parts);
+        let span = tracing::info_span!(
+            "handler.mark_applied",
+            session_id = %session_id,
+            recall_id = %args.recall_id,
+            memory = %args.memory,
+            verdict = %args.verdict,
+        );
+        let state = Arc::clone(&self.state);
+        async move {
+            match args.confidence.as_str() {
+                "high" | "medium" | "low" => {}
+                other => {
+                    return Err(ErrorData::from(MemoryError::InvalidInput {
+                        reason: format!(
+                            "invalid confidence '{}'; expected 'high', 'medium', or 'low'",
+                            other
+                        ),
+                    }));
+                }
+            }
+
+            let rows_affected = if let Some(ref log) = state.recall_log {
+                let log = Arc::clone(log);
+                let recall_id = args.recall_id.clone();
+                let memory = args.memory.clone();
+                let sid = session_id.clone();
+                let verdict = args.verdict.as_str();
+                let application = args.application.clone();
+                let confidence = args.confidence.clone();
+                traced_spawn_blocking(move || {
+                    log.mark_applied(
+                        &recall_id,
+                        &memory,
+                        &sid,
+                        verdict,
+                        application.as_deref(),
+                        &confidence,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    ErrorData::from(MemoryError::Internal(format!("spawn_blocking: {e}")))
+                })?
+                .map_err(ErrorData::from)?
+            } else {
+                warn!("mark_applied called but recall log is not enabled");
+                0
+            };
+
+            if rows_affected == 0 {
+                warn!(
+                    recall_id = %args.recall_id,
+                    memory = %args.memory,
+                    "mark_applied matched no rows"
+                );
+            }
+
+            info!(
+                rows_affected,
+                memory = %args.memory,
+                verdict = %args.verdict,
+                "mark_applied"
+            );
+
+            Ok(serde_json::json!({
+                "rows_affected": rows_affected,
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Return recall precision statistics bucketed by distance range.
+    ///
+    /// Agents can use this to inspect their own recall quality and adjust
+    /// thresholds.
+    ///
+    /// Returns an error if the recall log is not enabled.
+    #[tool(
+        name = "recall_stats",
+        description = "Return recall precision statistics bucketed by distance range. Shows applied/maybe/not_applied/unknown counts per bucket, useful for calibrating recall thresholds. No arguments required."
+    )]
+    async fn recall_stats(
+        &self,
+        Parameters(_args): Parameters<RecallStatsArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
+        let session_id = extract_session_id(&parts);
+        let span = tracing::info_span!(
+            "handler.recall_stats",
+            session_id = %session_id,
+        );
+        let state = Arc::clone(&self.state);
+        async move {
+            if state.recall_log.is_none() {
+                return Err(ErrorData::from(MemoryError::Internal(
+                    "recall log is not enabled".to_string(),
+                )));
+            }
+            let buckets = crate::repo::traced_spawn_blocking(move || {
+                // Safety: checked above that recall_log is Some.
+                state
+                    .recall_log
+                    .as_ref()
+                    .expect("recall_log is Some — checked above")
+                    .recall_stats()
+            })
+            .await
+            .map_err(|e| ErrorData::from(MemoryError::Internal(format!("spawn_blocking: {e}"))))?
+            .map_err(ErrorData::from)?;
+
+            let json_buckets: Vec<serde_json::Value> = buckets
+                .iter()
+                .filter(|b| b.total > 0)
+                .map(|b| {
+                    serde_json::json!({
+                        "range": format!("{:.2}–{:.2}", b.range_start, b.range_end),
+                        "total": b.total,
+                        "applied": b.applied,
+                        "maybe": b.maybe,
+                        "not_applied": b.not_applied,
+                        "unknown": b.unknown,
+                    })
+                })
+                .collect();
+
+            info!(buckets = json_buckets.len(), "recall_stats");
+
+            Ok(serde_json::json!({
+                "buckets": json_buckets,
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
+    }
 }
 
 #[tool_handler]
@@ -984,7 +1150,8 @@ impl ServerHandler for MemoryServer {
             "A semantic memory system for AI coding agents. Memories are stored as markdown files \
             in a git repository and indexed for semantic retrieval. Use `remember` to store, `recall` \
             to search, `read` to fetch a specific memory, `edit` to update, `forget` to delete, \
-            `list` to browse, and `sync` to push/pull the remote.\n\n\
+            `list` to browse, `sync` to push/pull the remote, and `recall_stats` to inspect recall \
+            precision statistics bucketed by distance for threshold calibration.\n\n\
             Scope convention: always pass scope='project:<basename-of-your-cwd>' when working within \
             a project. This returns project memories alongside global ones. Omitting scope defaults to \
             global-only for queries (recall, list) and targets a single memory for point operations \

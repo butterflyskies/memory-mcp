@@ -47,6 +47,8 @@ enum Command {
     Auth(AuthCommand),
     /// Pre-warm the embedding model cache (useful as a k8s init container)
     Warmup(WarmupArgs),
+    /// Show recall precision statistics by distance bucket
+    RecallStats(RecallStatsArgs),
 }
 
 #[derive(Args)]
@@ -154,6 +156,14 @@ struct ServeArgs {
     #[arg(long, default_value_t = false, env = "MEMORY_MCP_REQUIRE_REMOTE_SYNC")]
     require_remote_sync: bool,
 
+    /// SQLite busy timeout in seconds for the recall event log.
+    ///
+    /// When multiple processes access the recall log concurrently, this
+    /// controls how long each connection waits for a database lock before
+    /// returning an error.
+    #[arg(long, default_value_t = 5, env = "MEMORY_MCP_RECALL_LOG_BUSY_TIMEOUT")]
+    recall_log_busy_timeout: u64,
+
     /// Seconds after which a subsystem with no successful operations is considered
     /// stale. Set to 0 to disable staleness detection (default).
     #[arg(long, default_value_t = 0, env = "MEMORY_MCP_HEALTH_STALE_SECS")]
@@ -179,6 +189,17 @@ struct ServeArgs {
 struct WarmupArgs {
     #[command(flatten)]
     embed: EmbedArgs,
+}
+
+#[derive(Args)]
+struct RecallStatsArgs {
+    /// Path to the recall log database.
+    #[arg(long, env = "MEMORY_MCP_RECALL_LOG")]
+    recall_log: Option<String>,
+
+    /// Path to the index directory (default: ~/.memory-mcp/.memory-mcp-index).
+    #[arg(long)]
+    index_dir: Option<String>,
 }
 
 #[derive(Args)]
@@ -392,6 +413,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Command::RecallStats(args)) => {
+            #[cfg(feature = "otlp")]
+            init_tracing_fmt_only();
+            run_recall_stats(args)?;
+        }
     }
 
     Ok(())
@@ -566,10 +592,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let recall_log_path = index_dir.join("recall_log.sqlite");
-    let recall_log = match RecallLog::open(&recall_log_path) {
+    let recall_log = match RecallLog::open(
+        &recall_log_path,
+        std::time::Duration::from_secs(args.recall_log_busy_timeout),
+    ) {
         Ok(log) => {
             info!("recall log opened at {}", recall_log_path.display());
-            Some(log)
+            Some(Arc::new(log))
         }
         Err(e) => {
             warn!(error = %e, "failed to open recall log — recall events will not be logged");
@@ -676,6 +705,62 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         tracing::warn!("failed to persist vector index on shutdown: {}", e);
     } else {
         info!("vector index saved to {}", index_dir.display());
+    }
+
+    Ok(())
+}
+
+/// Print recall precision statistics bucketed by distance range.
+fn run_recall_stats(args: RecallStatsArgs) -> anyhow::Result<()> {
+    // Resolve the recall log path: explicit flag > env var (handled by clap) >
+    // default derived from index_dir or ~/.memory-mcp/.memory-mcp-index.
+    let log_path = if let Some(p) = args.recall_log {
+        PathBuf::from(p)
+    } else {
+        let index_dir = if let Some(d) = args.index_dir {
+            PathBuf::from(d)
+        } else {
+            let home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+            home.join(".memory-mcp").join(".memory-mcp-index")
+        };
+        index_dir.join("recall_log.sqlite")
+    };
+
+    let log = RecallLog::open(&log_path, std::time::Duration::from_secs(5))
+        .with_context(|| format!("failed to open recall log at {}", log_path.display()))?;
+
+    let buckets = log
+        .recall_stats()
+        .context("failed to compute recall stats")?;
+
+    // Print only non-empty buckets.
+    let any = buckets.iter().any(|b| b.total > 0);
+    if !any {
+        println!("No recall events recorded yet.");
+        return Ok(());
+    }
+
+    for b in &buckets {
+        if b.total == 0 {
+            continue;
+        }
+        let applied_pct = if b.applied > 0 {
+            format!("{}%", b.applied * 100 / b.total)
+        } else {
+            "0%".to_string()
+        };
+        println!(
+            "{:.2}–{:.2}:  applied {} ({}/{}), maybe {}, not_applied {}, unknown {}",
+            b.range_start,
+            b.range_end,
+            applied_pct,
+            b.applied,
+            b.total,
+            b.maybe,
+            b.not_applied,
+            b.unknown,
+        );
     }
 
     Ok(())
