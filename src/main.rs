@@ -631,9 +631,21 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to listen for ctrl-c");
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to listen for ctrl-c");
+            }
             info!("shutdown signal received");
             ct.cancel();
         })
