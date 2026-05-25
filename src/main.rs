@@ -19,6 +19,7 @@ use memory_mcp::auth::{self, AuthProvider, StoreBackend};
 use memory_mcp::embedding::{CandleEmbeddingEngine, EmbeddingBackend, MODEL_ID};
 use memory_mcp::health::{healthz_handler, readyz_handler, version_handler, HealthRegistry};
 use memory_mcp::index::{UsearchStore, VectorStore};
+use memory_mcp::recall_log::RecallLog;
 use memory_mcp::repo::MemoryRepo;
 use memory_mcp::server::MemoryServer;
 use memory_mcp::types::{validate_branch_name, AppState};
@@ -564,6 +565,18 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         health.vector_index.report_ok();
     }
 
+    let recall_log_path = index_dir.join("recall_log.sqlite");
+    let recall_log = match RecallLog::open(&recall_log_path) {
+        Ok(log) => {
+            info!("recall log opened at {}", recall_log_path.display());
+            Some(log)
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to open recall log — recall events will not be logged");
+            None
+        }
+    };
+
     let state = Arc::new(AppState::new(
         repo,
         args.branch.clone(),
@@ -571,6 +584,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         index,
         auth,
         health,
+        recall_log,
     ));
 
     // Keep a reference for post-shutdown index persistence.
