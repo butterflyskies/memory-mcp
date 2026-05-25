@@ -54,6 +54,10 @@ impl RecallLog {
     /// `busy_timeout` controls how long each connection will wait when the
     /// database is locked before returning an error.
     pub fn open(path: &Path, busy_timeout: Duration) -> Result<Self, MemoryError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MemoryError::Internal(format!("recall log dir: {e}")))?;
+        }
         let conn = Connection::open(path)
             .map_err(|e| MemoryError::Internal(format!("recall log open: {e}")))?;
         conn.busy_timeout(busy_timeout)

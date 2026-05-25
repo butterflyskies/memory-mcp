@@ -1,6 +1,6 @@
 [package]
 name = "memory-mcp"
-version = "0.13.1"
+version = "0.13.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MCP server for semantic memory — pure-Rust embeddings, vector search, git-backed storage"
@@ -24,7 +24,7 @@ otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 rmcp = { version = "1.1", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-git2 = "0.21"
+git2 = { version = "0.21", features = ["https", "vendored-openssl"] }
 usearch = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

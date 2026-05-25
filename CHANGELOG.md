@@ -1,3 +1,12 @@
+## [0.13.2] - 2026-05-25
+
+### Fixed
+- git2 0.21 dropped `https` from default features, breaking HTTPS git operations in container deployments (`no TLS stream available`) (#244)
+- RecallLog `open()` now creates parent directories before opening the SQLite file
+
+### Dependencies
+- git2: enabled `https` + `vendored-openssl` features (required since git2 0.21)
+
 ## [0.13.1] - 2026-05-25
 
 ### Added
