@@ -23,7 +23,7 @@ env:
   IMAGE: butterflyskies/memory-mcp
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,27 +37,74 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: "false"
-      - name: Install cargo-nextest
-        run: |
-          curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.131/cargo-nextest-0.9.131-x86_64-unknown-linux-gnu.tar.gz" \
-            -o /tmp/cargo-nextest.tar.gz
-          echo "8e38b16299864c9f597c9a1e2caf25b7e8b598ffc659ec014c2c735a9befd8fa  /tmp/cargo-nextest.tar.gz" | sha256sum -c -
-          tar xzf /tmp/cargo-nextest.tar.gz -C /usr/local/bin
       - run: cargo fmt --check
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo clippy --workspace --features k8s -- -D warnings
-      - run: cargo clippy --workspace --features otlp -- -D warnings
-      - run: cargo clippy --workspace --features native-certs -- -D warnings
-      - run: cargo clippy --workspace --all-features -- -D warnings
       - name: Verify no opentelemetry in default build
         run: |
           cargo tree 2>&1 | grep -i opentelemetry && \
             { echo "ERROR: opentelemetry appeared in default build tree" >&2; exit 1; } || \
             echo "OK: opentelemetry not present in default build"
-      - run: cargo nextest run --workspace --no-fail-fast
-      - run: cargo nextest run --workspace --no-fail-fast --features k8s
-      - run: cargo nextest run --workspace --no-fail-fast --features otlp
-      - run: cargo nextest run --workspace --no-fail-fast --all-features
+
+  clippy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--features k8s"
+          - "--features otlp"
+          - "--features native-certs"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-03-27)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: clippy-${{ matrix.features }}
+          cache-bin: "false"
+      - run: cargo clippy --workspace ${{ matrix.features }} -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--features k8s"
+          - "--features otlp"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-03-27)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: test-${{ matrix.features }}
+          cache-bin: "false"
+      - name: Cache HuggingFace model
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-model-${{ hashFiles('src/embedding.rs') }}
+      - name: Install cargo-nextest
+        run: |
+          curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.136/cargo-nextest-0.9.136-x86_64-unknown-linux-gnu.tar.gz" \
+            -o /tmp/cargo-nextest.tar.gz
+          echo "a098eed56f2dd88c7fdca1e554a6b99fa1ffbd2a7a1c41b865700112981f6f52  /tmp/cargo-nextest.tar.gz" | sha256sum -c -
+          tar xzf /tmp/cargo-nextest.tar.gz -C /usr/local/bin
+      - run: cargo nextest run --workspace --no-fail-fast ${{ matrix.features }}
 
   # Catch cross-platform compilation failures before they reach the release pipeline.
   # Mirrors the release.yml publish-binaries matrix (minus Windows — see #42).
@@ -148,7 +195,7 @@ jobs:
 
   build:
     if: github.event_name != 'pull_request' || github.base_ref == 'main'
-    needs: [test, audit, semver-checks, cross-compile, msrv]
+    needs: [lint, clippy, test, audit, semver-checks, cross-compile, msrv]
     runs-on: ubuntu-latest
     permissions:
       contents: read
