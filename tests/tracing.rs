@@ -716,7 +716,7 @@ fn debug_spans_are_filtered_when_only_info_enabled() {
 #[test]
 fn repo_save_span_has_name_and_oid_fields() {
     use memory_mcp::repo::MemoryRepo;
-    use memory_mcp::types::{Memory, MemoryMetadata, MemoryName, Scope};
+    use memory_mcp::types::{Memory, MemoryMetadata, Scope};
     use std::sync::Arc;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -735,11 +735,7 @@ fn repo_save_span_has_name_and_oid_fields() {
                 updated_at: chrono::Utc::now(),
                 source: None,
             };
-            let mem = Memory::new(
-                MemoryName::new("tc08-memory").unwrap(),
-                "test content".to_string(),
-                meta,
-            );
+            let mem = Memory::new("tc08-memory", "test content", meta).unwrap();
             repo.save_memory(&mem).await.expect("save");
         });
     });
@@ -772,7 +768,7 @@ fn repo_save_span_has_name_and_oid_fields() {
 #[test]
 fn repo_delete_span_has_name_and_oid_fields() {
     use memory_mcp::repo::MemoryRepo;
-    use memory_mcp::types::{Memory, MemoryMetadata, MemoryName, Scope};
+    use memory_mcp::types::{Memory, MemoryMetadata, Scope};
     use std::sync::Arc;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -791,11 +787,7 @@ fn repo_delete_span_has_name_and_oid_fields() {
                 updated_at: chrono::Utc::now(),
                 source: None,
             };
-            let mem = Memory::new(
-                MemoryName::new("tc08b-memory").unwrap(),
-                "test content".to_string(),
-                meta,
-            );
+            let mem = Memory::new("tc08b-memory", "test content", meta).unwrap();
             repo.save_memory(&mem).await.expect("save");
             repo.delete_memory("tc08b-memory", &Scope::Global)
                 .await
@@ -831,7 +823,7 @@ fn repo_delete_span_has_name_and_oid_fields() {
 #[test]
 fn repo_save_does_not_log_content_text() {
     use memory_mcp::repo::MemoryRepo;
-    use memory_mcp::types::{Memory, MemoryMetadata, MemoryName, Scope};
+    use memory_mcp::types::{Memory, MemoryMetadata, Scope};
     use std::sync::Arc;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -851,11 +843,7 @@ fn repo_save_does_not_log_content_text() {
                 updated_at: chrono::Utc::now(),
                 source: None,
             };
-            let mem = Memory::new(
-                MemoryName::new("tc17-memory").unwrap(),
-                secret_content.to_string(),
-                meta,
-            );
+            let mem = Memory::new("tc17-memory", secret_content, meta).unwrap();
             repo.save_memory(&mem).await.expect("save");
         });
     });

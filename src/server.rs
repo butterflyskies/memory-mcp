@@ -337,7 +337,7 @@ impl MemoryServer {
         async move {
             let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
             let metadata = MemoryMetadata::new(scope.clone(), args.tags, args.source);
-            let memory = Memory::new(name, args.content, metadata);
+            let memory = Memory::from_validated(name, args.content, metadata);
 
             // Order: (1) embed, (2) add to index, (3) save to repo.
             // If step 3 fails, index has a stale entry (harmless — recall will skip it).

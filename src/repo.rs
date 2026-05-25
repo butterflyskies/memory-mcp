@@ -1239,7 +1239,7 @@ impl MemoryRepo {
 mod tests {
     use super::*;
     use crate::auth::AuthProvider;
-    use crate::types::{Memory, MemoryMetadata, MemoryName, PullResult, Scope};
+    use crate::types::{Memory, MemoryMetadata, PullResult, Scope};
     use std::sync::Arc;
 
     fn test_auth() -> AuthProvider {
@@ -1254,7 +1254,7 @@ mod tests {
             updated_at: chrono::DateTime::from_timestamp(updated_at_secs, 0).unwrap(),
             source: None,
         };
-        Memory::new(MemoryName::new(name).unwrap(), content.to_string(), meta)
+        Memory::new(name, content, meta).unwrap()
     }
 
     fn setup_bare_remote() -> (tempfile::TempDir, String) {

@@ -301,12 +301,30 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// Create a new memory with a random UUID.
-    pub fn new(name: MemoryName, content: String, metadata: MemoryMetadata) -> Self {
+    /// Create a new memory with a random UUID, validating the name.
+    pub fn new(
+        name: impl Into<String>,
+        content: impl Into<String>,
+        metadata: MemoryMetadata,
+    ) -> Result<Self, MemoryError> {
+        Ok(Self {
+            id: Uuid::new_v4().to_string(),
+            name: MemoryName::new(name)?,
+            content: content.into(),
+            metadata,
+        })
+    }
+
+    /// Create a new memory from an already-validated [`MemoryName`].
+    pub(crate) fn from_validated(
+        name: MemoryName,
+        content: impl Into<String>,
+        metadata: MemoryMetadata,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             name,
-            content,
+            content: content.into(),
             metadata,
         }
     }
@@ -824,11 +842,7 @@ mod tests {
     #[test]
     fn round_trip_global_scope() {
         let meta = MemoryMetadata::new(Scope::Global, vec!["global-tag".to_string()], None);
-        let mem = Memory::new(
-            MemoryName::new("global-mem").unwrap(),
-            "Some content.".to_string(),
-            meta,
-        );
+        let mem = Memory::new("global-mem", "Some content.", meta).unwrap();
         let rendered = mem.to_markdown().unwrap();
         let parsed = Memory::from_markdown(&rendered).unwrap();
 
@@ -840,11 +854,7 @@ mod tests {
     #[test]
     fn round_trip_no_source() {
         let meta = MemoryMetadata::new(Scope::Project("proj".to_string()), vec![], None);
-        let mem = Memory::new(
-            MemoryName::new("no-src").unwrap(),
-            "Body.".to_string(),
-            meta,
-        );
+        let mem = Memory::new("no-src", "Body.", meta).unwrap();
         let md = mem.to_markdown().unwrap();
         // source field should not appear in yaml
         assert!(!md.contains("source:"));
