@@ -2081,6 +2081,7 @@ dependencies = [
  "tokenizers 0.23.1",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
