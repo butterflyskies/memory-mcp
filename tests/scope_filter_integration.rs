@@ -20,11 +20,7 @@ async fn make_repo() -> (Arc<MemoryRepo>, tempfile::TempDir) {
 /// Helper: save a memory with the given scope and name.
 async fn save(repo: &Arc<MemoryRepo>, name: &str, scope: Scope) {
     let metadata = MemoryMetadata::new(scope, vec![], None);
-    let memory = Memory::new(
-        MemoryName::new(name).unwrap(),
-        format!("Content for {}", name),
-        metadata,
-    );
+    let memory = Memory::new(name, format!("Content for {}", name), metadata).unwrap();
     repo.save_memory(&memory)
         .await
         .expect("save should succeed");

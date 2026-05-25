@@ -10,7 +10,7 @@ use memory_mcp::auth::AuthProvider;
 #[cfg(unix)]
 use memory_mcp::error::MemoryError;
 use memory_mcp::repo::MemoryRepo;
-use memory_mcp::types::{Memory, MemoryMetadata, MemoryName, PullResult, Scope};
+use memory_mcp::types::{Memory, MemoryMetadata, PullResult, Scope};
 
 /// Full round-trip: init repo → save memory → read it back → list → delete → pull.
 ///
@@ -28,11 +28,7 @@ async fn repo_round_trip_with_test_auth_provider() {
 
     // Save a memory.
     let metadata = MemoryMetadata::new(Scope::Global, vec!["test".into()], None);
-    let memory = Memory::new(
-        MemoryName::new("test-memory").unwrap(),
-        "Hello from integration test.".into(),
-        metadata,
-    );
+    let memory = Memory::new("test-memory", "Hello from integration test.", metadata).unwrap();
     repo.save_memory(&memory)
         .await
         .expect("save should succeed");
@@ -91,11 +87,7 @@ async fn push_pull_with_bare_remote() {
 
     // Save a memory so there's something to push.
     let metadata = MemoryMetadata::new(Scope::Global, vec!["push-test".into()], None);
-    let memory = Memory::new(
-        MemoryName::new("push-memory").unwrap(),
-        "Content for push test.".into(),
-        metadata,
-    );
+    let memory = Memory::new("push-memory", "Content for push test.", metadata).unwrap();
     repo.save_memory(&memory)
         .await
         .expect("save should succeed");
@@ -241,11 +233,7 @@ async fn push_rejected_by_server_hook() {
     let auth = AuthProvider::with_token("ghp_fake_token");
 
     let metadata = MemoryMetadata::new(Scope::Global, vec!["rejected".into()], None);
-    let memory = Memory::new(
-        MemoryName::new("rejected-memory").unwrap(),
-        "This push should be rejected.".into(),
-        metadata,
-    );
+    let memory = Memory::new("rejected-memory", "This push should be rejected.", metadata).unwrap();
     repo.save_memory(&memory)
         .await
         .expect("save should succeed");
