@@ -74,7 +74,7 @@ secrecy = "0.10.3"
 
 # OpenTelemetry OTLP export (feature = "otlp"). All four crates must be pinned
 # to compatible minor versions: opentelemetry 0.31 ↔ tracing-opentelemetry 0.32.
-opentelemetry = { version = "0.31", optional = true }
+opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.31", optional = true }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"], optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
