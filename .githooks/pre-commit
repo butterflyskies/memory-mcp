@@ -1,3 +1,22 @@
 #!/bin/sh
-# Fail fast on formatting issues before they reach CI.
-exec cargo fmt -- --check
+# Pre-commit checks — fail fast before issues reach CI.
+set -e
+
+echo "==> cargo fmt --check"
+cargo fmt -- --check
+
+echo "==> cargo clippy"
+cargo clippy -- -D warnings
+
+echo "==> cargo doc"
+if cargo doc --no-deps 2>&1 | grep -q "warning:"; then
+    echo "ERROR: doc warnings found"
+    exit 1
+fi
+
+echo "==> gitleaks (secrets scan)"
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks protect --staged
+else
+    echo "WARN: gitleaks not installed — skipping secrets scan. Install it to enable: https://github.com/gitleaks/gitleaks"
+fi
