@@ -1,184 +1,173 @@
 # memory-mcp Roadmap
 
 > Canonical source of truth for the memory-mcp development plan.
-> Updated with each phase completion. See the [pinned roadmap issue](https://github.com/butterflyskies/memory-mcp/issues/132) for discussion and progress notes.
+> Updated with each epic completion. See the [pinned roadmap issue](https://github.com/butterflyskies/memory-mcp/issues/132) for discussion.
 
-## Design Principle
+## What memory-mcp is
 
-Earlier phases should be implemented with awareness of where the project is headed. Interfaces, error types, and module boundaries introduced in Phase 1-2 should accommodate the multi-user, multi-transport, observable future without over-engineering for it now.
+A semantic memory system for AI coding agents. Memories are stored as markdown files in a git repository, indexed locally for semantic retrieval, and synced to a remote. Shipped as a single binary (Rust, candle for local embedding, usearch for HNSW vector index) speaking MCP over streamable HTTP.
+
+## Where it's heading
+
+The project has moved from phase-based planning to **value-based epics**. The old phases (1-7) mapped roughly to build order; epics map to *why the work matters*. Work within an epic can proceed in any order as dependencies allow.
+
+**Current priority:** Retrieval quality, starting with the HyperMem bridge (#262).
+
+---
+
+## Epics
+
+### Retrieval Quality
+Make recall find the right thing.
+
+The highest-priority epic. memory-mcp#262 (HyperMem bridge — graph-aware chunk index) is the current focus, providing a path to structured chunking and hybrid retrieval without rewriting the existing index.
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #262 | Graph-aware chunk index for retrieval (HyperMem bridge) | **Active** |
+| #141 | Upgrade to ModernBERT Embed (8192 token context) | Open |
+| #140 | Chunk long memories for embedding | Open |
+| #55 | BM25 keyword search via Tantivy | Open |
+| #148 | Tag-based filtering in recall | Open |
+| #197 | Threshold-based recall: auto-expand until relevance drops | Open |
+| #129 | Memory consolidation, write discipline, quality metrics | Open |
+| #147 | Deduplication / update detection on remember | Open |
+| #107 | Memory expiry: TTL + completion-triggered deletion | Open |
+
+### Recall Telemetry
+Measure whether retrieval works.
+
+The `mark_applied` feedback loop is live. This epic builds on it with structured telemetry, analytics by memory name, and schema normalization to make the data actionable.
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #213 | Recall evaluation log (applied-memory telemetry) | Open |
+| #241 | Recall telemetry v2 — retrieval funnel, shadow policies, filter regret | Open |
+| #247 | Memory health analytics: index recall verdicts by memory name | Open |
+| #251 | Normalize recall telemetry schema (recall_batches + recall_results) | Open |
+| #253 | Review finding telemetry — pattern fire rates, FP rates | Open |
+| #260 | Clean up orphaned recall log rows on memory delete/edit | Open |
+
+### Multi-Agent Access Control
+Support multiple identities with scope isolation.
+
+Enables different agents to share a memory-mcp instance without leaking across scope boundaries.
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #261 | Scope access control — public, shared, private scopes per identity | Open |
+| #259 | Scope access control and authorization enforcement | Open |
+| #116 | Memory scope isolation for multi-user deployments | Open |
+| #115 | Authentication and authorization framework | Open |
+| #113 | Log access denied events | Open |
+
+### Metadata Framework
+Structured data on memories.
+
+Adds classification, enrichment fields (last-accessed, confidence), and stable UUID-based access.
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #258 | Metadata framework implementation tracker | Open |
+| #248 | Information classification metadata | Open |
+| #149 | Memory metadata enrichment (last-accessed, access count, confidence) | Open |
+| #257 | read_by_id MCP tool — stable memory access by UUID | Open |
+
+### Observability
+Understand what the system is doing.
+
+Builds on the tracing scaffold shipped in v0.8.0 (Phase 2). Completes span coverage, adds audit channels, metrics export, and distributed tracing.
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #172 | Complete operational span coverage from #52 | Open |
+| #173 | Tiered audit channel infrastructure | Open |
+| #162 | W3C Trace Context propagation | Open |
+| #165 | Prometheus metrics endpoint (/metrics) | Open |
+| #205 | /stats endpoint for operational introspection | Open |
+| #110 | Authenticated user identity in log events | Open |
+| #111 | Log returned memory names on recall | Open |
+| #112 | Log auth events | Open |
+
+### Infrastructure & CI
+Build, ship, secure.
+
+CI pipeline, cross-platform support, dependency maintenance, supply chain security. Windows support (#42, #56) remains deferred until demand materializes.
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #243 | Cross-compile artifact in release docker image build | Open |
+| #78 | validate subcommand + Docker build speedup | Open |
+| #98 | Automate CHANGELOG without bypassing branch protection | Open |
+| #153 | CVE scanning gate in CI (Grype/Trivy) | Open |
+| #152 | Container signing with cosign | Open |
+| #79 | GitHub App installation token auth | Open |
+| #42 | Windows: usearch MAP_FAILED | Open |
+| #56 | Cross-platform vector index (brute-force fallback) | Open |
+| #144 | Migrate ureq v2 to v3 | Open |
+| #161 | Revisit candle fork patch | Open |
+| #160 | docs.rs metadata | Open |
+| #214 | hf-hub native-certs gap | Open |
+| #194 | candle ARM64 macOS infinite loop | Open |
+| #183 | Keep-alive timeout after laptop sleep | Open |
+| #166 | Flaky test: large_batch_is_chunked | Open |
+
+### Transport & Deployment
+How it runs.
+
+Stdio transport for local single-user deployments, non-GitHub remote support, and deployment documentation.
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #104 | Stdio transport | Open |
+| #103 | Non-GitHub git remotes | Open |
+| #118 | Deployment checklist | Open |
+| #150 | Periodic background sync | Open |
+
+### Agent Workflow
+Tooling for how agents use memory-mcp.
+
+Compaction hooks, migration paths, CLI access, and internal code quality.
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #130 | Post-compaction context re-priming hook | Open |
+| #254 | Dedicated test quality sub-agent in /code-review | Open |
+| #151 | Migration tools for Serena/auto-memories | Open |
+| #154 | CLI for manual memory management | Open |
+| #256 | Lazy directory migration from projects/ to namespaces/ | Open |
+| #255 | Idiomacy cleanup on in_memory.rs | Open |
 
 ---
 
 ## Completed Work
 
-### Phase 1: Stabilize & Quick Wins
+### Phase 1: Stabilize & Quick Wins (v0.6.0-v0.6.1)
 
-**Completed 2026-04-12.** All 6 issues closed. Released in v0.6.0 and v0.6.1.
+All 6 issues closed. #88 (flaky test), #81 (git push reject), #69 (atomic writes), #106 (recall truncation), #108 (secret-avoidance), #105 (docker docs).
 
-| Issue | Title | Status |
-|-------|-------|--------|
-| #88 | Flaky test: FastForward vs Merged | v0.5.1 |
-| #81 | git push silently succeeds on reject | v0.6.0 |
-| #69 | Atomic file writes + cleanup | v0.6.1 |
-| #106 | Recall truncation guidance for agents | v0.6.0 |
-| #108 | Secret-avoidance in tool instructions | v0.6.0 |
-| #105 | Document `docker run` pattern in README | v0.6.0 |
+### Phase 2: Tracing Scaffold + Core Quality (partial)
 
-**Design decisions carried forward:**
-- `MemoryError` is `#[non_exhaustive]` — future variants are patch-compatible.
-- `fs_util::atomic_write` is `pub(crate)` — reusable for index persistence and config writes in later phases.
-- Recall response includes `truncated` flag and `content_length` — extensible for audit logging fields.
+Tracing scaffold (#52), vector index trait (#94), DeviceFlowProvider (#145), embed timeout (#192), startup reindex (#193), /readyz (#164) all shipped across v0.8.0-v0.11.0.
 
-### Earlier Phases (Pre-Roadmap)
+### Pre-Roadmap (v0.1.0-v0.5.0)
 
-Core features delivered in v0.1.0–v0.5.0:
-- MCP server with streamable HTTP transport
-- Memory file format (markdown + YAML frontmatter)
-- All core tools: `remember`, `recall`, `forget`, `edit`, `list`, `read`, `sync`
-- Local embedding (candle, BGE-small-en-v1.5) + HNSW vector index (usearch)
-- Git push/pull with remote auth, incremental index rebuild
-- Keyring-based token storage, OAuth device flow
-- K8s deployment manifests, container image
-- Fat lib / thin binary refactor, semver hardening
-- Published to crates.io (v0.3.0+)
-
-Closed issues from original TODO: #60 (cargo-auditable), #62 (Trusted Publishing), #69 (atomic writes), #71 (recall over-fetch).
+MCP server, streamable HTTP, memory file format, all core tools, local embedding (candle/BGE-small), HNSW index (usearch), git sync, keyring auth, OAuth device flow, K8s manifests, container image, crates.io publishing.
 
 ---
 
-## Phase 2: Tracing Scaffold + Core Quality
+## Historical Phase Mapping
 
-**Goal:** Lay the observability foundation early so all subsequent work is automatically instrumented. Improve dev workflow and testing infrastructure.
+For reference, the original phase structure mapped to epics as follows:
 
-| Issue | Title | Effort | Depends on | Status |
-|-------|-------|--------|------------|--------|
-| #52 (partial) | Tracing scaffold | Medium | -- | **Done** (v0.8.0, PR #170) |
-| #94 | Vector index trait abstraction | Medium | -- | **Done** (v0.8.0, PR #177) |
-| #145 | DeviceFlowProvider trait | Small | -- | **Done** (v0.8.0, PR #178) |
-| #192 | Embed timeout — self-healing worker thread | Medium | -- | **Done** (v0.10.0, PR #199) |
-| #193 | Startup reindex after crash | Medium | -- | **Done** (v0.10.0, PR #199) |
-| #164 | `/readyz` health endpoint | Small | #94 | **Done** (v0.11.0, PR #202) |
-| #114 | Surface keep-alive timeout to clients | Small | -- | |
-| #109 | Content-level secret scanning | Medium | #108 | |
-| #98 | Automate CHANGELOG without bypassing branch protection | Medium | -- | |
-| #78 | `validate` subcommand + Docker build speedup | Large | -- | |
-| #146 | Integration tests for auth login, auth status, MEMORY_MCP_BIND | Medium | -- | |
+| Old Phase | Epic(s) |
+|-----------|---------|
+| Phase 1 (Stabilize) | Completed |
+| Phase 2 (Tracing + Quality) | Observability, Infrastructure & CI |
+| Phase 3 (Transport/Stdio) | Transport & Deployment |
+| Phase 4 (Search/Lifecycle) | Retrieval Quality, Metadata Framework |
+| Phase 5 (Audit Logging) | Observability |
+| Phase 6 (Enterprise) | Multi-Agent Access Control |
+| Phase 7 (Windows/polish) | Infrastructure & CI |
 
-**Key insight:** #52 (comprehensive tracing) is cross-cutting. The scaffold goes in Phase 2 so every new feature gets spans for free. Structured fields: operation, scope, memory_name, duration. OTLP export behind feature flag.
-
-**Design the vector index trait (#94) with future backends in mind:** brute-force fallback (#56), Tantivy BM25 (#55).
-
----
-
-## Phase 3: Transport & Stdio
-
-**Goal:** Add stdio as a secondary transport for local single-user deployments.
-
-| Issue | Title | Effort | Depends on |
-|-------|-------|--------|------------|
-| #104 | Stdio transport | Medium | -- |
-| #103 | Non-GitHub git remotes | Large | -- |
-
-**ADR required:** New ADR superseding ADR-0001. Stdio for local single-user (Claude Code manages process). HTTP for deployed/multi-user. Mutual exclusion: when serving HTTP(S), stdio/stdout is disabled.
-
----
-
-## Phase 4: Search & Memory Lifecycle
-
-**Goal:** Richer retrieval capabilities, better embedding quality, and memory lifecycle management.
-
-| Issue | Title | Effort | Depends on |
-|-------|-------|--------|------------|
-| #141 | Upgrade to ModernBERT Embed (8192 token context) | Medium | -- |
-| #140 | Chunk long memories for embedding | Medium | #141 |
-| #55 | BM25 keyword search via Tantivy | Large | -- |
-| #107 | Memory expiry: TTL + completion-triggered deletion | Medium | -- |
-| #147 | Deduplication / update detection on `remember` | Medium | -- |
-| #148 | Tag-based filtering in `recall` | Small | -- |
-| #149 | Memory metadata enrichment (last-accessed, access count, confidence) | Medium | -- |
-| #150 | Periodic background sync | Medium | -- |
-
-**Key insight:** BGE-small-en-v1.5 silently truncates memories beyond 512 tokens (~400 words). ModernBERT Embed (`nomic-ai/modernbert-embed-base`) provides a 16x context window (8192 tokens), alternating attention for CPU efficiency, and Matryoshka dimensions. Already implemented in candle-transformers. Chunking (#140) handles memories that still exceed the new window. BM25 (#55) provides a complementary retrieval path with no token limit.
-
----
-
-## Phase 5: Audit Logging (completing #52)
-
-**Goal:** Build on the tracing scaffold from Phase 2 to add compliance-ready audit fields.
-
-| Issue | Title | Effort | Depends on |
-|-------|-------|--------|------------|
-| #172 | Complete operational span coverage from #52 | Small | Phase 2 scaffold |
-| #173 | Tiered audit channel infrastructure | Medium | Phase 2 scaffold |
-| #110 | Authenticated user identity in log events | Small | #173 |
-| #111 | Log returned memory names on recall | Small | #173 |
-| #112 | Log auth events | Small | #173 |
-| #117 | Git commit SHA in write operation logs | Small | #173 |
-| #162 | W3C Trace Context propagation | Small | OTLP export |
-
----
-
-## Phase 6: Enterprise & Multi-User
-
-**Goal:** Transform from single-user tool into a multi-user platform.
-
-| Issue | Title | Effort | Depends on |
-|-------|-------|--------|------------|
-| #115 | Authentication & authorization framework | Large | #173 |
-| #116 | Memory scope isolation | Large | #115 |
-| #113 | Log access denied events | Small | #115 |
-| #119 | Enterprise scope hierarchy (org/team/project/user) | Large | #116 |
-| #118 | Production deployment checklist | Medium | #115, #116 |
-
----
-
-## Phase 7: Auth & Platform Polish
-
-**Goal:** Reduce operational burden, expand platform reach. #79 can interleave with any earlier phase.
-
-| Issue | Title | Effort | Depends on |
-|-------|-------|--------|------------|
-| #79 | GitHub App installation token auth | Medium | -- |
-| #42 | Windows: usearch MAP_FAILED | Medium | -- |
-| #56 | Cross-platform vector index (brute-force fallback) | Medium | #42, #94 |
-
-Windows support (#42, #56) is deferred until demand materializes.
-
----
-
-## Future
-
-Items without a phase assignment yet. These will be scheduled as priorities become clear.
-
-| Issue | Title | Category |
-|-------|-------|----------|
-| #129 | Memory consolidation, write discipline, and quality metrics | Quality |
-| #130 | Post-compaction context re-priming hook | Agent UX |
-| #144 | Migrate optional ureq dep from v2 to v3 | Dependencies |
-| #151 | Migration tools for Serena memories and Claude Code auto-memories | Migration |
-| #152 | Container signing with cosign | Security |
-| #153 | CVE scanning gate in CI (Grype/Trivy) | Security |
-| #154 | CLI for manual memory management outside agent sessions | UX |
-| #161 | Revisit candle fork patch when upstream merges | Dependencies |
-
-
----
-
-## Priority Order
-
-```
-Phase 1 (Stabilize)           ████████████████████  Done (v0.6.0/v0.6.1)
-Phase 2 (Tracing + Quality)   ░░░████████░░░░░░░░░░  In progress (5/11 done)
-  #79 (GitHub App Auth)       ░░░░░██░░░░░░░░░░░░░  Interleave anytime
-Phase 3 (Transport/Stdio)     ░░░░░░░███░░░░░░░░░░  After core quality
-Phase 4 (Search/Lifecycle)    ░░░░░░░░░░███░░░░░░░  After transport
-Phase 5 (Audit Logging)       ░░░░░░░░░░░░░██░░░░░  Completing tracing
-Phase 6 (Enterprise)          ░░░░░░░░░░░░░░░████░  Last (largest, most deps)
-Phase 7 (Windows/polish)      ░░░░░░░░░░░░░░░░░░░░  On demand
-```
-
-## /design Workflow
-
-- **Phase 1:** No /design needed -- straightforward bug fixes.
-- **Phase 2+:** Run /design with the phase scope 1-2 sessions before starting. Feed it the phase table plus awareness of downstream phases.
-- After each phase lands, update this document with what changed and design decisions that affect later phases.
+Issues not in the original phases (filed after the roadmap was written) have been assigned to epics based on their value area.
