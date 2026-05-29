@@ -6,20 +6,23 @@ Read all ADRs in `docs/adr/` — they capture binding architectural decisions an
 
 ## Pre-commit
 
-A `.githooks/` hook runs `cargo fmt --check` before every commit. Activate it once per clone:
+A `.githooks/` hook runs several checks before every commit. Activate it once per clone:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-If a commit is rejected, run `cargo fmt` and retry.
+The hook runs four checks in order:
 
-Before every commit, ensure all four pass:
+1. **`cargo fmt --check`** — formatting. If rejected, run `cargo fmt` and retry.
+2. **`cargo clippy -- -D warnings`** — lint. Fix all warnings before committing.
+3. **`cargo doc --no-deps`** — doc warnings (broken intra-doc links, missing public docs). Fix before committing.
+4. **`gitleaks protect --staged`** — secrets scan. Development-time dependency; install separately: <https://github.com/gitleaks/gitleaks>. If not installed, the hook warns and continues — it does not block the commit.
 
-1. `cargo fmt --check`
-2. `cargo clippy -- -D warnings`
-3. `cargo test`
-4. `cargo check --features k8s`
+Before every commit, also ensure these pass (not enforced by the hook):
+
+1. `cargo test`
+2. `cargo check --features k8s`
 
 ## Testing
 
