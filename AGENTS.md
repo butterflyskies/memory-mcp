@@ -1,102 +1,77 @@
 # Agent Instructions
 
-Instructions for AI coding agents working in this repository.
+## Before you start
 
-## Pre-commit hook
+Read all ADRs in `docs/adr/` — they capture binding architectural decisions and constraints. Respect them unless explicitly superseded.
 
-This repo ships a pre-commit hook in `.githooks/` that runs `cargo fmt --check`
-before every commit. Git does not use this directory by default — it must be
-configured once per clone:
+## Pre-commit
+
+A `.githooks/` hook runs `cargo fmt --check` before every commit. Activate it once per clone:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-**Before your first commit, verify the hook is active:**
+If a commit is rejected, run `cargo fmt` and retry.
 
-```sh
-git config core.hooksPath
-```
+Before every commit, ensure all four pass:
 
-If this prints `.githooks`, you're set. If it prints nothing or a different path,
-run the config command above.
-
-The hook prevents formatting issues from reaching CI. If a commit is rejected by
-the hook, run `cargo fmt` and re-commit.
-
-## Pre-commit checklist
-
-Before every commit, ensure:
-
-1. `cargo fmt --check` passes (enforced by hook above)
-2. `cargo clippy -- -D warnings` passes
-3. `cargo test` passes
-4. `cargo check --features k8s` compiles (feature-gated code)
+1. `cargo fmt --check`
+2. `cargo clippy -- -D warnings`
+3. `cargo test`
+4. `cargo check --features k8s`
 
 ## Testing
 
-- `cargo nextest run --workspace --no-fail-fast` for the full suite
-- `cargo nextest run --workspace --no-fail-fast --all-features` before version bumps
-- Production code uses `?` / `.map_err()` — never `.unwrap()`. Tests can `.unwrap()`.
+- Full suite: `cargo nextest run --workspace --no-fail-fast`
+- Before version bumps: add `--all-features`
 - Prefer in-process tests (`tower::ServiceExt::oneshot`) over subprocess tests
 - Use `#[tokio::test(start_paused = true)]` for time-dependent tests
-
-## CI
-
-- semver-checks enforced — breaking changes need a version bump (`cargo semver-checks check-release` to verify locally)
-- Changelog in `CHANGELOG.md` — must cover everything since the last release tag
-- Docs-only changes (markdown, licenses, ADRs) skip CI via path filters
+- Production code uses `?` / `.map_err()` — never `.unwrap()`. Tests can `.unwrap()`.
 
 ## Code style
 
 - `#![warn(missing_docs)]` — all public items need doc comments
-- If a guarantee can live in the type system, put it there — newtypes over primitives, validate at boundaries, use the typed version internally
-- `pub(crate)` by default — only promote to `pub` when external consumers need it
+- Encode guarantees in the type system: newtypes over primitives, validate at boundaries, use typed versions internally
+- `pub(crate)` by default — only `pub` when external consumers need it
 - `#[non_exhaustive]` on public enums and structs with fields
 - `impl Into<String>` for ergonomic constructors
 - No verbose comments in tests — the interface should be legible without them
-- `cargo fmt` before every push
 
 ## Error handling
 
-- Use `MemoryError` variants — `InvalidInput` for user-facing validation, `Internal` for infrastructure failures
+- Use `MemoryError` variants — `InvalidInput` for user-facing validation, `Internal` for infrastructure
 - Propagate with `?`, never panic in production code
-- Tracing: span names follow `module.operation` pattern, no sensitive data in spans (R-17)
+- Tracing: span names follow `module.operation`, no sensitive data in spans (R-17)
 
 ## API surface
 
-- Constructors over public fields — preserves ability to evolve without breaking consumers
-- Run `cargo semver-checks check-release` before any version bump
+- Constructors over public fields — preserves room to evolve without breaking consumers
+- `cargo semver-checks check-release` before any version bump
 - Minimize the surface: fewer `pub` items = fewer commitments
+
+## CI
+
+- semver-checks enforced — breaking changes need a version bump
+- Changelog in `CHANGELOG.md` must cover everything since the last release tag
+- Docs-only changes (markdown, licenses, ADRs) skip CI via path filters
 
 ## Releases
 
-- Maintainer (butterflysky) handles merging and releases
-- Never auto-merge or call `gh pr merge`
+- Maintainer (butterflysky) handles merging and releases — never auto-merge or call `gh pr merge`
 - Stacked PRs: each concern gets its own change, merged in order
 
-## Architecture Decision Records
+## ADRs
 
-### Reading ADRs
-Before starting any implementation work, read all ADRs in `docs/adr/` to understand prior architectural decisions and constraints. These capture the "why" behind design choices and must be respected unless explicitly superseded.
+When making architectural or design decisions, write a new ADR in `docs/adr/` following the existing format and sequential numbering. Capture what was decided, alternatives considered, tradeoffs accepted, and why. Use ADRs for decisions where alternatives were seriously weighed, technology/dependency choices, architectural patterns, or security decisions — not every change needs one.
 
-### Writing ADRs
-When making new architectural or design decisions during implementation, write a new ADR in `docs/adr/` following the existing format and sequential numbering. An ADR should capture:
-- What was decided
-- What alternatives were considered
-- What tradeoffs were accepted
-- Why this choice was made
+## Code review
 
-Not every change needs an ADR — use them for decisions where alternatives were seriously considered, technology/dependency choices, architectural patterns, or security decisions.
+After a PR passes checks (tests, clippy, fmt):
 
-## Code Review
+1. Run `/code-review` on the branch.
+2. Fix all findings (P1, P2, P3).
+3. Re-run review. Repeat fix-then-review up to 5 rounds.
+4. If findings persist after 5 rounds, surface them for human review.
 
-After a PR is ready (tests pass, clippy clean, formatted):
-
-1. If a `code-review` skill exists (check with `/code-review`), use it to review the branch.
-2. **Fix all findings** from the review — every severity level (P1, P2, P3).
-3. After fixing, run the code review again.
-4. Repeat the fix → review cycle until there are **zero remaining findings**, up to **5 rounds**.
-5. If findings persist after 5 rounds, stop and surface the remaining findings for human review.
-
-Code review is a required step before a PR is considered ready for human review.
+Code review is required before a PR is considered ready for human review.
