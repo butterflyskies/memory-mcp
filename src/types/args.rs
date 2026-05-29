@@ -69,6 +69,21 @@ pub struct EditArgs {
     pub scope: Option<String>,
 }
 
+/// Arguments for the `move` tool — relocate a memory between scopes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MoveArgs {
+    /// Exact name of the memory to move.
+    pub name: String,
+    /// Source scope. Defaults to 'global'. Use a bare namespace path like 'my-project' or 'org/team' for scoped memories.
+    #[serde(default)]
+    pub from_scope: Option<String>,
+    /// Destination scope. Required. Use a bare namespace path like 'my-project' or 'org/team', or 'global'.
+    pub to_scope: String,
+    /// Optional new name for the memory in the destination scope. Defaults to the original name.
+    #[serde(default)]
+    pub new_name: Option<String>,
+}
+
 /// Arguments for the `list` tool — browse stored memories.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListArgs {

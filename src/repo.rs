@@ -12,7 +12,7 @@ use crate::{
     auth::AuthProvider,
     error::MemoryError,
     health::SubsystemReporter,
-    types::{ChangedMemories, Memory, PullResult, Scope},
+    types::{ChangedMemories, Memory, MemoryMetadata, MemoryName, PullResult, Scope},
 };
 
 // ---------------------------------------------------------------------------
@@ -279,9 +279,11 @@ impl MemoryRepo {
             let markdown = memory.to_markdown()?;
             arc.write_memory_file(&file_path, markdown.as_bytes())?;
 
-            let oid = arc.git_add_and_commit(
+            let mut index = repo.index()?;
+            arc.stage_add(&mut index, &file_path)?;
+            let oid = arc.commit_index(
                 &repo,
-                &file_path,
+                &mut index,
                 &format!("chore: save memory '{}'", memory.name),
             )?;
 
@@ -320,33 +322,17 @@ impl MemoryRepo {
                 .lock()
                 .expect("lock poisoned — prior panic corrupted state");
 
-            // Check existence and symlink status atomically via symlink_metadata.
-            match std::fs::symlink_metadata(&file_path_clone) {
-                Err(_) => return Err(MemoryError::NotFound { name: name.clone() }),
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(MemoryError::InvalidInput {
-                        reason: format!(
-                            "path '{}' is a symlink, which is not permitted",
-                            file_path_clone.display()
-                        ),
-                    });
-                }
-                Ok(_) => {}
-            }
+            Self::assert_exists_no_symlink(&file_path_clone, &name)?;
 
             std::fs::remove_file(&file_path_clone)?;
-            // git rm equivalent: stage the removal
-            let relative =
-                file_path_clone
-                    .strip_prefix(&arc.root)
-                    .map_err(|e| MemoryError::InvalidInput {
-                        reason: format!("path strip error: {}", e),
-                    })?;
-            let mut index = repo.index()?;
-            index.remove_path(relative)?;
 
-            let message = format!("chore: delete memory '{}'", name);
-            let oid = arc.commit_index(&repo, &mut index, &message)?;
+            let mut index = repo.index()?;
+            arc.stage_remove(&mut index, &file_path_clone)?;
+            let oid = arc.commit_index(
+                &repo,
+                &mut index,
+                &format!("chore: delete memory '{}'", name),
+            )?;
 
             tracing::Span::current().record("oid", oid.to_string().as_str());
             info!(oid = %oid, "memory deleted from repo");
@@ -359,6 +345,113 @@ impl MemoryRepo {
         match &result {
             Ok(_) => self.reporter.report_ok(),
             Err(_) => self.reporter.report_err("delete_memory failed"),
+        }
+        result
+    }
+
+    /// Move a memory from one scope to another in a single git commit.
+    ///
+    /// Reads the source, builds a destination [`Memory`] with a new ID and
+    /// the given name/scope (preserving content, tags, and source hint),
+    /// writes the destination file, removes the source file, stages both
+    /// changes, and commits atomically. If any step fails, the working
+    /// tree is reset to HEAD via `checkout_head --force` so no dirty or
+    /// untracked files are left behind.
+    ///
+    /// Returns the newly created destination [`Memory`] on success.
+    pub async fn move_memory(
+        self: &Arc<Self>,
+        source_name: &str,
+        source_scope: &Scope,
+        dest_name: &MemoryName,
+        dest_scope: &Scope,
+    ) -> Result<Memory, MemoryError> {
+        let source_path = self.memory_path(source_name, source_scope);
+        self.assert_within_root(&source_path)?;
+
+        let dest_path = self.memory_path(dest_name, dest_scope);
+        self.assert_within_root(&dest_path)?;
+
+        let arc = Arc::clone(self);
+        let source_name = source_name.to_string();
+        let dest_name = dest_name.clone();
+        let dest_scope = dest_scope.clone();
+        let span = tracing::info_span!(
+            "repo.move",
+            source_name = %source_name,
+            dest_name = %dest_name,
+            oid = tracing::field::Empty,
+        );
+
+        let result = traced_spawn_blocking(move || -> Result<Memory, MemoryError> {
+            let _enter = span.entered();
+            let repo = arc
+                .inner
+                .lock()
+                .expect("lock poisoned — prior panic corrupted state");
+
+            Self::assert_exists_no_symlink(&source_path, &source_name)?;
+
+            // Read the source memory.
+            let raw = arc.read_memory_file(&source_path)?;
+            let source = Memory::from_markdown(&raw)?;
+
+            // Build destination: new ID, same content/tags/source, new scope/name.
+            let metadata = MemoryMetadata::new(
+                dest_scope,
+                source.metadata.tags.clone(),
+                source.metadata.source.clone(),
+            );
+            let dest = Memory::from_validated(dest_name, source.content.clone(), metadata);
+
+            // Write destination, delete source, stage both, commit.
+            // If anything fails after we start modifying the working tree,
+            // reset hard to HEAD so we never leave dirty/untracked files.
+            let commit_result = (|| -> Result<git2::Oid, MemoryError> {
+                if let Some(parent) = dest_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let markdown = dest.to_markdown()?;
+                arc.write_memory_file(&dest_path, markdown.as_bytes())?;
+                std::fs::remove_file(&source_path)?;
+
+                let mut index = repo.index()?;
+                arc.stage_add(&mut index, &dest_path)?;
+                arc.stage_remove(&mut index, &source_path)?;
+                arc.commit_index(
+                    &repo,
+                    &mut index,
+                    &format!("chore: move memory '{}' → '{}'", source_name, dest.name),
+                )
+            })();
+
+            match commit_result {
+                Ok(oid) => {
+                    tracing::Span::current().record("oid", oid.to_string().as_str());
+                    info!(oid = %oid, "memory moved in repo");
+                    Ok(dest)
+                }
+                Err(e) => {
+                    // Reset working tree + index to HEAD — restores source,
+                    // removes destination, clears staged changes.
+                    let mut checkout = git2::build::CheckoutBuilder::default();
+                    checkout.force();
+                    if let Err(reset_err) = repo.checkout_head(Some(&mut checkout)) {
+                        warn!(
+                            error = %reset_err,
+                            "failed to reset working tree after move failure"
+                        );
+                    }
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .map_err(|e| MemoryError::Join(e.to_string()))?;
+
+        match &result {
+            Ok(_) => self.reporter.report_ok(),
+            Err(_) => self.reporter.report_err("move_memory failed"),
         }
         result
     }
@@ -377,19 +470,7 @@ impl MemoryRepo {
         let span = tracing::debug_span!("repo.read", name = %name);
         let result = traced_spawn_blocking(move || -> Result<Memory, MemoryError> {
             let _enter = span.entered();
-            // Check existence/symlink status before opening.
-            match std::fs::symlink_metadata(&file_path) {
-                Err(_) => return Err(MemoryError::NotFound { name }),
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(MemoryError::InvalidInput {
-                        reason: format!(
-                            "path '{}' is a symlink, which is not permitted",
-                            file_path.display()
-                        ),
-                    });
-                }
-                Ok(_) => {}
-            }
+            Self::assert_exists_no_symlink(&file_path, &name)?;
             let raw = arc.read_memory_file(&file_path)?;
             Memory::from_markdown(&raw)
         })
@@ -1034,24 +1115,48 @@ impl MemoryRepo {
         Ok(oid)
     }
 
-    /// Stage `file_path` and create a commit.
-    fn git_add_and_commit(
-        &self,
-        repo: &Repository,
-        file_path: &Path,
-        message: &str,
-    ) -> Result<git2::Oid, MemoryError> {
+    /// Stage a file addition in the given index.
+    fn stage_add(&self, index: &mut git2::Index, file_path: &Path) -> Result<(), MemoryError> {
         let relative =
             file_path
                 .strip_prefix(&self.root)
                 .map_err(|e| MemoryError::InvalidInput {
                     reason: format!("path strip error: {}", e),
                 })?;
-
-        let mut index = repo.index()?;
         index.add_path(relative)?;
+        Ok(())
+    }
 
-        self.commit_index(repo, &mut index, message)
+    /// Stage a file removal in the given index.
+    fn stage_remove(&self, index: &mut git2::Index, file_path: &Path) -> Result<(), MemoryError> {
+        let relative =
+            file_path
+                .strip_prefix(&self.root)
+                .map_err(|e| MemoryError::InvalidInput {
+                    reason: format!("path strip error: {}", e),
+                })?;
+        index.remove_path(relative)?;
+        Ok(())
+    }
+
+    /// Assert that `path` exists on disk and is not a symlink.
+    ///
+    /// Returns `NotFound` if the file is absent, `InvalidInput` if it is a
+    /// symlink. This is the standard pre-check for operations that read or
+    /// remove an existing memory file.
+    fn assert_exists_no_symlink(path: &Path, name: &str) -> Result<(), MemoryError> {
+        match std::fs::symlink_metadata(path) {
+            Err(_) => Err(MemoryError::NotFound {
+                name: name.to_string(),
+            }),
+            Ok(m) if m.file_type().is_symlink() => Err(MemoryError::InvalidInput {
+                reason: format!(
+                    "path '{}' is a symlink, which is not permitted",
+                    path.display()
+                ),
+            }),
+            Ok(_) => Ok(()),
+        }
     }
 
     /// Assert that `path` remains under `self.root` after canonicalisation,

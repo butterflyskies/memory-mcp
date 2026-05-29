@@ -251,6 +251,12 @@ fn canonical_fields() -> HashSet<&'static str> {
         "oid",
         "token_source",
         "duration_ms",
+        // Move-related fields (handler.move, repo.move)
+        "source_name",
+        "dest_name",
+        "new_name",
+        "from_scope",
+        "to_scope",
         // These are tracing internal / log fields we allow through:
         "message",
         "error",

@@ -1,4 +1,4 @@
-//! Integration tests for the memory repository — save, read, list, pull, delete.
+//! Integration tests for the memory repository — save, read, list, pull, delete, move.
 //!
 //! Uses `AuthProvider::with_token` to inject a known token without needing
 //! real credentials. The `push_pull_with_bare_remote` test exercises the full
@@ -10,7 +10,7 @@ use memory_mcp::auth::AuthProvider;
 #[cfg(unix)]
 use memory_mcp::error::MemoryError;
 use memory_mcp::repo::MemoryRepo;
-use memory_mcp::types::{Memory, MemoryMetadata, PullResult, Scope};
+use memory_mcp::types::{Memory, MemoryMetadata, MemoryName, PullResult, Scope};
 
 /// Full round-trip: init repo → save memory → read it back → list → delete → pull.
 ///
@@ -249,5 +249,111 @@ async fn push_rejected_by_server_hook() {
     assert!(
         msg.contains("refs/heads/main"),
         "rejection should name the rejected ref, got: {msg}",
+    );
+}
+
+/// Move a memory to a different scope with a new name via `repo.move_memory`.
+#[tokio::test]
+async fn move_memory_with_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo =
+        Arc::new(MemoryRepo::init_or_open(tmp.path(), None).expect("should init fresh repo"));
+
+    let from_scope: Scope = "project-a".parse().unwrap();
+    let to_scope: Scope = "project-b".parse().unwrap();
+
+    // Save a memory.
+    let metadata = MemoryMetadata::new(from_scope.clone(), vec!["rename-test".into()], None);
+    let memory = Memory::new("old-name", "Content for rename test.", metadata).unwrap();
+    repo.save_memory(&memory)
+        .await
+        .expect("save should succeed");
+
+    let new_name = MemoryName::new("new-name").unwrap();
+    repo.move_memory("old-name", &from_scope, &new_name, &to_scope)
+        .await
+        .expect("move should succeed");
+
+    // Old name in old scope is gone.
+    assert!(repo.read_memory("old-name", &from_scope).await.is_err());
+
+    // New name in new scope exists with correct content.
+    let loaded = repo
+        .read_memory("new-name", &to_scope)
+        .await
+        .expect("renamed memory should exist");
+    assert_eq!(loaded.content, "Content for rename test.");
+    assert_eq!(loaded.metadata.tags, vec!["rename-test".to_string()]);
+}
+
+/// Exercise `repo.move_memory` directly — single-commit atomicity.
+///
+/// Verifies that after a successful move the source is gone, the
+/// destination exists with correct content, and the git log shows
+/// exactly one new commit (not two).
+#[tokio::test]
+async fn repo_move_memory_atomic_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo =
+        Arc::new(MemoryRepo::init_or_open(tmp.path(), None).expect("should init fresh repo"));
+
+    let from_scope = Scope::Root;
+    let to_scope: Scope = "target-project".parse().unwrap();
+
+    // Save source memory (creates first commit after init).
+    let metadata = MemoryMetadata::new(
+        from_scope.clone(),
+        vec!["atomic".into()],
+        Some("test".into()),
+    );
+    let source = Memory::new("atomic-mem", "Atomic move content.", metadata).unwrap();
+    repo.save_memory(&source)
+        .await
+        .expect("save should succeed");
+
+    // Count commits before move.
+    let pre_move_commits = {
+        let git = git2::Repository::open(tmp.path()).unwrap();
+        let mut revwalk = git.revwalk().unwrap();
+        revwalk.push_head().unwrap();
+        revwalk.count()
+    };
+
+    // Move via the repo method.
+    let dest_name = MemoryName::new("atomic-mem").unwrap();
+    let dest = repo
+        .move_memory("atomic-mem", &from_scope, &dest_name, &to_scope)
+        .await
+        .expect("move should succeed");
+
+    // Returned memory has correct content and metadata.
+    assert_eq!(dest.content, "Atomic move content.");
+    assert_eq!(dest.metadata.tags, vec!["atomic".to_string()]);
+    assert_eq!(dest.metadata.source.as_deref(), Some("test"));
+
+    // Source should be gone.
+    assert!(
+        repo.read_memory("atomic-mem", &from_scope).await.is_err(),
+        "source should be deleted"
+    );
+
+    // Destination should be readable from repo.
+    let loaded = repo
+        .read_memory("atomic-mem", &to_scope)
+        .await
+        .expect("dest should exist");
+    assert_eq!(loaded.content, "Atomic move content.");
+
+    // Exactly one new commit should have been created (the move).
+    let post_move_commits = {
+        let git = git2::Repository::open(tmp.path()).unwrap();
+        let mut revwalk = git.revwalk().unwrap();
+        revwalk.push_head().unwrap();
+        revwalk.count()
+    };
+    assert_eq!(
+        post_move_commits,
+        pre_move_commits + 1,
+        "move should produce exactly one git commit"
     );
 }

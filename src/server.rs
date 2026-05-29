@@ -38,8 +38,9 @@ use crate::{
     repo::{traced_spawn_blocking, MemoryRepo},
     types::{
         parse_qualified_name, AppState, ChangedMemories, EditArgs, ForgetArgs, ListArgs,
-        MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, PullResult, ReadArgs,
-        RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
+        MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, MoveArgs, PullResult,
+        ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, Scope, ScopeFilter,
+        SyncArgs,
     },
 };
 
@@ -711,6 +712,131 @@ impl MemoryServer {
                 "id": memory.id,
                 "name": memory.name,
                 "scope": memory.metadata.scope.to_string(),
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Move a memory from one scope to another, optionally renaming it.
+    ///
+    /// Reads the source memory, creates it in the destination scope (with a
+    /// new name if provided), re-indexes the embedding, then deletes the
+    /// source. Atomic: if the create fails, the source is preserved.
+    ///
+    /// Returns the new memory ID, name, and scope on success.
+    #[tool(
+        name = "move",
+        description = "Move a memory from one scope to another, optionally renaming it. \
+        Reads the source memory (content, tags, metadata), creates it in the destination scope, \
+        re-indexes the embedding, and deletes the original. Atomic: if the create fails, the \
+        source is preserved. Use 'new_name' to rename during the move. Returns the new memory \
+        ID, name, and scope."
+    )]
+    async fn move_memory(
+        &self,
+        Parameters(args): Parameters<MoveArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
+        let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
+        let new_name = match args.new_name {
+            Some(n) => MemoryName::new(n).map_err(ErrorData::from)?,
+            None => name.clone(),
+        };
+        let session_id = extract_session_id(&parts);
+        let span = tracing::info_span!(
+            "handler.move",
+            session_id = %session_id,
+            name = %name,
+            new_name = %new_name,
+            from_scope = ?args.from_scope,
+            to_scope = %args.to_scope,
+        );
+        let state = Arc::clone(&self.state);
+        async move {
+            let from_scope =
+                Scope::parse_or_default(args.from_scope.as_deref()).map_err(ErrorData::from)?;
+            let to_scope =
+                Scope::parse_or_default(Some(&args.to_scope)).map_err(ErrorData::from)?;
+
+            // Reject no-op moves (same scope + same name).
+            if from_scope == to_scope && name == new_name {
+                return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
+                    reason: "source and destination are identical — nothing to move".into(),
+                }));
+            }
+
+            let start = Instant::now();
+
+            // 1. Reject early if the destination already exists.
+            match state.repo.read_memory(&new_name, &to_scope).await {
+                Ok(_) => {
+                    return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
+                        reason: format!(
+                            "destination memory '{}' already exists in scope '{}' — \
+                             rename or delete it first",
+                            new_name, to_scope
+                        ),
+                    }));
+                }
+                Err(crate::error::MemoryError::NotFound { .. }) => {
+                    // Good — destination is clear.
+                }
+                Err(e) => {
+                    return Err(ErrorData::from(e));
+                }
+            }
+
+            // 2. Atomically read source, write destination, delete source
+            //    in one git commit. Must happen before index mutations so a
+            //    failure leaves the index consistent with the repo on disk.
+            let dest = state
+                .repo
+                .move_memory(&name, &from_scope, &new_name, &to_scope)
+                .await
+                .map_err(ErrorData::from)?;
+
+            // 3. Embed the content for the new scope's index entry.
+            let vector = state
+                .embedding
+                .embed_one(&dest.content)
+                .await
+                .map_err(ErrorData::from)?;
+
+            let dest_qualified = dest.mem_ref().qualified_path();
+
+            // 4. Add destination to the vector index.
+            state
+                .index
+                .add(&to_scope, &vector, dest_qualified)
+                .map_err(ErrorData::from)?;
+
+            // 5. Remove the source from the vector index (best-effort — stale
+            //    entries are skipped at recall time).
+            let source_qualified =
+                MemoryRef::new(from_scope.clone(), name.clone()).qualified_path();
+            if let Err(e) = state.index.remove(&from_scope, &source_qualified) {
+                warn!(
+                    name = %name,
+                    error = %e,
+                    "vector removal failed during move; stale source entry will be skipped at recall"
+                );
+            }
+
+            info!(
+                ms = start.elapsed().as_millis(),
+                name = %name,
+                new_name = %new_name,
+                from_scope = %from_scope,
+                to_scope = %to_scope,
+                "memory moved"
+            );
+
+            Ok(serde_json::json!({
+                "id": dest.id,
+                "name": dest.name,
+                "scope": dest.metadata.scope.to_string(),
             })
             .to_string())
         }
