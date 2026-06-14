@@ -34,15 +34,24 @@ use crate::{
     embedding::EmbeddingBackend,
     error::MemoryError,
     index::VectorStore,
-    recall_log::{RecallLog, RecallResult},
+    recall_log::{BatchVerdict, RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
     types::{
-        parse_qualified_name, AppState, ChangedMemories, EditArgs, ForgetArgs, ListArgs,
-        MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, MoveArgs, PullResult,
-        ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, Scope, ScopeFilter,
-        SyncArgs,
+        parse_qualified_name, AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs,
+        ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
+        MoveArgs, PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs,
+        Scope, ScopeFilter, SyncArgs,
     },
 };
+
+/// Owned counterpart of [`BatchVerdict`] for moving into `spawn_blocking`.
+struct OwnedBatchVerdict {
+    recall_id: String,
+    memory_name: String,
+    verdict: String,
+    application_note: Option<String>,
+    confidence: String,
+}
 
 /// MCP server implementation.
 ///
@@ -1228,6 +1237,129 @@ impl MemoryServer {
         .await
     }
 
+    /// Report verdicts for multiple recalled memories in a single call.
+    ///
+    /// Accepts an array of verdict entries and processes them in one database
+    /// transaction. Each entry follows the same semantics as `mark_applied`:
+    /// first call wins per (`recall_id`, `memory_name`, `session_id`) tuple.
+    ///
+    /// Returns per-entry row counts and an aggregate total.
+    #[tool(
+        name = "batch_mark_applied",
+        description = "Report verdicts for multiple recalled memories in a single call. Pass an \
+        array of verdict objects, each with recall_id, memory name, verdict ('applied', 'maybe', \
+        or 'not_applied'), optional application note, and confidence level. Processes all verdicts \
+        in one transaction. Use this instead of calling mark_applied repeatedly — it reduces \
+        round-trips from N calls to 1."
+    )]
+    async fn batch_mark_applied(
+        &self,
+        Parameters(args): Parameters<BatchMarkAppliedArgs>,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<String, ErrorData> {
+        let session_id = extract_session_id(&parts);
+        let count = args.verdicts.len();
+        let span = tracing::info_span!(
+            "handler.batch_mark_applied",
+            session_id = %session_id,
+            count,
+        );
+        let state = Arc::clone(&self.state);
+        async move {
+            if args.verdicts.is_empty() {
+                return Err(ErrorData::from(MemoryError::InvalidInput {
+                    reason: "verdicts array must not be empty".into(),
+                }));
+            }
+
+            // Validate all confidence values up front.
+            for (i, entry) in args.verdicts.iter().enumerate() {
+                match entry.confidence.as_str() {
+                    "high" | "medium" | "low" => {}
+                    other => {
+                        return Err(ErrorData::from(MemoryError::InvalidInput {
+                            reason: format!(
+                                "invalid confidence '{}' at index {}; expected 'high', 'medium', or 'low'",
+                                other, i
+                            ),
+                        }));
+                    }
+                }
+            }
+
+            let total_rows = if let Some(ref log) = state.recall_log {
+                let log = Arc::clone(log);
+                let sid = session_id.clone();
+
+                // Build owned copies directly from the deserialized args so we
+                // can move them into spawn_blocking.
+                let owned: Vec<OwnedBatchVerdict> = args
+                    .verdicts
+                    .iter()
+                    .map(|v| OwnedBatchVerdict {
+                        recall_id: v.recall_id.clone(),
+                        memory_name: v.memory.clone(),
+                        verdict: v.verdict.as_str().to_owned(),
+                        application_note: v.application.clone(),
+                        confidence: v.confidence.clone(),
+                    })
+                    .collect();
+
+                let per_entry = traced_spawn_blocking(move || {
+                    let refs: Vec<BatchVerdict<'_>> = owned
+                        .iter()
+                        .map(|o| BatchVerdict {
+                            recall_id: &o.recall_id,
+                            memory_name: &o.memory_name,
+                            verdict: &o.verdict,
+                            application_note: o.application_note.as_deref(),
+                            confidence: &o.confidence,
+                        })
+                        .collect();
+                    log.batch_mark_applied(&sid, &refs)
+                })
+                .await
+                .map_err(|e| {
+                    ErrorData::from(MemoryError::Internal(format!("spawn_blocking: {e}")))
+                })?
+                .map_err(ErrorData::from)?;
+
+                let total: u64 = per_entry.iter().sum();
+
+                // Warn for entries that matched nothing.
+                for (i, &rows) in per_entry.iter().enumerate() {
+                    if rows == 0 {
+                        warn!(
+                            recall_id = %args.verdicts[i].recall_id,
+                            memory = %args.verdicts[i].memory,
+                            index = i,
+                            "batch_mark_applied entry matched no rows"
+                        );
+                    }
+                }
+
+                info!(
+                    total_rows = total,
+                    entries = per_entry.len(),
+                    "batch_mark_applied"
+                );
+
+                total
+            } else {
+                warn!("batch_mark_applied called but recall log is not enabled");
+                0
+            };
+
+            Ok(serde_json::json!({
+                "total_rows_affected": total_rows,
+                "entries_processed": args.verdicts.len(),
+            })
+            .to_string())
+        }
+        .instrument(span)
+        .await
+    }
+
     /// Return recall precision statistics bucketed by distance range.
     ///
     /// Agents can use this to inspect their own recall quality and adjust
@@ -1314,7 +1446,9 @@ impl ServerHandler for MemoryServer {
             Recall feedback: after acting on recalled memories, call `mark_applied` for each result \
             with your verdict ('applied', 'maybe', or 'not_applied'). Every recall response includes \
             a `recall_id` — pass it back with each verdict. This bidirectional feedback calibrates \
-            recall thresholds. Use `recall_stats` to inspect precision by distance bucket.\n\n\
+            recall thresholds. Use `batch_mark_applied` to submit multiple verdicts in a single call \
+            instead of calling `mark_applied` repeatedly. Use `recall_stats` to inspect precision \
+            by distance bucket.\n\n\
             Breaking change (v0.14.0): the 'project:<name>' scope format is no longer accepted \
             as tool input. If your prompts or configuration pass scope values like \
             'project:my-project', replace them with the bare path: 'my-project'. The 'global' \

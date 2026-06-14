@@ -152,6 +152,30 @@ fn default_confidence() -> String {
     "medium".to_string()
 }
 
+/// A single verdict entry within a [`BatchMarkAppliedArgs`] request.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VerdictEntry {
+    /// The recall_id from the recall response that returned this memory.
+    pub recall_id: String,
+    /// Name of the memory that was (or was not) applied.
+    pub memory: String,
+    /// Agent's assessment of whether the memory was useful: 'applied', 'maybe', or 'not_applied'.
+    pub verdict: Verdict,
+    /// Brief description of how the memory influenced the session.
+    #[serde(default)]
+    pub application: Option<String>,
+    /// Confidence level: "high", "medium", or "low".
+    #[serde(default = "default_confidence")]
+    pub confidence: String,
+}
+
+/// Arguments for the `batch_mark_applied` tool — report multiple memory verdicts in a single call.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchMarkAppliedArgs {
+    /// Array of verdict entries, each containing a recall_id, memory name, verdict, and optional metadata.
+    pub verdicts: Vec<VerdictEntry>,
+}
+
 /// Arguments for the `sync` tool — push/pull the git remote.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SyncArgs {
@@ -277,5 +301,141 @@ impl AppState {
             health,
             recall_log,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Wire-contract tests — assert the JSON schema shape that MCP clients see.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn batch_mark_applied_schema_has_verdicts_array() {
+        let schema = schemars::schema_for!(BatchMarkAppliedArgs);
+        let root = serde_json::to_value(&schema).unwrap();
+
+        let props = root["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("verdicts"),
+            "schema must expose a 'verdicts' property"
+        );
+
+        let required = root["required"].as_array().unwrap();
+        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            required_strs.contains(&"verdicts"),
+            "'verdicts' must be required"
+        );
+    }
+
+    #[test]
+    fn verdict_entry_schema_has_required_fields() {
+        let schema = schemars::schema_for!(VerdictEntry);
+        let root = serde_json::to_value(&schema).unwrap();
+
+        let props = root["properties"].as_object().unwrap();
+        for field in &["recall_id", "memory", "verdict"] {
+            assert!(
+                props.contains_key(*field),
+                "VerdictEntry schema must contain '{field}'"
+            );
+        }
+
+        let required = root["required"].as_array().unwrap();
+        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        for field in &["recall_id", "memory", "verdict"] {
+            assert!(
+                required_strs.contains(field),
+                "'{field}' must be required in VerdictEntry"
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_entry_optional_fields_not_required() {
+        let schema = schemars::schema_for!(VerdictEntry);
+        let root = serde_json::to_value(&schema).unwrap();
+
+        let required = root["required"].as_array().unwrap();
+        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            !required_strs.contains(&"application"),
+            "'application' must not be required"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deserialization round-trip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn batch_mark_applied_deserializes_minimal() {
+        let json = r#"{
+            "verdicts": [
+                { "recall_id": "r_abc", "memory": "foo", "verdict": "applied" }
+            ]
+        }"#;
+        let args: BatchMarkAppliedArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.verdicts.len(), 1);
+        assert_eq!(args.verdicts[0].recall_id, "r_abc");
+        assert_eq!(args.verdicts[0].memory, "foo");
+        assert_eq!(args.verdicts[0].verdict, Verdict::Applied);
+        assert_eq!(args.verdicts[0].confidence, "medium");
+        assert!(args.verdicts[0].application.is_none());
+    }
+
+    #[test]
+    fn batch_mark_applied_deserializes_full() {
+        let json = r#"{
+            "verdicts": [
+                {
+                    "recall_id": "r_1",
+                    "memory": "m1",
+                    "verdict": "applied",
+                    "application": "used for greeting",
+                    "confidence": "high"
+                },
+                {
+                    "recall_id": "r_2",
+                    "memory": "m2",
+                    "verdict": "not_applied",
+                    "confidence": "low"
+                },
+                {
+                    "recall_id": "r_3",
+                    "memory": "m3",
+                    "verdict": "maybe"
+                }
+            ]
+        }"#;
+        let args: BatchMarkAppliedArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.verdicts.len(), 3);
+        assert_eq!(args.verdicts[0].verdict, Verdict::Applied);
+        assert_eq!(args.verdicts[0].confidence, "high");
+        assert_eq!(
+            args.verdicts[0].application.as_deref(),
+            Some("used for greeting")
+        );
+        assert_eq!(args.verdicts[1].verdict, Verdict::NotApplied);
+        assert_eq!(args.verdicts[1].confidence, "low");
+        assert_eq!(args.verdicts[2].verdict, Verdict::Maybe);
+        assert_eq!(args.verdicts[2].confidence, "medium");
+    }
+
+    #[test]
+    fn batch_mark_applied_rejects_empty_json() {
+        let json = r#"{}"#;
+        let result: Result<BatchMarkAppliedArgs, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "missing 'verdicts' should fail");
+    }
+
+    #[test]
+    fn verdict_entry_rejects_invalid_verdict() {
+        let json = r#"{ "recall_id": "r_1", "memory": "m1", "verdict": "bogus" }"#;
+        let result: Result<VerdictEntry, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "invalid verdict variant should fail");
     }
 }
