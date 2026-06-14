@@ -10,9 +10,9 @@ mod validated;
 // re-exported as `pub(crate)`.
 
 pub use args::{
-    AppState, ChangedMemories, EditArgs, ForgetArgs, ListArgs, MarkAppliedArgs, MoveArgs,
-    PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, SyncArgs,
-    Verdict,
+    AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs, ForgetArgs, ListArgs,
+    MarkAppliedArgs, MoveArgs, PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats,
+    RememberArgs, SyncArgs, Verdict, VerdictEntry,
 };
 
 pub use memory::{parse_qualified_name, Memory, MemoryMetadata, MemoryName, MemoryRef};

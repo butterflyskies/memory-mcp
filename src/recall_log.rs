@@ -168,6 +168,52 @@ impl RecallLog {
         Ok(rows as u64)
     }
 
+    /// Mark multiple recall events with agent verdicts in a single transaction.
+    ///
+    /// Each entry in `verdicts` is applied via the same `UPDATE` logic as
+    /// [`mark_applied`](Self::mark_applied): rows matching (`recall_id`,
+    /// `memory_name`, `session_id`) where `was_applied IS NULL` are updated
+    /// (first call wins). Returns a `Vec<u64>` with one element per input
+    /// entry — the number of rows affected by that verdict.
+    pub fn batch_mark_applied(
+        &self,
+        session_id: &str,
+        verdicts: &[BatchVerdict<'_>],
+    ) -> Result<Vec<u64>, MemoryError> {
+        let conn = self.conn()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| MemoryError::Internal(format!("recall log batch tx: {e}")))?;
+        let mut results = Vec::with_capacity(verdicts.len());
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE recall_events \
+                     SET was_applied = ?1, application_note = ?2, confidence = ?3 \
+                     WHERE recall_id = ?4 AND memory_name = ?5 AND session_id = ?6 AND was_applied IS NULL",
+                )
+                .map_err(|e| MemoryError::Internal(format!("recall log batch prepare: {e}")))?;
+            for v in verdicts {
+                let rows = stmt
+                    .execute(rusqlite::params![
+                        v.verdict,
+                        v.application_note,
+                        v.confidence,
+                        v.recall_id,
+                        v.memory_name,
+                        session_id
+                    ])
+                    .map_err(|e| {
+                        MemoryError::Internal(format!("recall log batch mark_applied: {e}"))
+                    })?;
+                results.push(rows as u64);
+            }
+        }
+        tx.commit()
+            .map_err(|e| MemoryError::Internal(format!("recall log batch commit: {e}")))?;
+        Ok(results)
+    }
+
     /// Mark all unread recall events for a given session and memory as read.
     ///
     /// Sets `was_read = 1` for every matching row where it was still `0`.
@@ -252,6 +298,20 @@ impl RecallLog {
 
         Ok(buckets)
     }
+}
+
+/// A single verdict for batch application.
+pub struct BatchVerdict<'a> {
+    /// The recall_id to match.
+    pub recall_id: &'a str,
+    /// Memory name to match.
+    pub memory_name: &'a str,
+    /// Verdict string: `"applied"`, `"maybe"`, or `"not_applied"`.
+    pub verdict: &'a str,
+    /// Optional note about how the memory was used.
+    pub application_note: Option<&'a str>,
+    /// Confidence level: `"high"`, `"medium"`, or `"low"`.
+    pub confidence: &'a str,
 }
 
 /// A single recall result for logging purposes.
@@ -668,5 +728,309 @@ mod tests {
         assert_eq!(Verdict::Applied.as_str(), "applied");
         assert_eq!(Verdict::Maybe.as_str(), "maybe");
         assert_eq!(Verdict::NotApplied.as_str(), "not_applied");
+    }
+
+    #[test]
+    fn batch_mark_applied_processes_all_verdicts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recall_log.sqlite");
+        let log = RecallLog::open(&path, Duration::from_secs(5)).unwrap();
+
+        let recall_id = RecallLog::generate_recall_id();
+        let results = vec![
+            RecallResult {
+                memory_name: "m1".to_string(),
+                scope: "global".to_string(),
+                rank: 0,
+                distance: 0.1,
+            },
+            RecallResult {
+                memory_name: "m2".to_string(),
+                scope: "global".to_string(),
+                rank: 1,
+                distance: 0.2,
+            },
+            RecallResult {
+                memory_name: "m3".to_string(),
+                scope: "global".to_string(),
+                rank: 2,
+                distance: 0.3,
+            },
+        ];
+        log.log_results(&recall_id, "sess-batch", &results).unwrap();
+
+        let verdicts = vec![
+            BatchVerdict {
+                recall_id: &recall_id,
+                memory_name: "m1",
+                verdict: "applied",
+                application_note: Some("used for init"),
+                confidence: "high",
+            },
+            BatchVerdict {
+                recall_id: &recall_id,
+                memory_name: "m2",
+                verdict: "maybe",
+                application_note: None,
+                confidence: "medium",
+            },
+            BatchVerdict {
+                recall_id: &recall_id,
+                memory_name: "m3",
+                verdict: "not_applied",
+                application_note: Some("noise"),
+                confidence: "low",
+            },
+        ];
+
+        let per_entry = log.batch_mark_applied("sess-batch", &verdicts).unwrap();
+        assert_eq!(per_entry, vec![1, 1, 1]);
+
+        let conn = log.conn().unwrap();
+        let verdict_m1: String = conn
+            .query_row(
+                "SELECT was_applied FROM recall_events WHERE recall_id = ?1 AND memory_name = 'm1'",
+                [&recall_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict_m1, "applied");
+
+        let verdict_m2: String = conn
+            .query_row(
+                "SELECT was_applied FROM recall_events WHERE recall_id = ?1 AND memory_name = 'm2'",
+                [&recall_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict_m2, "maybe");
+
+        let verdict_m3: String = conn
+            .query_row(
+                "SELECT was_applied FROM recall_events WHERE recall_id = ?1 AND memory_name = 'm3'",
+                [&recall_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict_m3, "not_applied");
+    }
+
+    #[test]
+    fn batch_mark_applied_empty_returns_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recall_log.sqlite");
+        let log = RecallLog::open(&path, Duration::from_secs(5)).unwrap();
+
+        let per_entry = log.batch_mark_applied("sess", &[]).unwrap();
+        assert!(per_entry.is_empty());
+    }
+
+    #[test]
+    fn batch_mark_applied_no_match_returns_zeros() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recall_log.sqlite");
+        let log = RecallLog::open(&path, Duration::from_secs(5)).unwrap();
+
+        let verdicts = vec![
+            BatchVerdict {
+                recall_id: "no-id",
+                memory_name: "no-mem",
+                verdict: "applied",
+                application_note: None,
+                confidence: "high",
+            },
+            BatchVerdict {
+                recall_id: "no-id-2",
+                memory_name: "no-mem-2",
+                verdict: "maybe",
+                application_note: None,
+                confidence: "low",
+            },
+        ];
+
+        let per_entry = log.batch_mark_applied("no-sess", &verdicts).unwrap();
+        assert_eq!(per_entry, vec![0, 0]);
+    }
+
+    #[test]
+    fn batch_mark_applied_idempotent_first_call_wins() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recall_log.sqlite");
+        let log = RecallLog::open(&path, Duration::from_secs(5)).unwrap();
+
+        let recall_id = RecallLog::generate_recall_id();
+        let results = vec![RecallResult {
+            memory_name: "idem".to_string(),
+            scope: "global".to_string(),
+            rank: 0,
+            distance: 0.2,
+        }];
+        log.log_results(&recall_id, "sess", &results).unwrap();
+
+        let verdicts_first = vec![BatchVerdict {
+            recall_id: &recall_id,
+            memory_name: "idem",
+            verdict: "applied",
+            application_note: Some("first"),
+            confidence: "high",
+        }];
+        let per_entry = log.batch_mark_applied("sess", &verdicts_first).unwrap();
+        assert_eq!(per_entry, vec![1]);
+
+        let verdicts_second = vec![BatchVerdict {
+            recall_id: &recall_id,
+            memory_name: "idem",
+            verdict: "not_applied",
+            application_note: Some("second"),
+            confidence: "low",
+        }];
+        let per_entry2 = log.batch_mark_applied("sess", &verdicts_second).unwrap();
+        assert_eq!(per_entry2, vec![0], "second call must be a no-op");
+
+        let conn = log.conn().unwrap();
+        let verdict: String = conn
+            .query_row(
+                "SELECT was_applied FROM recall_events WHERE recall_id = ?1 AND memory_name = 'idem'",
+                [&recall_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict, "applied", "first verdict must be preserved");
+    }
+
+    #[test]
+    fn batch_mark_applied_mixed_recall_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recall_log.sqlite");
+        let log = RecallLog::open(&path, Duration::from_secs(5)).unwrap();
+
+        let recall_id_a = RecallLog::generate_recall_id();
+        let recall_id_b = RecallLog::generate_recall_id();
+
+        log.log_results(
+            &recall_id_a,
+            "sess",
+            &[RecallResult {
+                memory_name: "ma".to_string(),
+                scope: "global".to_string(),
+                rank: 0,
+                distance: 0.1,
+            }],
+        )
+        .unwrap();
+        log.log_results(
+            &recall_id_b,
+            "sess",
+            &[RecallResult {
+                memory_name: "mb".to_string(),
+                scope: "global".to_string(),
+                rank: 0,
+                distance: 0.2,
+            }],
+        )
+        .unwrap();
+
+        let verdicts = vec![
+            BatchVerdict {
+                recall_id: &recall_id_a,
+                memory_name: "ma",
+                verdict: "applied",
+                application_note: None,
+                confidence: "high",
+            },
+            BatchVerdict {
+                recall_id: &recall_id_b,
+                memory_name: "mb",
+                verdict: "not_applied",
+                application_note: None,
+                confidence: "medium",
+            },
+        ];
+
+        let per_entry = log.batch_mark_applied("sess", &verdicts).unwrap();
+        assert_eq!(per_entry, vec![1, 1]);
+
+        let conn = log.conn().unwrap();
+        let va: String = conn
+            .query_row(
+                "SELECT was_applied FROM recall_events WHERE recall_id = ?1 AND memory_name = 'ma'",
+                [&recall_id_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(va, "applied");
+
+        let vb: String = conn
+            .query_row(
+                "SELECT was_applied FROM recall_events WHERE recall_id = ?1 AND memory_name = 'mb'",
+                [&recall_id_b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vb, "not_applied");
+    }
+
+    #[test]
+    fn batch_mark_applied_reflects_in_recall_stats() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recall_log.sqlite");
+        let log = RecallLog::open(&path, Duration::from_secs(5)).unwrap();
+
+        let recall_id = RecallLog::generate_recall_id();
+        let results = vec![
+            RecallResult {
+                memory_name: "s1".to_string(),
+                scope: "global".to_string(),
+                rank: 0,
+                distance: 0.15,
+            },
+            RecallResult {
+                memory_name: "s2".to_string(),
+                scope: "global".to_string(),
+                rank: 1,
+                distance: 0.15,
+            },
+            RecallResult {
+                memory_name: "s3".to_string(),
+                scope: "global".to_string(),
+                rank: 2,
+                distance: 0.15,
+            },
+        ];
+        log.log_results(&recall_id, "sess", &results).unwrap();
+
+        let verdicts = vec![
+            BatchVerdict {
+                recall_id: &recall_id,
+                memory_name: "s1",
+                verdict: "applied",
+                application_note: None,
+                confidence: "high",
+            },
+            BatchVerdict {
+                recall_id: &recall_id,
+                memory_name: "s2",
+                verdict: "maybe",
+                application_note: None,
+                confidence: "medium",
+            },
+            BatchVerdict {
+                recall_id: &recall_id,
+                memory_name: "s3",
+                verdict: "not_applied",
+                application_note: None,
+                confidence: "low",
+            },
+        ];
+        log.batch_mark_applied("sess", &verdicts).unwrap();
+
+        let stats = log.recall_stats().unwrap();
+        // distance 0.15 -> bucket 3 [0.15, 0.20)
+        let bucket = &stats[3];
+        assert_eq!(bucket.total, 3);
+        assert_eq!(bucket.applied, 1);
+        assert_eq!(bucket.maybe, 1);
+        assert_eq!(bucket.not_applied, 1);
+        assert_eq!(bucket.unknown, 0);
     }
 }
