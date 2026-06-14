@@ -122,7 +122,7 @@ impl RecallLog {
                     session_id,
                     r.memory_name,
                     r.scope,
-                    r.rank,
+                    r.rank as i64,
                     r.distance
                 ])
                 .map_err(|e| MemoryError::Internal(format!("recall log insert: {e}")))?;
@@ -274,11 +274,11 @@ impl RecallLog {
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)? as usize,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
-                    row.get::<_, u64>(4)?,
-                    row.get::<_, u64>(5)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)? as u64,
+                    row.get::<_, i64>(5)? as u64,
                 ))
             })
             .map_err(|e| MemoryError::Internal(format!("recall_stats query: {e}")))?;
