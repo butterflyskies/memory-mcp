@@ -1290,28 +1290,18 @@ impl MemoryServer {
             let total_rows = if let Some(ref log) = state.recall_log {
                 let log = Arc::clone(log);
                 let sid = session_id.clone();
-                let verdicts: Vec<_> = args
+
+                // Build owned copies directly from the deserialized args so we
+                // can move them into spawn_blocking.
+                let owned: Vec<OwnedBatchVerdict> = args
                     .verdicts
                     .iter()
-                    .map(|v| BatchVerdict {
-                        recall_id: &v.recall_id,
-                        memory_name: &v.memory,
-                        verdict: v.verdict.as_str(),
-                        application_note: v.application.as_deref(),
-                        confidence: &v.confidence,
-                    })
-                    .collect();
-
-                // The BatchVerdict borrows from args.verdicts, so we must build
-                // owned copies before moving into spawn_blocking.
-                let owned: Vec<OwnedBatchVerdict> = verdicts
-                    .iter()
                     .map(|v| OwnedBatchVerdict {
-                        recall_id: v.recall_id.to_owned(),
-                        memory_name: v.memory_name.to_owned(),
-                        verdict: v.verdict.to_owned(),
-                        application_note: v.application_note.map(|s| s.to_owned()),
-                        confidence: v.confidence.to_owned(),
+                        recall_id: v.recall_id.clone(),
+                        memory_name: v.memory.clone(),
+                        verdict: v.verdict.as_str().to_owned(),
+                        application_note: v.application.clone(),
+                        confidence: v.confidence.clone(),
                     })
                     .collect();
 
