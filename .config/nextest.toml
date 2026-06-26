@@ -1,0 +1,6 @@
+[test-groups.embedding]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "test(candle_embedding::) | test(auth::memory_mcp_bind)"
+test-group = "embedding"
