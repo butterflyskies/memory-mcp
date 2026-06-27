@@ -324,7 +324,12 @@ async fn memory_mcp_bind_env_var_sets_listen_address() {
     let client = reqwest::Client::new();
     let healthz_url = format!("http://{bind}/healthz");
     let mut ready = false;
-    for _ in 0..100 {
+    // The server loads the embedding model synchronously before binding the
+    // HTTP listener, so /healthz is unreachable until model load completes. On
+    // a cold HuggingFace cache that includes downloading ~130 MB, which can take
+    // tens of seconds on a loaded CI runner. Budget 60s to match the embedding
+    // integration tests' TEST_TIMEOUT.
+    for _ in 0..600 {
         if let Ok(resp) = client.get(&healthz_url).send().await {
             if resp.status().is_success() {
                 ready = true;
