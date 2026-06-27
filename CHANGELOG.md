@@ -1,3 +1,21 @@
+## [0.15.0] - 2026-06-26
+
+### Added
+
+- `move` MCP tool — relocate memories between scopes, preserving content and metadata (#268)
+- `batch_mark_applied` MCP tool — submit multiple recall verdicts in a single call for multi-verdict recall feedback (#279)
+
+### Changed
+
+- Consolidate agent instructions into AGENTS.md (#269)
+- Remove private repo references from ROADMAP.md (#263)
+
+### Dependencies
+
+- Bump the rust-dependencies group with 2 updates (#265)
+- Bump the actions group with 7 updates (#264)
+- Batch dependabot dependency updates (#280)
+
 ## [0.14.0] - 2026-05-25
 
 ### Breaking
