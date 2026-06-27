@@ -2,5 +2,5 @@
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "test(candle_embedding::) | test(auth::memory_mcp_bind)"
+filter = "binary(candle_embedding) | (binary(auth) & test(memory_mcp_bind))"
 test-group = "embedding"
