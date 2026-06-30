@@ -58,14 +58,12 @@ impl Config {
             ))
         })?;
         for mapping in &config.remotes {
-            ScopePath::new(&mapping.scope).map_err(|_| {
-                MemoryError::InvalidInput {
-                    reason: format!(
-                        "invalid scope '{}' in config file {}",
-                        mapping.scope,
-                        path.display()
-                    ),
-                }
+            ScopePath::new(&mapping.scope).map_err(|_| MemoryError::InvalidInput {
+                reason: format!(
+                    "invalid scope '{}' in config file {}",
+                    mapping.scope,
+                    path.display()
+                ),
             })?;
         }
         info!(
