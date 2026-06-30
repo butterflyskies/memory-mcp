@@ -10,6 +10,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::error::MemoryError;
+use crate::types::ScopePath;
 
 /// A single scope-to-repo mapping from the config file.
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +57,17 @@ impl Config {
                 e
             ))
         })?;
+        for mapping in &config.remotes {
+            ScopePath::new(&mapping.scope).map_err(|_| {
+                MemoryError::InvalidInput {
+                    reason: format!(
+                        "invalid scope '{}' in config file {}",
+                        mapping.scope,
+                        path.display()
+                    ),
+                }
+            })?;
+        }
         info!(
             path = %path.display(),
             remotes = config.remotes.len(),

@@ -1030,11 +1030,7 @@ impl MemoryServer {
             let mut any_reindex = false;
             for entry in &sync_result.results {
                 if let Some(ref changes) = entry.changes {
-                    let repo = state.router.repo(&if entry.label == "default" {
-                        Scope::Root
-                    } else {
-                        Scope::parse_or_default(Some(&entry.label)).unwrap_or(Scope::Root)
-                    });
+                    let repo = state.router.repo(&entry.scope);
                     let stats = incremental_reindex(
                         repo,
                         state.embedding.as_ref(),

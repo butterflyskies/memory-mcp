@@ -53,6 +53,8 @@ pub struct MultiSyncResult {
 pub struct SyncEntry {
     /// Human-readable label (`"default"` or the scope prefix).
     pub label: String,
+    /// The scope used to resolve this repo (for reindex routing).
+    pub scope: Scope,
     /// Pull result, if pull was performed.
     pub pull: Option<PullResult>,
     /// Whether push succeeded.
@@ -158,11 +160,14 @@ impl RepoRouter {
     }
 
     /// Iterate over all repos (default + scope-mapped).
-    fn all_repos(&self) -> impl Iterator<Item = (&str, &Arc<MemoryRepo>, Option<&str>)> {
-        std::iter::once(("default", &self.default_repo, None)).chain(
-            self.routes
-                .iter()
-                .map(|r| (r.prefix.as_str(), &r.repo, r.branch.as_deref())),
+    fn all_repos(&self) -> impl Iterator<Item = (&str, &Arc<MemoryRepo>, Option<&str>, Scope)> {
+        std::iter::once(("default", &self.default_repo, None, Scope::Root)).chain(
+            self.routes.iter().map(|r| {
+                let scope = crate::types::ScopePath::new(&r.prefix)
+                    .map(Scope::Path)
+                    .unwrap_or(Scope::Root);
+                (r.prefix.as_str(), &r.repo, r.branch.as_deref(), scope)
+            }),
         )
     }
 
@@ -218,8 +223,9 @@ impl RepoRouter {
                 warn!(
                     error = %e,
                     source = %source_name,
-                    "cross-repo move: failed to delete source after successful save to destination"
+                    "cross-repo move: failed to delete source after successful save to destination — data exists in both repos"
                 );
+                return Err(e);
             }
             Ok(dest)
         }
@@ -264,10 +270,11 @@ impl RepoRouter {
     ) -> Result<MultiSyncResult, MemoryError> {
         let mut result = MultiSyncResult::default();
 
-        for (label, repo, branch_override) in self.all_repos() {
+        for (label, repo, branch_override, scope) in self.all_repos() {
             let branch = branch_override.unwrap_or(default_branch);
             let mut entry = SyncEntry {
                 label: label.to_string(),
+                scope,
                 pull: None,
                 push_ok: false,
                 changes: None,
