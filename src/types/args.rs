@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::{
     auth::AuthProvider, embedding::EmbeddingBackend, health::HealthRegistry, index::VectorStore,
-    repo::MemoryRepo,
+    repo::MemoryRepo, repo_router::RepoRouter,
 };
 
 pub(crate) const LIST_MAX_LIMIT: usize = 100;
@@ -384,8 +384,10 @@ pub struct ReindexStats {
 /// wrapped in its own `Arc` so it can be cloned into `spawn_blocking` closures.
 #[non_exhaustive]
 pub struct AppState {
-    /// Git-backed memory repository.
+    /// Git-backed memory repository (default repo, for backward compat).
     pub repo: Arc<MemoryRepo>,
+    /// Routes memory operations to scope-specific repos when configured.
+    pub router: RepoRouter,
     /// Backend used to compute text embeddings.
     pub embedding: Box<dyn EmbeddingBackend>,
     /// In-memory vector index for semantic search (scope-partitioned).
@@ -413,8 +415,33 @@ impl AppState {
         health: HealthRegistry,
         recall_log: Option<Arc<crate::recall_log::RecallLog>>,
     ) -> Self {
+        let router = RepoRouter::single(Arc::clone(&repo));
         Self {
             repo,
+            router,
+            embedding,
+            index,
+            auth,
+            branch,
+            health,
+            recall_log,
+        }
+    }
+
+    /// Create a new application state with a pre-built repo router.
+    pub fn with_router(
+        repo: Arc<MemoryRepo>,
+        router: RepoRouter,
+        branch: String,
+        embedding: Box<dyn EmbeddingBackend>,
+        index: Box<dyn VectorStore>,
+        auth: AuthProvider,
+        health: HealthRegistry,
+        recall_log: Option<Arc<crate::recall_log::RecallLog>>,
+    ) -> Self {
+        Self {
+            repo,
+            router,
             embedding,
             index,
             // Constructed here rather than injected: creation is infallible

@@ -866,7 +866,7 @@ impl MemoryServer {
             let start = Instant::now();
             let unit_state = Arc::clone(&state);
             let memory = shielded_mutation_unit(&state.lexical, async move {
-                unit_state.repo.save_memory(&memory).await?;
+                unit_state.router.save_memory(&memory).await?;
                 info!(repo_ms = start.elapsed().as_millis(), "saved to repo");
 
                 // Mirror into the lexical index after git truth is durable,
@@ -1004,7 +1004,7 @@ impl MemoryServer {
                 };
 
                 // Read the memory; if it was deleted but still in the index, skip it.
-                let memory = match state.repo.read_memory(&mref.name, &mref.scope).await {
+                let memory = match state.router.read_memory(&mref.name, &mref.scope).await {
                     Ok(m) => m,
                     Err(e) => {
                         warn!(
@@ -1097,7 +1097,10 @@ impl MemoryServer {
             shielded_mutation_unit(&state.lexical, async move {
                 // Delete from repo first — if this fails, index is untouched,
                 // memory stays functional.
-                unit_state.repo.delete_memory(&unit_name, &scope).await?;
+                unit_state
+                    .router
+                    .delete_memory(&unit_name, &scope)
+                    .await?;
 
                 // Remove from index (best-effort — stale entries are skipped at recall time).
                 let qualified_name =
@@ -1188,7 +1191,7 @@ impl MemoryServer {
             // Read the existing memory.
             timing.stage = "read";
             let stage_start = Instant::now();
-            let read_result = state.repo.read_memory(&name, &scope).await;
+            let read_result = state.router.read_memory(&name, &scope).await;
             timing.read_ms = elapsed_ms(stage_start);
             let mut memory = read_result.map_err(ErrorData::from)?;
 
@@ -1228,7 +1231,7 @@ impl MemoryServer {
             let unit_state = Arc::clone(&state);
             let (memory, mut timing) = shielded_mutation_unit(&state.lexical, async move {
                 let stage_start = Instant::now();
-                let save_result = unit_state.repo.save_memory(&memory).await;
+                let save_result = unit_state.router.save_memory(&memory).await;
                 timing.repo_save_ms = elapsed_ms(stage_start);
                 save_result?;
 
@@ -1333,7 +1336,7 @@ impl MemoryServer {
             let start = Instant::now();
 
             // 1. Reject early if the destination already exists.
-            match state.repo.read_memory(&new_name, &to_scope).await {
+            match state.router.read_memory(&new_name, &to_scope).await {
                 Ok(_) => {
                     return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
                         reason: format!(
@@ -1367,7 +1370,7 @@ impl MemoryServer {
                 //    in one git commit. Must happen before index mutations so a
                 //    failure leaves the index consistent with the repo on disk.
                 let dest = unit_state
-                    .repo
+                    .router
                     .move_memory(&unit_name, &unit_from_scope, &unit_new_name, &unit_to_scope)
                     .await?;
 
@@ -1488,24 +1491,24 @@ impl MemoryServer {
             let start = Instant::now();
             let memories = match &scope_filter {
                 ScopeFilter::RootOnly => state
-                    .repo
+                    .router
                     .list_memories(Some(&Scope::Root))
                     .await
                     .map_err(ErrorData::from)?,
                 ScopeFilter::All => state
-                    .repo
+                    .router
                     .list_memories(None)
                     .await
                     .map_err(ErrorData::from)?,
                 ScopeFilter::Subtree(sp) => {
                     let path_scope = Scope::Path(sp.clone());
                     let mut root_memories = state
-                        .repo
+                        .router
                         .list_memories(Some(&Scope::Root))
                         .await
                         .map_err(ErrorData::from)?;
                     let path_memories = state
-                        .repo
+                        .router
                         .list_memories(Some(&path_scope))
                         .await
                         .map_err(ErrorData::from)?;
@@ -1551,7 +1554,7 @@ impl MemoryServer {
 
             let start = Instant::now();
             let memory = state
-                .repo
+                .router
                 .read_memory(&name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
@@ -1606,76 +1609,78 @@ impl MemoryServer {
             let start = Instant::now();
             let branch = &state.branch;
 
-            // Track whether origin is configured at all so we can skip push
-            // for local-only deployments that have no remote.
-            let mut has_remote = true;
+            let sync_result = state
+                .router
+                .sync_all(&state.auth, branch, pull_first)
+                .await
+                .map_err(ErrorData::from)?;
 
-            let mut reindex_stats: Option<ReindexStats> = None;
-
-            let pull_status = if pull_first {
-                // Pull + incremental reindex run as one cancellation-shielded
-                // unit: cancelling this request can no longer land the pull's
-                // git commits while stranding the reindex that mirrors them
-                // into the vector and lexical indexes (#310, ADR-0039).
-                let unit_state = Arc::clone(&state);
-                let (status, unit_reindex_stats, unit_has_remote) =
-                    shielded_mutation_unit(&state.lexical, async move {
-                        let branch = &unit_state.branch;
-                        let mut has_remote = true;
-                        let mut reindex_stats: Option<ReindexStats> = None;
-
-                        let result = unit_state.repo.pull(&unit_state.auth, branch).await?;
-
-                        let mut oid_range: Option<([u8; 20], [u8; 20])> = None;
-                        let status = match result {
-                            PullResult::NoRemote => {
-                                has_remote = false;
-                                "no-remote".to_string()
-                            }
-                            PullResult::UpToDate => "up-to-date".to_string(),
-                            PullResult::FastForward { old_head, new_head } => {
-                                oid_range = Some((old_head, new_head));
-                                "fast-forward".to_string()
-                            }
-                            PullResult::Merged {
-                                conflicts_resolved,
-                                old_head,
-                                new_head,
-                            } => {
-                                oid_range = Some((old_head, new_head));
-                                format!("merged ({} conflicts resolved)", conflicts_resolved)
-                            }
-                        };
-
-                        if let Some((old_head, new_head)) = oid_range {
-                            // Complete-or-degraded: the pull has already
-                            // moved git truth, so `mirror_pulled_changes`
-                            // owns flagging the lexical index and scheduling
-                            // repair for every preparation failure before
-                            // propagating the error (#314).
-                            reindex_stats =
-                                mirror_pulled_changes(&unit_state, old_head, new_head).await?;
-                        }
-
-                        Ok((status, reindex_stats, has_remote))
-                    })
-                    .await
-                    .map_err(ErrorData::from)?;
-
-                reindex_stats = unit_reindex_stats;
-                has_remote = unit_has_remote;
-                status
-            } else {
-                "skipped".to_string()
-            };
-
-            if has_remote {
-                state
-                    .repo
-                    .push(&state.auth, branch)
-                    .await
-                    .map_err(ErrorData::from)?;
+            // Incremental reindex for any repos that had changes.
+            let mut total_reindex = ReindexStats::default();
+            let mut any_reindex = false;
+            for entry in &sync_result.results {
+                if let Some(ref changes) = entry.changes {
+                    let repo = state.router.repo(&if entry.label == "default" {
+                        Scope::Root
+                    } else {
+                        Scope::parse_or_default(Some(&entry.label)).unwrap_or(Scope::Root)
+                    });
+                    let stats = incremental_reindex(
+                        repo,
+                        state.embedding.as_ref(),
+                        state.index.as_ref(),
+                        changes,
+                    )
+                    .instrument(tracing::info_span!(
+                        "server.incremental_reindex",
+                        repo = %entry.label,
+                    ))
+                    .await;
+                    info!(
+                        repo = %entry.label,
+                        added = stats.added,
+                        updated = stats.updated,
+                        removed = stats.removed,
+                        errors = stats.errors,
+                        "incremental reindex complete"
+                    );
+                    total_reindex.added += stats.added;
+                    total_reindex.updated += stats.updated;
+                    total_reindex.removed += stats.removed;
+                    total_reindex.errors += stats.errors;
+                    any_reindex = true;
+                }
             }
+
+            // Advance the default repo's stored SHA.
+            let reindex_failed_completely = any_reindex
+                && total_reindex.added == 0
+                && total_reindex.updated == 0
+                && total_reindex.errors > 0;
+            if !reindex_failed_completely {
+                if let Some(sha) = state.router.head_sha().await {
+                    state.index.set_commit_sha(Some(&sha));
+                }
+            }
+
+            // Build pull status summary.
+            let pull_status = if !pull_first {
+                "skipped".to_string()
+            } else if sync_result.results.len() == 1 {
+                match &sync_result.results[0].pull {
+                    Some(PullResult::NoRemote) => "no-remote".to_string(),
+                    Some(PullResult::UpToDate) => "up-to-date".to_string(),
+                    Some(PullResult::FastForward { .. }) => "fast-forward".to_string(),
+                    Some(PullResult::Merged {
+                        conflicts_resolved, ..
+                    }) => {
+                        format!("merged ({} conflicts resolved)", conflicts_resolved)
+                    }
+                    None => "skipped".to_string(),
+                }
+            } else {
+                format!("{} repos synced", sync_result.results.len())
+            };
 
             info!(
                 ms = start.elapsed().as_millis(),
@@ -1690,12 +1695,12 @@ impl MemoryServer {
                 "branch": branch,
             });
 
-            if let Some(stats) = reindex_stats {
+            if any_reindex {
                 response["reindex"] = serde_json::json!({
-                    "added": stats.added,
-                    "updated": stats.updated,
-                    "removed": stats.removed,
-                    "errors": stats.errors,
+                    "added": total_reindex.added,
+                    "updated": total_reindex.updated,
+                    "removed": total_reindex.removed,
+                    "errors": total_reindex.errors,
                 });
             }
 
