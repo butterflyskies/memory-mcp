@@ -165,7 +165,7 @@ impl RepoRouter {
             self.routes.iter().map(|r| {
                 let scope = crate::types::ScopePath::new(&r.prefix)
                     .map(Scope::Path)
-                    .unwrap_or(Scope::Root);
+                    .expect("scope prefix validated at config load");
                 (r.prefix.as_str(), &r.repo, r.branch.as_deref(), scope)
             }),
         )
@@ -211,13 +211,22 @@ impl RepoRouter {
                 .await
         } else {
             // Cross-repo move: read from source, save to dest, delete from source.
+            // Preserve id and created_at from the source so recall_log references
+            // and memory identity survive the move.
             let source = source_repo.read_memory(source_name, source_scope).await?;
-            let metadata = crate::types::MemoryMetadata::new(
-                dest_scope.clone(),
-                source.metadata.tags.clone(),
-                source.metadata.source.clone(),
+            let metadata = crate::types::MemoryMetadata {
+                scope: dest_scope.clone(),
+                tags: source.metadata.tags.clone(),
+                source: source.metadata.source.clone(),
+                created_at: source.metadata.created_at,
+                updated_at: chrono::Utc::now(),
+            };
+            let dest = Memory::from_validated_with_id(
+                source.id,
+                dest_name.clone(),
+                source.content.clone(),
+                metadata,
             );
-            let dest = Memory::from_validated(dest_name.clone(), source.content.clone(), metadata);
             dest_repo.save_memory(&dest).await?;
             if let Err(e) = source_repo.delete_memory(source_name, source_scope).await {
                 warn!(
