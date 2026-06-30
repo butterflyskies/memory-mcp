@@ -397,7 +397,7 @@ impl MemoryServer {
 
             let start = Instant::now();
             state
-                .repo
+                .router
                 .save_memory(&memory)
                 .await
                 .map_err(ErrorData::from)?;
@@ -498,7 +498,7 @@ impl MemoryServer {
                 };
 
                 // Read the memory; if it was deleted but still in the index, skip it.
-                let memory = match state.repo.read_memory(&mref.name, &mref.scope).await {
+                let memory = match state.router.read_memory(&mref.name, &mref.scope).await {
                     Ok(m) => m,
                     Err(e) => {
                         warn!(
@@ -590,7 +590,7 @@ impl MemoryServer {
 
             // Delete from repo first — if this fails, index is untouched, memory stays functional.
             state
-                .repo
+                .router
                 .delete_memory(&name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
@@ -671,7 +671,7 @@ impl MemoryServer {
 
             // Read the existing memory.
             let mut memory = state
-                .repo
+                .router
                 .read_memory(&name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
@@ -705,7 +705,7 @@ impl MemoryServer {
 
             // Persist to repo (last, so partial failures leave recoverable state).
             state
-                .repo
+                .router
                 .save_memory(&memory)
                 .await
                 .map_err(ErrorData::from)?;
@@ -779,7 +779,7 @@ impl MemoryServer {
             let start = Instant::now();
 
             // 1. Reject early if the destination already exists.
-            match state.repo.read_memory(&new_name, &to_scope).await {
+            match state.router.read_memory(&new_name, &to_scope).await {
                 Ok(_) => {
                     return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
                         reason: format!(
@@ -797,11 +797,10 @@ impl MemoryServer {
                 }
             }
 
-            // 2. Atomically read source, write destination, delete source
-            //    in one git commit. Must happen before index mutations so a
-            //    failure leaves the index consistent with the repo on disk.
+            // 2. Move the memory (atomic within a single repo, or
+            //    read-save-delete across repos).
             let dest = state
-                .repo
+                .router
                 .move_memory(&name, &from_scope, &new_name, &to_scope)
                 .await
                 .map_err(ErrorData::from)?;
@@ -883,24 +882,24 @@ impl MemoryServer {
             let start = Instant::now();
             let memories = match &scope_filter {
                 ScopeFilter::RootOnly => state
-                    .repo
+                    .router
                     .list_memories(Some(&Scope::Root))
                     .await
                     .map_err(ErrorData::from)?,
                 ScopeFilter::All => state
-                    .repo
+                    .router
                     .list_memories(None)
                     .await
                     .map_err(ErrorData::from)?,
                 ScopeFilter::Subtree(sp) => {
                     let path_scope = Scope::Path(sp.clone());
                     let mut root_memories = state
-                        .repo
+                        .router
                         .list_memories(Some(&Scope::Root))
                         .await
                         .map_err(ErrorData::from)?;
                     let path_memories = state
-                        .repo
+                        .router
                         .list_memories(Some(&path_scope))
                         .await
                         .map_err(ErrorData::from)?;
@@ -965,7 +964,7 @@ impl MemoryServer {
 
             let start = Instant::now();
             let memory = state
-                .repo
+                .router
                 .read_memory(&name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
@@ -1020,94 +1019,78 @@ impl MemoryServer {
             let start = Instant::now();
             let branch = &state.branch;
 
-            // Track whether origin is configured at all so we can skip push
-            // for local-only deployments that have no remote.
-            let mut has_remote = true;
+            let sync_result = state
+                .router
+                .sync_all(&state.auth, branch, pull_first)
+                .await
+                .map_err(ErrorData::from)?;
 
-            let mut reindex_stats: Option<ReindexStats> = None;
+            // Incremental reindex for any repos that had changes.
+            let mut total_reindex = ReindexStats::default();
+            let mut any_reindex = false;
+            for entry in &sync_result.results {
+                if let Some(ref changes) = entry.changes {
+                    let repo = state.router.repo(&if entry.label == "default" {
+                        Scope::Root
+                    } else {
+                        Scope::parse_or_default(Some(&entry.label)).unwrap_or(Scope::Root)
+                    });
+                    let stats = incremental_reindex(
+                        repo,
+                        state.embedding.as_ref(),
+                        state.index.as_ref(),
+                        changes,
+                    )
+                    .instrument(tracing::info_span!(
+                        "server.incremental_reindex",
+                        repo = %entry.label,
+                    ))
+                    .await;
+                    info!(
+                        repo = %entry.label,
+                        added = stats.added,
+                        updated = stats.updated,
+                        removed = stats.removed,
+                        errors = stats.errors,
+                        "incremental reindex complete"
+                    );
+                    total_reindex.added += stats.added;
+                    total_reindex.updated += stats.updated;
+                    total_reindex.removed += stats.removed;
+                    total_reindex.errors += stats.errors;
+                    any_reindex = true;
+                }
+            }
 
-            let pull_status = if pull_first {
-                let result = state
-                    .repo
-                    .pull(&state.auth, branch)
-                    .await
-                    .map_err(ErrorData::from)?;
+            // Advance the default repo's stored SHA.
+            let reindex_failed_completely = any_reindex
+                && total_reindex.added == 0
+                && total_reindex.updated == 0
+                && total_reindex.errors > 0;
+            if !reindex_failed_completely {
+                if let Some(sha) = state.router.head_sha().await {
+                    state.index.set_commit_sha(Some(&sha));
+                }
+            }
 
-                let mut oid_range: Option<([u8; 20], [u8; 20])> = None;
-                let status = match result {
-                    PullResult::NoRemote => {
-                        has_remote = false;
-                        "no-remote".to_string()
-                    }
-                    PullResult::UpToDate => "up-to-date".to_string(),
-                    PullResult::FastForward { old_head, new_head } => {
-                        oid_range = Some((old_head, new_head));
-                        "fast-forward".to_string()
-                    }
-                    PullResult::Merged {
-                        conflicts_resolved,
-                        old_head,
-                        new_head,
-                    } => {
-                        oid_range = Some((old_head, new_head));
+            // Build pull status summary.
+            let pull_status = if !pull_first {
+                "skipped".to_string()
+            } else if sync_result.results.len() == 1 {
+                match &sync_result.results[0].pull {
+                    Some(PullResult::NoRemote) => "no-remote".to_string(),
+                    Some(PullResult::UpToDate) => "up-to-date".to_string(),
+                    Some(PullResult::FastForward { .. }) => "fast-forward".to_string(),
+                    Some(PullResult::Merged {
+                        conflicts_resolved, ..
+                    }) => {
                         format!("merged ({} conflicts resolved)", conflicts_resolved)
                     }
-                };
-
-                if let Some((old_head, new_head)) = oid_range {
-                    let repo = Arc::clone(&state.repo);
-                    let changes = crate::repo::traced_spawn_blocking(move || {
-                        repo.diff_changed_memories(old_head, new_head)
-                    })
-                    .await
-                    .map_err(|e| MemoryError::Join(e.to_string()))
-                    .map_err(ErrorData::from)?
-                    .map_err(ErrorData::from)?;
-
-                    let mut reindex_failed_completely = false;
-                    if !changes.is_empty() {
-                        let stats = incremental_reindex(
-                            &state.repo,
-                            state.embedding.as_ref(),
-                            state.index.as_ref(),
-                            &changes,
-                        )
-                        .instrument(tracing::info_span!("server.incremental_reindex"))
-                        .await;
-                        info!(
-                            added = stats.added,
-                            updated = stats.updated,
-                            removed = stats.removed,
-                            errors = stats.errors,
-                            "incremental reindex complete"
-                        );
-                        reindex_failed_completely =
-                            stats.added == 0 && stats.updated == 0 && stats.errors > 0;
-                        reindex_stats = Some(stats);
-                    }
-
-                    // Advance the stored SHA so the next startup doesn't trigger
-                    // a full reindex for changes already processed. Skip when every
-                    // embed failed so the next startup retries.
-                    if !reindex_failed_completely {
-                        if let Some(sha) = state.repo.head_sha().await {
-                            state.index.set_commit_sha(Some(&sha));
-                        }
-                    }
+                    None => "skipped".to_string(),
                 }
-
-                status
             } else {
-                "skipped".to_string()
+                format!("{} repos synced", sync_result.results.len())
             };
-
-            if has_remote {
-                state
-                    .repo
-                    .push(&state.auth, branch)
-                    .await
-                    .map_err(ErrorData::from)?;
-            }
 
             info!(
                 ms = start.elapsed().as_millis(),
@@ -1122,12 +1105,12 @@ impl MemoryServer {
                 "branch": branch,
             });
 
-            if let Some(stats) = reindex_stats {
+            if any_reindex {
                 response["reindex"] = serde_json::json!({
-                    "added": stats.added,
-                    "updated": stats.updated,
-                    "removed": stats.removed,
-                    "errors": stats.errors,
+                    "added": total_reindex.added,
+                    "updated": total_reindex.updated,
+                    "removed": total_reindex.removed,
+                    "errors": total_reindex.errors,
                 });
             }
 

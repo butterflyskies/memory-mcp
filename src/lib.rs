@@ -8,6 +8,9 @@
 
 /// Token resolution, OAuth device flow, and credential storage backends.
 pub mod auth;
+/// Configuration file parsing for per-scope remote mapping.
+pub mod config;
+
 /// Embedding backends for computing vector representations of text.
 pub mod embedding;
 /// Error types used throughout the crate.
@@ -22,6 +25,8 @@ pub mod index;
 pub mod recall_log;
 /// Git-backed memory repository — read, write, sync, and diff operations.
 pub mod repo;
+/// Routes memory operations to scope-specific git repositories.
+pub mod repo_router;
 /// MCP server implementation — tool handlers for the memory protocol.
 pub mod server;
 /// Domain types: memories, scopes, metadata, validation, and application state.
