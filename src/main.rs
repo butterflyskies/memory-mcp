@@ -92,6 +92,12 @@ struct ServeArgs {
     #[arg(long, default_value = "~/.memory-mcp", env = "MEMORY_MCP_REPO_PATH")]
     repo_path: String,
 
+    /// Path to the TOML config file for per-scope remote mapping.
+    /// Defaults to `~/.config/memory-mcp/config.toml`. Set to an empty
+    /// string to disable config loading.
+    #[arg(long, env = "MEMORY_MCP_CONFIG")]
+    config: Option<String>,
+
     /// URL path at which the MCP service is mounted.
     #[arg(long, default_value = "/mcp", env = "MEMORY_MCP_PATH")]
     mcp_path: String,
@@ -493,6 +499,33 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let repo = Arc::new(repo);
 
+    // Load per-scope remote config and build the repo router.
+    let router = {
+        let config_path = match &args.config {
+            Some(p) if p.is_empty() => None,
+            Some(p) => Some(expand_path(p)?),
+            None => memory_mcp::config::Config::resolve_path().ok(),
+        };
+
+        if let Some(ref path) = config_path {
+            let config = memory_mcp::config::Config::load(path)
+                .with_context(|| format!("failed to load config from {}", path.display()))?;
+            if config.remotes.is_empty() {
+                memory_mcp::repo_router::RepoRouter::single(Arc::clone(&repo))
+            } else {
+                memory_mcp::repo_router::RepoRouter::from_config(
+                    Arc::clone(&repo),
+                    &config.remotes,
+                    &health.git,
+                    &health.sync,
+                )
+                .context("failed to initialise scope-specific repos from config")?
+            }
+        } else {
+            memory_mcp::repo_router::RepoRouter::single(Arc::clone(&repo))
+        }
+    };
+
     // Load the persisted index and check freshness against repo HEAD.
     // If the SHA doesn't match, discard the loaded index entirely and start
     // fresh — this prevents ghost entries from deleted memories lingering.
@@ -606,8 +639,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     };
 
-    let state = Arc::new(AppState::new(
+    let state = Arc::new(AppState::with_router(
         repo,
+        router,
         args.branch.clone(),
         embedding,
         index,
