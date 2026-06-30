@@ -308,6 +308,7 @@ impl AppState {
     }
 
     /// Create a new application state with a pre-built repo router.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_router(
         repo: Arc<MemoryRepo>,
         router: RepoRouter,

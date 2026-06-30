@@ -102,7 +102,7 @@ impl RepoRouter {
             });
         }
         // Sort by prefix length descending so longest match wins.
-        routes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        routes.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
         Ok(Self {
             default_repo,
             routes,
@@ -129,6 +129,7 @@ impl RepoRouter {
     }
 
     /// Resolve the branch name for a given scope.
+    #[cfg(test)]
     fn branch_for_scope(&self, scope: &Scope, default_branch: &str) -> String {
         match scope {
             Scope::Root => default_branch.to_string(),
@@ -275,7 +276,6 @@ impl RepoRouter {
             let mut has_remote = true;
 
             if pull_first {
-                let old_head = repo.head_sha().await;
                 match repo.pull(auth, branch).await {
                     Ok(pull_result) => {
                         if matches!(pull_result, PullResult::NoRemote) {
@@ -463,7 +463,7 @@ mod tests {
                 branch: None,
             },
         ];
-        routes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        routes.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
 
         let router = RepoRouter {
             default_repo: Arc::clone(&default_repo),
