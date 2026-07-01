@@ -15,8 +15,8 @@ pub mod config;
 pub mod embedding;
 /// Error types used throughout the crate.
 pub mod error;
-/// Filesystem utilities — atomic writes with crash-safe temp-file-then-rename.
-pub(crate) mod fs_util;
+/// Filesystem utilities — atomic writes, path helpers, crash-safe temp-file-then-rename.
+pub mod fs_util;
 /// HTTP health-check handlers (`/readyz`).
 pub mod health;
 /// HNSW vector index for approximate nearest-neighbour search.

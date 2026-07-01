@@ -10,6 +10,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::error::MemoryError;
+use crate::fs_util::expand_tilde;
 use crate::types::ScopePath;
 
 /// A single scope-to-repo mapping from the config file.
@@ -102,22 +103,6 @@ impl RemoteMapping {
                 Ok(home.join(dir_name))
             }
         }
-    }
-}
-
-/// Expand leading `~` to the user's home directory.
-fn expand_tilde(path: &str) -> Result<PathBuf, MemoryError> {
-    match path.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            let home = dirs::home_dir().ok_or_else(|| {
-                MemoryError::Internal("could not expand '~': home directory unknown".into())
-            })?;
-            Ok(home.join(rest.strip_prefix('/').unwrap_or(rest)))
-        }
-        Some(_) => Err(MemoryError::Internal(
-            "~user expansion is not supported; use an absolute path or ~/...".into(),
-        )),
-        None => Ok(PathBuf::from(path)),
     }
 }
 

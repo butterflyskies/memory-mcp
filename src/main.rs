@@ -848,22 +848,7 @@ fn parse_nonzero_u64(s: &str) -> Result<u64, String> {
 }
 
 fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
-    match path.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            let home = dirs::home_dir().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "could not expand '~': home directory could not be determined; \
-                     please provide --repo-path explicitly or set HOME"
-                )
-            })?;
-            Ok(home.join(rest.strip_prefix('/').unwrap_or(rest)))
-        }
-        Some(_) => anyhow::bail!(
-            "~user path expansion is not supported; \
-             please use an absolute path or ~/..."
-        ),
-        None => Ok(PathBuf::from(path)),
-    }
+    memory_mcp::fs_util::expand_tilde(path).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 // ---------------------------------------------------------------------------
