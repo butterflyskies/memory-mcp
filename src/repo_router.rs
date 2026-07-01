@@ -271,6 +271,10 @@ impl RepoRouter {
     // -----------------------------------------------------------------------
 
     /// Sync all repos: pull then push each one.
+    ///
+    /// Errors on individual repos are logged and recorded but do not abort
+    /// the remaining repos — a network blip on one remote must not block
+    /// syncing the others.
     pub async fn sync_all(
         &self,
         auth: &AuthProvider,
@@ -278,6 +282,7 @@ impl RepoRouter {
         pull_first: bool,
     ) -> Result<MultiSyncResult, MemoryError> {
         let mut result = MultiSyncResult::default();
+        let mut errors: Vec<(String, MemoryError)> = Vec::new();
 
         for (label, repo, branch_override, scope) in self.all_repos() {
             let branch = branch_override.unwrap_or(default_branch);
@@ -342,9 +347,11 @@ impl RepoRouter {
                         warn!(
                             label = %label,
                             error = %e,
-                            "sync: pull failed"
+                            "sync: pull failed — continuing with remaining repos"
                         );
-                        return Err(e);
+                        errors.push((label.to_string(), e));
+                        result.results.push(entry);
+                        continue;
                     }
                 }
             }
@@ -356,9 +363,9 @@ impl RepoRouter {
                         warn!(
                             label = %label,
                             error = %e,
-                            "sync: push failed"
+                            "sync: push failed — continuing with remaining repos"
                         );
-                        return Err(e);
+                        errors.push((label.to_string(), e));
                     }
                 }
             } else {
@@ -366,6 +373,22 @@ impl RepoRouter {
             }
 
             result.results.push(entry);
+        }
+
+        if !errors.is_empty() {
+            let summary = errors
+                .iter()
+                .map(|(label, e)| format!("{label}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            warn!(
+                failed = errors.len(),
+                total = result.results.len(),
+                "sync: {}/{} repos had errors: {}",
+                errors.len(),
+                result.results.len(),
+                summary
+            );
         }
 
         Ok(result)
