@@ -1,6 +1,30 @@
-//! Filesystem utilities — atomic writes with crash-safe temp-file-then-rename.
+//! Filesystem utilities — atomic writes, crash-safe temp-file-then-rename,
+//! and path helpers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::error::MemoryError;
+
+/// Expand a leading `~` to the user's home directory.
+///
+/// - `~/foo` → `$HOME/foo`
+/// - `~` alone → `$HOME`
+/// - `~user/...` → error (not supported)
+/// - Absolute or relative paths pass through unchanged.
+pub fn expand_tilde(path: &str) -> Result<PathBuf, MemoryError> {
+    match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            let home = dirs::home_dir().ok_or_else(|| {
+                MemoryError::Internal("could not expand '~': home directory unknown".into())
+            })?;
+            Ok(home.join(rest.strip_prefix('/').unwrap_or(rest)))
+        }
+        Some(_) => Err(MemoryError::Internal(
+            "~user expansion is not supported; use an absolute path or ~/...".into(),
+        )),
+        None => Ok(PathBuf::from(path)),
+    }
+}
 
 /// RAII guard that removes a temp file on drop unless defused.
 struct TempGuard<'a> {
