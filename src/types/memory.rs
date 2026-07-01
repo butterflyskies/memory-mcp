@@ -224,6 +224,21 @@ impl Memory {
         }
     }
 
+    /// Create a memory preserving an existing ID (for cross-repo moves).
+    pub(crate) fn from_validated_with_id(
+        id: String,
+        name: MemoryName,
+        content: impl Into<String>,
+        metadata: MemoryMetadata,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            content: content.into(),
+            metadata,
+        }
+    }
+
     /// Render to the on-disk format: YAML frontmatter + markdown body.
     ///
     /// Format:
