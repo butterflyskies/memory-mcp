@@ -538,7 +538,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             }),
     );
 
-    let head_sha = repo.head_sha().await;
+    let head_sha = router.head_sha().await;
     let needs_reindex = head_sha != index.commit_sha();
     // Track whether the reindex (if it ran) completed without errors.
     // Used below to gate startup report_ok for embedding and vector_index.
@@ -555,7 +555,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         );
 
         reindex_ok =
-            match memory_mcp::server::full_reindex(&repo, embedding.as_ref(), index.as_ref())
+            match memory_mcp::server::full_reindex(&router, embedding.as_ref(), index.as_ref())
                 .instrument(tracing::info_span!("startup.full_reindex"))
                 .await
             {
@@ -757,7 +757,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Persist the scoped vector index so the next startup can skip a full reindex.
     std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
-    if let Some(sha) = state_for_shutdown.repo.head_sha().await {
+    if let Some(sha) = state_for_shutdown.router.head_sha().await {
         state_for_shutdown.index.set_commit_sha(Some(&sha));
     }
     if let Err(e) = state_for_shutdown.index.save(&index_dir) {
