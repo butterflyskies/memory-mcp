@@ -394,9 +394,42 @@ impl RepoRouter {
         Ok(result)
     }
 
-    /// Get the HEAD SHA for the default repo (used for index persistence).
+    /// Get a composite HEAD SHA covering all repos.
+    ///
+    /// When no scope-specific routes are configured, returns the default repo's
+    /// SHA directly (backward compatible). When routes exist, returns a
+    /// deterministic string built from all repos' HEADs so that a change in
+    /// *any* repo invalidates the stored index SHA and triggers a reindex.
     pub async fn head_sha(&self) -> Option<String> {
-        self.default_repo.head_sha().await
+        if self.routes.is_empty() {
+            return self.default_repo.head_sha().await;
+        }
+
+        // Collect (label, sha) from all repos. Labels are already unique
+        // ("default" + each route prefix) and we sort for determinism.
+        let mut parts: Vec<(String, String)> = Vec::with_capacity(1 + self.routes.len());
+
+        if let Some(sha) = self.default_repo.head_sha().await {
+            parts.push(("default".to_string(), sha));
+        }
+        for route in &self.routes {
+            if let Some(sha) = route.repo.head_sha().await {
+                parts.push((route.prefix.clone(), sha));
+            }
+        }
+
+        if parts.is_empty() {
+            return None;
+        }
+
+        parts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let composite = parts
+            .iter()
+            .map(|(label, sha)| format!("{label}={sha}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        Some(composite)
     }
 
     /// Return a reference to the repo for a given scope (for direct access when needed).

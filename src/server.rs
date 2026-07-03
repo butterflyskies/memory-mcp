@@ -237,20 +237,21 @@ async fn incremental_reindex(
     stats
 }
 
-/// Re-embed and re-index all memories in the repository.
+/// Re-embed and re-index all memories across all repos.
 ///
-/// This is a full rebuild: all memories are listed, their content is embedded,
-/// and the index is updated. Intended for startup freshness checks and
-/// recovery after a crash that discarded an in-progress index.
+/// This is a full rebuild: all memories are listed (via the router, which
+/// aggregates across scope-specific repos), their content is embedded, and the
+/// index is updated. Intended for startup freshness checks and recovery after
+/// a crash that discarded an in-progress index.
 ///
 /// Unlike delegating to `incremental_reindex`, this function uses the content
 /// already loaded by `list_memories` to avoid reading each file a second time.
 pub async fn full_reindex(
-    repo: &Arc<MemoryRepo>,
+    router: &crate::repo_router::RepoRouter,
     embedding: &dyn EmbeddingBackend,
     index: &dyn VectorStore,
 ) -> Result<ReindexStats, MemoryError> {
-    let memories = repo.list_memories(None).await?;
+    let memories = router.list_memories(None).await?;
     if memories.is_empty() {
         return Ok(ReindexStats::default());
     }
