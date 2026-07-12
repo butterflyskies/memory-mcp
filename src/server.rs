@@ -6,9 +6,16 @@ const SNIPPET_MAX_CHARS: usize = 500;
 
 use chrono::Utc;
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
-    model::{ErrorData, ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router, ServerHandler,
+    handler::server::{
+        router::tool::ToolRouter,
+        tool::{Extension, ToolCallContext},
+        wrapper::Parameters,
+    },
+    model::{
+        CallToolRequestParams, CallToolResult, ErrorData, Meta, ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
 use tracing::{info, warn, Instrument};
 
@@ -68,6 +75,90 @@ pub struct MemoryServer {
 
 /// Maximum allowed content size in bytes (1 MiB).
 const MAX_CONTENT_SIZE: usize = 1_048_576;
+
+const SERVER_PROCESSING_DURATION_META_KEY: &str = "memory-mcp/serverProcessingDurationMs";
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn finish_tool_call(
+    tool_name: &str,
+    start: Instant,
+    result: Result<CallToolResult, ErrorData>,
+) -> Result<CallToolResult, ErrorData> {
+    let server_processing_duration_ms = elapsed_ms(start);
+    match result {
+        Ok(mut result) => {
+            let mut meta = result.meta.take().unwrap_or_else(Meta::new);
+            meta.insert(
+                SERVER_PROCESSING_DURATION_META_KEY.to_string(),
+                server_processing_duration_ms.into(),
+            );
+            result.meta = Some(meta);
+            info!(
+                tool_name,
+                server_processing_duration_ms,
+                outcome = "success",
+                "tool call completed"
+            );
+            Ok(result)
+        }
+        Err(error) => {
+            info!(
+                tool_name,
+                server_processing_duration_ms,
+                outcome = "error",
+                "tool call completed"
+            );
+            Err(error)
+        }
+    }
+}
+
+struct EditStageTiming {
+    start: Instant,
+    stage: &'static str,
+    outcome: &'static str,
+    read_ms: u64,
+    embed_total_ms: u64,
+    index_ms: u64,
+    repo_save_ms: u64,
+}
+
+impl EditStageTiming {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            stage: "validation",
+            outcome: "error",
+            read_ms: 0,
+            embed_total_ms: 0,
+            index_ms: 0,
+            repo_save_ms: 0,
+        }
+    }
+
+    fn completed(&mut self) {
+        self.stage = "completed";
+        self.outcome = "success";
+    }
+}
+
+impl Drop for EditStageTiming {
+    fn drop(&mut self) {
+        info!(
+            outcome = self.outcome,
+            stage = self.stage,
+            edit_total_ms = elapsed_ms(self.start),
+            read_ms = self.read_ms,
+            embed_total_ms = self.embed_total_ms,
+            index_ms = self.index_ms,
+            repo_save_ms = self.repo_save_ms,
+            "edit stage timing"
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Incremental reindex helper
@@ -634,6 +725,7 @@ impl MemoryServer {
         Parameters(args): Parameters<EditArgs>,
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
+        let mut timing = EditStageTiming::new();
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         if args.content.is_none() && args.tags.is_none() {
             return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
@@ -664,17 +756,15 @@ impl MemoryServer {
         async move {
             let scope = Scope::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
-            let start = Instant::now();
-
             // Track whether content changed so we can skip re-embedding when only tags changed.
             let content_changed = args.content.is_some();
 
             // Read the existing memory.
-            let mut memory = state
-                .repo
-                .read_memory(&name, &scope)
-                .await
-                .map_err(ErrorData::from)?;
+            timing.stage = "read";
+            let stage_start = Instant::now();
+            let read_result = state.repo.read_memory(&name, &scope).await;
+            timing.read_ms = elapsed_ms(stage_start);
+            let mut memory = read_result.map_err(ErrorData::from)?;
 
             // Apply partial updates.
             if let Some(content) = args.content {
@@ -691,31 +781,34 @@ impl MemoryServer {
                 let qualified_name = memory.mem_ref().qualified_path();
 
                 // Re-embed updated content.
-                let vector = state
-                    .embedding
-                    .embed_one(&memory.content)
-                    .await
-                    .map_err(ErrorData::from)?;
+                timing.stage = "embed";
+                let stage_start = Instant::now();
+                let embed_result = state.embedding.embed_one(&memory.content).await;
+                timing.embed_total_ms = elapsed_ms(stage_start);
+                let vector = embed_result.map_err(ErrorData::from)?;
 
-                state
-                    .index
-                    .add(&scope, &vector, qualified_name)
-                    .map_err(ErrorData::from)?;
+                timing.stage = "index";
+                let stage_start = Instant::now();
+                let index_result = state.index.add(&scope, &vector, qualified_name);
+                timing.index_ms = elapsed_ms(stage_start);
+                index_result.map_err(ErrorData::from)?;
             }
 
             // Persist to repo (last, so partial failures leave recoverable state).
-            state
-                .repo
-                .save_memory(&memory)
-                .await
-                .map_err(ErrorData::from)?;
+            timing.stage = "repo_save";
+            let stage_start = Instant::now();
+            let save_result = state.repo.save_memory(&memory).await;
+            timing.repo_save_ms = elapsed_ms(stage_start);
+            save_result.map_err(ErrorData::from)?;
 
             info!(
-                ms = start.elapsed().as_millis(),
+                ms = elapsed_ms(timing.start),
                 name = %name,
                 content_changed,
                 "memory edited"
             );
+
+            timing.completed();
 
             Ok(serde_json::json!({
                 "id": memory.id,
@@ -1428,6 +1521,17 @@ impl MemoryServer {
 
 #[tool_handler]
 impl ServerHandler for MemoryServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let start = Instant::now();
+        let tool_name = request.name.to_string();
+        let context = ToolCallContext::new(self, request, context);
+        finish_tool_call(&tool_name, start, self.tool_router.call(context).await)
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "A semantic memory system for AI coding agents. Memories are stored as markdown files \
@@ -1470,6 +1574,143 @@ fn build_snippet(content: &str) -> (String, usize, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::Content;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::{layer::SubscriberExt, Registry};
+
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_info_logs(f: impl FnOnce()) -> String {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = Registry::default()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || TestWriter(Arc::clone(&writer_output))),
+            );
+        with_default(subscriber, f);
+        let bytes = output.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("UTF-8 logs")
+    }
+
+    #[test]
+    fn tool_timing_preserves_content_and_adds_metadata() {
+        let original = CallToolResult::success(vec![Content::text("{\"ok\":true}")]);
+        let original_content = original.content.clone();
+
+        let result = finish_tool_call("read", Instant::now(), Ok(original)).expect("success");
+
+        assert_eq!(result.content, original_content);
+        assert_eq!(result.structured_content, None);
+        assert_eq!(result.is_error, Some(false));
+        let duration = result
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(SERVER_PROCESSING_DURATION_META_KEY))
+            .and_then(serde_json::Value::as_u64);
+        assert!(duration.is_some());
+    }
+
+    #[test]
+    fn tool_timing_merges_existing_metadata() {
+        let mut meta = Meta::new();
+        meta.insert("existing".to_string(), serde_json::json!("kept"));
+        let original = CallToolResult::success(vec![Content::text("ok")]).with_meta(Some(meta));
+
+        let result = finish_tool_call("list", Instant::now(), Ok(original)).expect("success");
+        let meta = result.meta.expect("metadata");
+
+        assert_eq!(meta.get("existing"), Some(&serde_json::json!("kept")));
+        assert!(meta.contains_key(SERVER_PROCESSING_DURATION_META_KEY));
+    }
+
+    #[test]
+    fn tool_timing_preserves_error_data_semantics() {
+        let original =
+            ErrorData::invalid_params("bad input", Some(serde_json::json!({"field": "name"})));
+        let expected_code = original.code;
+        let expected_message = original.message.clone();
+        let expected_data = original.data.clone();
+
+        let error = finish_tool_call("edit", Instant::now(), Err(original)).expect_err("error");
+
+        assert_eq!(error.code, expected_code);
+        assert_eq!(error.message, expected_message);
+        assert_eq!(error.data, expected_data);
+    }
+
+    #[test]
+    fn tool_timing_logs_success_and_error_at_info() {
+        let logs = capture_info_logs(|| {
+            let success = CallToolResult::success(vec![Content::text("ok")]);
+            finish_tool_call("read", Instant::now(), Ok(success)).expect("success");
+            let error = ErrorData::invalid_params("bad input", None);
+            finish_tool_call("edit", Instant::now(), Err(error)).expect_err("error");
+        });
+
+        assert!(logs.contains("tool_name=\"read\""), "logs: {logs}");
+        assert!(logs.contains("tool_name=\"edit\""), "logs: {logs}");
+        assert!(logs.contains("outcome=\"success\""), "logs: {logs}");
+        assert!(logs.contains("outcome=\"error\""), "logs: {logs}");
+        assert!(
+            logs.contains("server_processing_duration_ms="),
+            "logs: {logs}"
+        );
+    }
+
+    #[test]
+    fn edit_stage_timing_logs_success_and_failure_at_info() {
+        let logs = capture_info_logs(|| {
+            let mut success = EditStageTiming::new();
+            success.read_ms = 1;
+            success.embed_total_ms = 2;
+            success.index_ms = 3;
+            success.repo_save_ms = 4;
+            success.completed();
+            drop(success);
+
+            let mut failure = EditStageTiming::new();
+            failure.stage = "embed";
+            failure.read_ms = 1;
+            failure.embed_total_ms = 2;
+            drop(failure);
+        });
+
+        assert!(logs.contains("stage=\"completed\""), "logs: {logs}");
+        assert!(logs.contains("stage=\"embed\""), "logs: {logs}");
+        assert!(logs.contains("outcome=\"success\""), "logs: {logs}");
+        assert!(logs.contains("outcome=\"error\""), "logs: {logs}");
+        for field in [
+            "edit_total_ms=",
+            "read_ms=",
+            "embed_total_ms=",
+            "index_ms=",
+            "repo_save_ms=",
+        ] {
+            assert!(logs.contains(field), "missing {field}; logs: {logs}");
+        }
+        assert!(
+            !logs.contains("server_processing_duration_ms="),
+            "edit-stage logs must not reuse the authoritative tool-boundary field; logs: {logs}"
+        );
+    }
 
     #[test]
     fn snippet_short_content_not_truncated() {

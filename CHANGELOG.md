@@ -1,3 +1,14 @@
+## [0.16.0] - 2026-07-12
+
+### Added
+
+- Return server-side tool processing duration in MCP result metadata and default-verbosity completion logs (#298)
+- Report edit-stage totals and separate embedding queue-wait and inference timings (#298)
+
+### Dependencies
+
+- Upgrade `anyhow` to 1.0.103 and `crossbeam-epoch` to 0.9.20 to resolve newly published security advisories
+
 ## [0.15.0] - 2026-06-26
 
 ### Added
@@ -367,4 +378,3 @@ Agents using `scope: "project:my-api"` in tool calls must switch to `scope: "my-
 * @github-actions[bot] made their first contribution in [#18](https://github.com/butterflyskies/memory-mcp/pull/18)
 * @butterflysky-ai made their first contribution in [#17](https://github.com/butterflyskies/memory-mcp/pull/17)
 * @butterflysky made their first contribution in [#8](https://github.com/butterflyskies/memory-mcp/pull/8)
-
