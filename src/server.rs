@@ -121,7 +121,7 @@ struct EditStageTiming {
     stage: &'static str,
     outcome: &'static str,
     read_ms: u64,
-    embed_wait_ms: u64,
+    embed_total_ms: u64,
     index_ms: u64,
     repo_save_ms: u64,
 }
@@ -133,7 +133,7 @@ impl EditStageTiming {
             stage: "validation",
             outcome: "error",
             read_ms: 0,
-            embed_wait_ms: 0,
+            embed_total_ms: 0,
             index_ms: 0,
             repo_save_ms: 0,
         }
@@ -150,9 +150,9 @@ impl Drop for EditStageTiming {
         info!(
             outcome = self.outcome,
             stage = self.stage,
-            server_processing_duration_ms = elapsed_ms(self.start),
+            edit_total_ms = elapsed_ms(self.start),
             read_ms = self.read_ms,
-            embed_wait_ms = self.embed_wait_ms,
+            embed_total_ms = self.embed_total_ms,
             index_ms = self.index_ms,
             repo_save_ms = self.repo_save_ms,
             "edit stage timing"
@@ -784,7 +784,7 @@ impl MemoryServer {
                 timing.stage = "embed";
                 let stage_start = Instant::now();
                 let embed_result = state.embedding.embed_one(&memory.content).await;
-                timing.embed_wait_ms = elapsed_ms(stage_start);
+                timing.embed_total_ms = elapsed_ms(stage_start);
                 let vector = embed_result.map_err(ErrorData::from)?;
 
                 timing.stage = "index";
@@ -1680,7 +1680,7 @@ mod tests {
         let logs = capture_info_logs(|| {
             let mut success = EditStageTiming::new();
             success.read_ms = 1;
-            success.embed_wait_ms = 2;
+            success.embed_total_ms = 2;
             success.index_ms = 3;
             success.repo_save_ms = 4;
             success.completed();
@@ -1689,7 +1689,7 @@ mod tests {
             let mut failure = EditStageTiming::new();
             failure.stage = "embed";
             failure.read_ms = 1;
-            failure.embed_wait_ms = 2;
+            failure.embed_total_ms = 2;
             drop(failure);
         });
 
@@ -1697,9 +1697,19 @@ mod tests {
         assert!(logs.contains("stage=\"embed\""), "logs: {logs}");
         assert!(logs.contains("outcome=\"success\""), "logs: {logs}");
         assert!(logs.contains("outcome=\"error\""), "logs: {logs}");
-        for field in ["read_ms=", "embed_wait_ms=", "index_ms=", "repo_save_ms="] {
+        for field in [
+            "edit_total_ms=",
+            "read_ms=",
+            "embed_total_ms=",
+            "index_ms=",
+            "repo_save_ms=",
+        ] {
             assert!(logs.contains(field), "missing {field}; logs: {logs}");
         }
+        assert!(
+            !logs.contains("server_processing_duration_ms="),
+            "edit-stage logs must not reuse the authoritative tool-boundary field; logs: {logs}"
+        );
     }
 
     #[test]

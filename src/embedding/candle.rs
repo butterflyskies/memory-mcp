@@ -1,6 +1,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::time::Instant;
 
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
@@ -21,10 +22,11 @@ pub const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
 // Worker thread
 // ---------------------------------------------------------------------------
 
-type EmbedRequest = (
-    Vec<String>,
-    oneshot::Sender<Result<Vec<Vec<f32>>, MemoryError>>,
-);
+struct EmbedRequest {
+    texts: Vec<String>,
+    enqueued_at: Instant,
+    reply_tx: oneshot::Sender<Result<Vec<Vec<f32>>, MemoryError>>,
+}
 
 /// Pure-Rust embedding engine using candle for BERT inference.
 ///
@@ -165,7 +167,11 @@ impl Drop for CandleEmbeddingEngine {
 /// out), the send fails silently and the loop continues — this is the
 /// self-healing path.
 fn worker_loop(mut inner: CandleInner, dim: usize, rx: mpsc::Receiver<EmbedRequest>) {
-    for (texts, reply_tx) in rx {
+    for request in rx {
+        let queue_wait_ms =
+            u64::try_from(request.enqueued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let texts = request.texts;
+        let reply_tx = request.reply_tx;
         let span = tracing::debug_span!(
             "embedding.embed",
             batch_size = texts.len(),
@@ -175,6 +181,7 @@ fn worker_loop(mut inner: CandleInner, dim: usize, rx: mpsc::Receiver<EmbedReque
         let _enter = span.enter();
 
         let mut panicked = false;
+        let inference_start = Instant::now();
         let result = catch_unwind(AssertUnwindSafe(|| embed_batch(&inner, &texts))).unwrap_or_else(
             |panic_payload| {
                 panicked = true;
@@ -190,6 +197,13 @@ fn worker_loop(mut inner: CandleInner, dim: usize, rx: mpsc::Receiver<EmbedReque
                     "embedding engine panicked: {msg}"
                 )))
             },
+        );
+        let inference_ms = u64::try_from(inference_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            queue_wait_ms,
+            inference_ms,
+            outcome = if result.is_ok() { "success" } else { "error" },
+            "embedding completed"
         );
 
         let _ = reply_tx.send(result);
@@ -217,15 +231,19 @@ impl EmbeddingBackend for CandleEmbeddingEngine {
             .as_ref()
             .ok_or_else(|| MemoryError::Embedding("embedding engine has been shut down".into()))?;
 
-        tx.try_send((texts.to_vec(), reply_tx))
-            .map_err(|e| match e {
-                mpsc::TrySendError::Full(_) => {
-                    MemoryError::Embedding("embedding worker is busy — try again".into())
-                }
-                mpsc::TrySendError::Disconnected(_) => {
-                    MemoryError::Embedding("embedding worker has exited — restart required".into())
-                }
-            })?;
+        tx.try_send(EmbedRequest {
+            texts: texts.to_vec(),
+            enqueued_at: Instant::now(),
+            reply_tx,
+        })
+        .map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => {
+                MemoryError::Embedding("embedding worker is busy — try again".into())
+            }
+            mpsc::TrySendError::Disconnected(_) => {
+                MemoryError::Embedding("embedding worker has exited — restart required".into())
+            }
+        })?;
 
         let result = match timeout(self.embed_timeout, reply_rx).await {
             Ok(Ok(result)) => result,
@@ -444,8 +462,8 @@ mod tests {
     {
         let (tx, rx) = mpsc::sync_channel::<EmbedRequest>(1);
         std::thread::spawn(move || {
-            for (texts, reply_tx) in rx {
-                handler(texts, reply_tx);
+            for request in rx {
+                handler(request.texts, request.reply_tx);
             }
         });
         CandleEmbeddingEngine::with_worker(tx, 4, timeout)
@@ -540,7 +558,12 @@ mod tests {
 
         // Pre-fill the single channel slot by sending directly, bypassing embed().
         let (filler_tx, _filler_rx) = oneshot::channel::<Result<Vec<Vec<f32>>, MemoryError>>();
-        tx.send((vec!["fill".to_string()], filler_tx)).unwrap();
+        tx.send(EmbedRequest {
+            texts: vec!["fill".to_string()],
+            enqueued_at: Instant::now(),
+            reply_tx: filler_tx,
+        })
+        .unwrap();
 
         // Now embed() hits try_send on a full channel.
         let engine = CandleEmbeddingEngine::with_worker(tx, 4, Duration::from_secs(5));
