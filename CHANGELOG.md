@@ -1,8 +1,13 @@
-## [Unreleased]
+## [0.16.0] - 2026-07-12
 
 ### Added
 
-- Return server-side tool processing duration in MCP result metadata and log edit stage timings (#298)
+- Return server-side tool processing duration in MCP result metadata and default-verbosity completion logs (#298)
+- Report edit-stage totals and separate embedding queue-wait and inference timings (#298)
+
+### Dependencies
+
+- Upgrade `anyhow` to 1.0.103 and `crossbeam-epoch` to 0.9.20 to resolve newly published security advisories
 
 ## [0.15.0] - 2026-06-26
 
