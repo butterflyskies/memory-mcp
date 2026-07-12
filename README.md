@@ -211,6 +211,11 @@ Then use the `sync` tool from your editor, or call `memory-mcp sync` directly.
 | **list** | Browse all memories, optionally filtered by scope. |
 | **sync** | Push/pull the memory repo with a git remote. Handles conflicts via recency-based resolution. |
 
+Successful tool results include `_meta["memory-mcp/serverProcessingDurationMs"]`, measured
+from the server tool-handler boundary through result conversion. This is server processing
+time, not client round-trip time; clients should measure `clientRoundTripDurationMs` around
+the MCP call when end-to-end latency is needed.
+
 ### Example: agent remembers a debugging insight
 
 ```

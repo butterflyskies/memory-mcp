@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Added
+
+- Return server-side tool processing duration in MCP result metadata and log edit stage timings (#298)
+
 ## [0.15.0] - 2026-06-26
 
 ### Added
@@ -367,4 +373,3 @@ Agents using `scope: "project:my-api"` in tool calls must switch to `scope: "my-
 * @github-actions[bot] made their first contribution in [#18](https://github.com/butterflyskies/memory-mcp/pull/18)
 * @butterflysky-ai made their first contribution in [#17](https://github.com/butterflyskies/memory-mcp/pull/17)
 * @butterflysky made their first contribution in [#8](https://github.com/butterflyskies/memory-mcp/pull/8)
-
