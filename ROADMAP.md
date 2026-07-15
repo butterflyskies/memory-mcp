@@ -5,7 +5,7 @@
 
 ## What memory-mcp is
 
-A semantic memory system for AI coding agents. Memories are stored as markdown files in a git repository, indexed locally for semantic retrieval, and synced to a remote. Shipped as a single binary (Rust, candle for local embedding, usearch for HNSW vector index) speaking MCP over streamable HTTP.
+A hybrid memory system for AI coding agents. Memories are stored as markdown files in a git repository, indexed locally for semantic and BM25 lexical retrieval, and synced to a remote. It ships as a single Rust binary speaking MCP over Streamable HTTP.
 
 ## Where it's heading
 
@@ -27,7 +27,7 @@ The highest-priority epic. memory-mcp#262 (HyperMem bridge — graph-aware chunk
 | #262 | Graph-aware chunk index for retrieval (HyperMem bridge) | **Active** |
 | #141 | Upgrade to ModernBERT Embed (8192 token context) | Open |
 | #140 | Chunk long memories for embedding | Open |
-| #55 | BM25 keyword search via Tantivy | Open |
+| #55 | BM25 keyword search via Tantivy | Completed in #308 |
 | #148 | Tag-based filtering in recall | Open |
 | #197 | Threshold-based recall: auto-expand until relevance drops | Open |
 | #129 | Memory consolidation, write discipline, quality metrics | Open |
