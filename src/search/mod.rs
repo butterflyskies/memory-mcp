@@ -25,7 +25,7 @@ pub mod bm25;
 /// Reciprocal rank fusion for merging result lists.
 pub mod fusion;
 
-pub use bm25::{LexicalDoc, LexicalIndex};
+pub use bm25::{LexicalDoc, LexicalIndex, LexicalOp};
 pub use fusion::{reciprocal_rank_fusion, FusedHit};
 
 /// Run semantic and lexical retrieval in parallel and merge the ranked
@@ -106,10 +106,11 @@ pub async fn hybrid_search(
 ///
 /// The lexical index lives in RAM only, so this runs on every startup —
 /// unlike the vector index, which is persisted because embedding is
-/// expensive. Returns the number of indexed memories.
+/// expensive. The rebuild is a single Tantivy commit and runs on the
+/// blocking pool. Returns the number of indexed memories.
 pub async fn rebuild_lexical_from_repo(
     repo: &Arc<MemoryRepo>,
-    lexical: &LexicalIndex,
+    lexical: &Arc<LexicalIndex>,
 ) -> Result<usize, MemoryError> {
     let memories = repo.list_memories(None).await?;
     let docs: Vec<LexicalDoc> = memories
@@ -120,5 +121,8 @@ pub async fn rebuild_lexical_from_repo(
             content: m.content,
         })
         .collect();
-    lexical.rebuild(docs)
+    let lexical = Arc::clone(lexical);
+    traced_spawn_blocking(move || lexical.rebuild(docs))
+        .await
+        .map_err(|e| MemoryError::Join(e.to_string()))?
 }

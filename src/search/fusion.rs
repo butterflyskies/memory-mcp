@@ -43,9 +43,11 @@ impl FusedHit {
 ///
 /// Both inputs must already be sorted best-first; ranks are taken from list
 /// positions. Duplicate names within one list keep their best (first) rank.
-/// The output is sorted by descending fused score, with ties broken by
-/// ascending qualified name so the ordering is fully deterministic. At most
-/// `limit` hits are returned.
+/// The output is sorted by descending fused score. Score ties break
+/// lexical-first (a hit with a lexical contribution outranks a tied hit
+/// without one — so the top lexical hit is never displaced by a tied
+/// semantic-only hit), then by ascending qualified name, so the ordering is
+/// fully deterministic. At most `limit` hits are returned.
 pub fn reciprocal_rank_fusion(
     semantic: &[(String, f32)],
     lexical: &[(String, f32)],
@@ -85,6 +87,10 @@ pub fn reciprocal_rank_fusion(
     hits.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
+            // Lexical wins score ties: the only structural tie is lexical
+            // rank r vs semantic rank r (both contribute 1/(K+r+1)), and an
+            // exact keyword match must not be displaced by it (#55).
+            .then_with(|| b.lexical_score.is_some().cmp(&a.lexical_score.is_some()))
             .then_with(|| a.qualified_name.cmp(&b.qualified_name))
     });
     hits.truncate(limit);
@@ -134,27 +140,30 @@ mod tests {
 
         let hits = reciprocal_rank_fusion(&semantic, &lexical, 10);
 
-        // Lexical rank 0 ties semantic rank 0 and beats every lower
-        // semantic rank, so "needle" lands in the top two.
-        let pos = names(&hits)
-            .iter()
-            .position(|n| *n == "needle")
-            .expect("needle must be present");
-        assert!(pos <= 1, "needle should be in the top 2, got rank {pos}");
-        assert_eq!(hits[pos].match_type(), "lexical");
-        assert_eq!(hits[pos].semantic_distance, None);
+        // Lexical rank 0 ties semantic rank 0 on RRF score, and the
+        // lexical-first tie-break resolves it: "needle" must rank first,
+        // ahead of every semantic-only candidate.
+        assert_eq!(
+            names(&hits)[0],
+            "needle",
+            "top lexical hit must outrank all semantic-only hits"
+        );
+        assert_eq!(hits[0].match_type(), "lexical");
+        assert_eq!(hits[0].semantic_distance, None);
     }
 
     #[test]
-    fn equal_score_ties_break_by_name() {
+    fn equal_score_ties_prefer_lexical_regardless_of_name() {
         // Semantic rank 0 and lexical rank 0 contribute identical RRF
-        // scores; ordering must fall back to the qualified name.
-        let semantic = sem(&[("zzz", 0.1)]);
-        let lexical = sem(&[("aaa", 3.0)]);
+        // scores; the lexical hit must win the tie even when its name
+        // sorts after the semantic hit's.
+        let semantic = sem(&[("aaa", 0.1)]);
+        let lexical = sem(&[("zzz", 3.0)]);
 
         let hits = reciprocal_rank_fusion(&semantic, &lexical, 10);
 
-        assert_eq!(names(&hits), vec!["aaa", "zzz"]);
+        assert_eq!(names(&hits), vec!["zzz", "aaa"]);
+        assert_eq!(hits[0].match_type(), "lexical");
     }
 
     #[test]

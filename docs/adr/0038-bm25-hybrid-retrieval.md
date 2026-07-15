@@ -35,7 +35,11 @@ Key choices:
   (remember, edit, forget, move, incremental reindex) mirror the write
   into the lexical index. Lexical writes are best-effort: a failure
   logs a warning and degrades that memory to semantic-only until the
-  next startup rebuild.
+  next startup rebuild. Mutations are batched (`LexicalOp` lists): each
+  logical operation performs exactly one Tantivy commit and one reader
+  reload — incremental reindex applies the whole changed set in one
+  batch — and the commit runs on the Tokio blocking pool
+  (`apply_async`), never on an async worker thread.
 - **Exact-phrase precedence.** BM25 length normalisation lets a short
   document containing one query term outrank a long document containing
   the exact phrase — the very failure hybrid retrieval exists to fix.
@@ -43,8 +47,9 @@ Key choices:
   strictly above term-only matches. Fusion consumes ranks, not scores.
 - **RRF over score interpolation.** Cosine distances and BM25 scores
   live on incomparable scales; rank fusion needs no normalisation, no
-  tuned weights, and is fully deterministic (ties break on qualified
-  name).
+  tuned weights, and is fully deterministic (score ties break
+  lexical-first — a hit with a lexical contribution outranks a tied hit
+  without one — then on qualified name).
 - **Error asymmetry.** A semantic failure is fatal (preserves recall's
   pre-hybrid error surface); a lexical failure degrades to
   semantic-only with a warning. `LexicalIndex::new()` is infallible —
@@ -57,12 +62,17 @@ Key choices:
 
 ## Consequences
 - Literal phrases buried in long memories are retrievable: the top
-  lexical hit mathematically outranks every semantic-only candidate in
-  the fused list (1/(k+1) beats 1/(k+r) for r > 1).
+  lexical hit outranks every semantic-only candidate in the fused list
+  — 1/(k+1) beats 1/(k+r) for r > 1, and the remaining rank-0 tie
+  (lexical rank 0 vs semantic rank 0, both 1/(k+1)) resolves in the
+  lexical hit's favour via the deterministic lexical-first tie-break.
+  Only candidates found by *both* strategies can rank above it.
 - Recall results gain a `match_type` field (`semantic` / `lexical` /
-  `both`); `distance` is `null` for lexical-only hits. Recall-log
-  entries for lexical-only hits use a `-1.0` distance sentinel, which
-  distance-bucketed stats already exclude (`distance >= 0.0`).
+  `both`). `distance` stays a required numeric field for wire
+  compatibility with pre-hybrid clients: lexical-only hits, which have
+  no embedding distance, carry the `-1.0` sentinel (impossible as a
+  real cosine distance). Recall-log entries use the same sentinel,
+  which distance-bucketed stats already exclude (`distance >= 0.0`).
 - Startup reads all memories once even when the vector index is fresh.
 - The binary grows by the Tantivy dependency tree (pure Rust, no new
   C/C++ FFI beyond the existing zstd already vendored elsewhere).

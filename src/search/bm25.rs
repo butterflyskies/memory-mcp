@@ -4,8 +4,14 @@
 //! on startup (indexing text is cheap, unlike embedding it), so there is no
 //! on-disk index to version or migrate. Writes go through the same handlers
 //! that update the vector index, keeping the two views consistent.
+//!
+//! Mutations are batched: [`LexicalIndex::apply`] takes a list of
+//! [`LexicalOp`]s and performs exactly one Tantivy commit and one reader
+//! reload for the whole batch, and [`LexicalIndex::apply_async`] runs that
+//! blocking work on the Tokio blocking pool so async workers are never
+//! stalled behind a commit.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tantivy::{
     collector::TopDocs,
@@ -17,6 +23,7 @@ use tracing::{debug, warn};
 
 use crate::{
     error::MemoryError,
+    repo::traced_spawn_blocking,
     types::{parse_qualified_name, ScopeFilter},
 };
 
@@ -40,12 +47,27 @@ pub struct LexicalDoc {
     pub content: String,
 }
 
+/// A single mutation applied by [`LexicalIndex::apply`].
+///
+/// Ops within one batch are applied in order (Tantivy serialises them by
+/// opstamp), so a `Remove` followed by an `Upsert` of the same key yields
+/// a fresh document, not a ghost.
+#[derive(Debug, Clone)]
+pub enum LexicalOp {
+    /// Insert or replace the document for the contained key.
+    Upsert(LexicalDoc),
+    /// Delete the document with this qualified name. No-op if absent.
+    Remove(String),
+}
+
 /// In-RAM BM25 index over memory names and content.
 ///
 /// Thread-safe: reads go through a Tantivy [`IndexReader`], writes are
-/// serialised by an internal mutex. Every write commits and reloads the
-/// reader so results are immediately visible — acceptable because writes
-/// happen at memory-mutation frequency, not query frequency.
+/// serialised by an internal mutex. Each *batch* of writes commits and
+/// reloads the reader once so results are immediately visible — acceptable
+/// because writes happen at memory-mutation frequency, not query frequency.
+/// Callers on the async runtime must use [`LexicalIndex::apply_async`],
+/// which moves the commit onto the blocking pool.
 ///
 /// Construction is infallible: if the underlying Tantivy index cannot be
 /// initialised (practically impossible for a RAM directory), the instance
@@ -138,46 +160,81 @@ impl LexicalIndex {
         })
     }
 
+    /// Apply a batch of mutations with exactly one commit and one reader
+    /// reload, regardless of batch size.
+    ///
+    /// Blocking: takes the writer mutex and performs a Tantivy commit.
+    /// Callers on the async runtime must use [`Self::apply_async`] instead.
+    pub fn apply(&self, ops: Vec<LexicalOp>) -> Result<(), MemoryError> {
+        let span = tracing::debug_span!("lexical.apply", ops = ops.len());
+        let _guard = span.enter();
+
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let inner = self.inner()?;
+        let mut writer = inner.lock_writer()?;
+        for op in &ops {
+            match op {
+                LexicalOp::Upsert(item) => {
+                    writer.delete_term(Term::from_field_text(
+                        inner.field_qualified_name,
+                        &item.qualified_name,
+                    ));
+                    let mut doc = TantivyDocument::default();
+                    doc.add_text(inner.field_qualified_name, &item.qualified_name);
+                    doc.add_text(inner.field_name, &item.name);
+                    doc.add_text(inner.field_content, &item.content);
+                    writer.add_document(doc).map_err(lexical_error)?;
+                }
+                LexicalOp::Remove(qualified_name) => {
+                    writer.delete_term(Term::from_field_text(
+                        inner.field_qualified_name,
+                        qualified_name,
+                    ));
+                }
+            }
+        }
+        writer.commit().map_err(lexical_error)?;
+        drop(writer);
+        inner.reader.reload().map_err(lexical_error)
+    }
+
+    /// Run [`Self::apply`] on the Tokio blocking pool.
+    ///
+    /// This is the mutation entry point for async handlers: the writer
+    /// lock, the Tantivy commit, and the reader reload never run on an
+    /// async worker thread.
+    pub async fn apply_async(self: &Arc<Self>, ops: Vec<LexicalOp>) -> Result<(), MemoryError> {
+        let index = Arc::clone(self);
+        traced_spawn_blocking(move || index.apply(ops))
+            .await
+            .map_err(|e| MemoryError::Join(e.to_string()))?
+    }
+
     /// Insert or replace the document for `qualified_name`.
+    ///
+    /// Blocking convenience wrapper over [`Self::apply`] — one commit per
+    /// call. Async callers batch through [`Self::apply_async`].
     pub fn upsert(
         &self,
         qualified_name: &str,
         name: &str,
         content: &str,
     ) -> Result<(), MemoryError> {
-        let span = tracing::debug_span!("lexical.upsert", qualified_name = %qualified_name);
-        let _guard = span.enter();
-
-        let inner = self.inner()?;
-        let mut writer = inner.lock_writer()?;
-        writer.delete_term(Term::from_field_text(
-            inner.field_qualified_name,
-            qualified_name,
-        ));
-        let mut doc = TantivyDocument::default();
-        doc.add_text(inner.field_qualified_name, qualified_name);
-        doc.add_text(inner.field_name, name);
-        doc.add_text(inner.field_content, content);
-        writer.add_document(doc).map_err(lexical_error)?;
-        writer.commit().map_err(lexical_error)?;
-        drop(writer);
-        inner.reader.reload().map_err(lexical_error)
+        self.apply(vec![LexicalOp::Upsert(LexicalDoc {
+            qualified_name: qualified_name.to_string(),
+            name: name.to_string(),
+            content: content.to_string(),
+        })])
     }
 
     /// Remove the document for `qualified_name`. No-op if absent.
+    ///
+    /// Blocking convenience wrapper over [`Self::apply`] — one commit per
+    /// call. Async callers batch through [`Self::apply_async`].
     pub fn remove(&self, qualified_name: &str) -> Result<(), MemoryError> {
-        let span = tracing::debug_span!("lexical.remove", qualified_name = %qualified_name);
-        let _guard = span.enter();
-
-        let inner = self.inner()?;
-        let mut writer = inner.lock_writer()?;
-        writer.delete_term(Term::from_field_text(
-            inner.field_qualified_name,
-            qualified_name,
-        ));
-        writer.commit().map_err(lexical_error)?;
-        drop(writer);
-        inner.reader.reload().map_err(lexical_error)
+        self.apply(vec![LexicalOp::Remove(qualified_name.to_string())])
     }
 
     /// Replace the entire index contents with `docs` in a single commit.
@@ -609,11 +666,83 @@ mod tests {
     }
 
     #[test]
+    fn apply_batches_mixed_ops_in_order_with_one_commit() {
+        let scope = Scope::Root;
+        let index = index_with(&[(&scope, "doomed", "contains magicword here")]);
+
+        // Remove-then-upsert of the same key inside one batch must yield a
+        // fresh document, plus an unrelated upsert — all in a single apply.
+        index
+            .apply(vec![
+                LexicalOp::Remove(key(&scope, "doomed")),
+                LexicalOp::Upsert(LexicalDoc {
+                    qualified_name: key(&scope, "doomed"),
+                    name: "doomed".to_string(),
+                    content: "reborn freshword".to_string(),
+                }),
+                LexicalOp::Upsert(LexicalDoc {
+                    qualified_name: key(&scope, "extra"),
+                    name: "extra".to_string(),
+                    content: "another freshword".to_string(),
+                }),
+            ])
+            .expect("apply");
+
+        assert!(
+            index
+                .search(&ScopeFilter::All, "magicword", 10)
+                .expect("search")
+                .is_empty(),
+            "old content must be gone after the batch"
+        );
+        assert_eq!(
+            index
+                .search(&ScopeFilter::All, "freshword", 10)
+                .expect("search")
+                .len(),
+            2,
+            "both batch upserts must be visible"
+        );
+    }
+
+    #[test]
+    fn apply_empty_batch_is_a_no_op() {
+        let index = LexicalIndex::new();
+        index.apply(Vec::new()).expect("empty batch is fine");
+    }
+
+    #[tokio::test]
+    async fn apply_async_mutations_are_visible_after_await() {
+        let scope = Scope::Root;
+        let index = std::sync::Arc::new(LexicalIndex::new());
+
+        index
+            .apply_async(vec![LexicalOp::Upsert(LexicalDoc {
+                qualified_name: key(&scope, "note"),
+                name: "note".to_string(),
+                content: "asyncword content".to_string(),
+            })])
+            .await
+            .expect("apply_async");
+
+        assert_eq!(
+            index
+                .search(&ScopeFilter::All, "asyncword", 10)
+                .expect("search")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn disabled_instance_errors_on_every_operation() {
         let index = LexicalIndex::disabled();
 
         assert!(index.upsert("key", "name", "content").is_err());
         assert!(index.remove("key").is_err());
+        assert!(index
+            .apply(vec![LexicalOp::Remove("key".to_string())])
+            .is_err());
         assert!(index.rebuild(Vec::new()).is_err());
         assert!(index.search(&ScopeFilter::All, "query", 10).is_err());
     }

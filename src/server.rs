@@ -43,7 +43,7 @@ use crate::{
     index::VectorStore,
     recall_log::{BatchVerdict, RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
-    search::{hybrid_search, FusedHit, LexicalIndex},
+    search::{hybrid_search, FusedHit, LexicalDoc, LexicalIndex, LexicalOp},
     types::{
         parse_qualified_name, AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs,
         ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
@@ -168,29 +168,25 @@ impl Drop for EditStageTiming {
 /// Re-embed and re-index all memories that changed between two commits.
 ///
 /// Removals are processed first so a name that was deleted and re-added in
-/// the same pull gets a fresh entry rather than a ghost.
+/// the same pull gets a fresh entry rather than a ghost. Lexical mutations
+/// are accumulated and applied as one batch (a single Tantivy commit and
+/// reader reload on the blocking pool), not one commit per memory.
 async fn incremental_reindex(
     repo: &Arc<MemoryRepo>,
     embedding: &dyn EmbeddingBackend,
     index: &dyn VectorStore,
-    lexical: &LexicalIndex,
+    lexical: &Arc<LexicalIndex>,
     changes: &ChangedMemories,
 ) -> ReindexStats {
     let mut stats = ReindexStats::default();
+    let mut lexical_ops: Vec<LexicalOp> = Vec::new();
 
     // ---- 1. Removals --------------------------------------------------------
     for name in &changes.removed {
         match parse_qualified_name(name) {
             Ok(mref) => {
                 let canonical = mref.qualified_path();
-                if let Err(e) = lexical.remove(&canonical) {
-                    warn!(
-                        qualified_name = %canonical,
-                        error = %e,
-                        "incremental_reindex: lexical removal failed; stale entry \
-                         will be skipped at recall"
-                    );
-                }
+                lexical_ops.push(LexicalOp::Remove(canonical.clone()));
                 match index.remove(&mref.scope, &canonical) {
                     Ok(()) => {
                         stats.removed += 1;
@@ -273,15 +269,24 @@ async fn incremental_reindex(
                 continue;
             }
         };
-        if let Err(e) = lexical.upsert(&qualified, memory.name.as_str(), &memory.content) {
-            warn!(
-                qualified_name = %qualified,
-                error = %e,
-                "incremental_reindex: lexical upsert failed; memory will not be \
-                 keyword-searchable until restart"
-            );
-        }
+        lexical_ops.push(LexicalOp::Upsert(LexicalDoc {
+            qualified_name: qualified,
+            name: memory.name.as_str().to_string(),
+            content: memory.content.clone(),
+        }));
         to_embed.push((mref.clone(), memory.content));
+    }
+
+    // ---- 3b. Mirror all changes into the lexical index ----------------------
+    // One batch: a single commit and reader reload for the whole changed
+    // set, on the blocking pool. Best-effort — a failure degrades the
+    // changed memories to semantic-only until the next startup rebuild.
+    if let Err(e) = lexical.apply_async(lexical_ops).await {
+        warn!(
+            error = %e,
+            "incremental_reindex: lexical batch update failed; changed memories \
+             will not be keyword-searchable until restart"
+        );
     }
 
     if to_embed.is_empty() {
@@ -506,10 +511,15 @@ impl MemoryServer {
 
             // Lexical index is best-effort: a failure here leaves the memory
             // semantically searchable, and the next startup rebuild heals it.
-            if let Err(e) =
-                state
-                    .lexical
-                    .upsert(&qualified_name, memory.name.as_str(), &memory.content)
+            // The commit runs on the blocking pool, not this async worker.
+            if let Err(e) = state
+                .lexical
+                .apply_async(vec![LexicalOp::Upsert(LexicalDoc {
+                    qualified_name: qualified_name.clone(),
+                    name: memory.name.as_str().to_string(),
+                    content: memory.content.clone(),
+                })])
+                .await
             {
                 warn!(
                     name = %memory.name,
@@ -553,7 +563,8 @@ impl MemoryServer {
         When `truncated` is true, the snippet is incomplete — use the `read` tool with the memory's name and scope \
         to retrieve the full content before acting on it.\n\n\
         Each result also includes `match_type` ('semantic', 'lexical', or 'both') and `distance` \
-        (cosine distance, lower is more similar; null for lexical-only hits, which have no embedding distance).\n\n\
+        (cosine distance, lower is more similar; always numeric — lexical-only hits, which have no \
+        embedding distance, carry the sentinel -1.0).\n\n\
         Scope: pass '<basename-of-your-cwd>' or 'org/team' to search that scope + global memories, \
         'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
@@ -648,7 +659,9 @@ impl MemoryServer {
                     // Lexical-only hits have no embedding distance; the -1.0
                     // sentinel keeps them out of distance-bucketed recall
                     // stats (which filter on distance >= 0.0).
-                    distance: hit.semantic_distance.map_or(-1.0, f64::from),
+                    distance: hit
+                        .semantic_distance
+                        .map_or(LEXICAL_ONLY_DISTANCE_SENTINEL, f64::from),
                 });
 
                 results_vec.push(recall_entry_json(&memory, &hit));
@@ -721,7 +734,11 @@ impl MemoryServer {
             if let Err(e) = state.index.remove(&scope, &qualified_name) {
                 warn!(name = %name, error = %e, "vector removal failed during forget; stale entry will be skipped at recall");
             }
-            if let Err(e) = state.lexical.remove(&qualified_name) {
+            if let Err(e) = state
+                .lexical
+                .apply_async(vec![LexicalOp::Remove(qualified_name.clone())])
+                .await
+            {
                 warn!(name = %name, error = %e, "lexical removal failed during forget; stale entry will be skipped at recall");
             }
 
@@ -827,10 +844,15 @@ impl MemoryServer {
                 index_result.map_err(ErrorData::from)?;
 
                 // Lexical index is best-effort: the next startup rebuild heals it.
-                if let Err(e) =
-                    state
-                        .lexical
-                        .upsert(&qualified_name, memory.name.as_str(), &memory.content)
+                // The commit runs on the blocking pool, not this async worker.
+                if let Err(e) = state
+                    .lexical
+                    .apply_async(vec![LexicalOp::Upsert(LexicalDoc {
+                        qualified_name: qualified_name.clone(),
+                        name: memory.name.as_str().to_string(),
+                        content: memory.content.clone(),
+                    })])
+                    .await
                 {
                     warn!(
                         name = %memory.name,
@@ -973,24 +995,28 @@ impl MemoryServer {
                 );
             }
 
-            // 6. Mirror the move in the lexical index (best-effort).
-            if let Err(e) =
-                state
-                    .lexical
-                    .upsert(&dest_qualified, dest.name.as_str(), &dest.content)
+            // 6. Mirror the move in the lexical index (best-effort). One
+            //    batch: destination upsert + source removal share a single
+            //    commit and reader reload on the blocking pool.
+            if let Err(e) = state
+                .lexical
+                .apply_async(vec![
+                    LexicalOp::Upsert(LexicalDoc {
+                        qualified_name: dest_qualified.clone(),
+                        name: dest.name.as_str().to_string(),
+                        content: dest.content.clone(),
+                    }),
+                    LexicalOp::Remove(source_qualified.clone()),
+                ])
+                .await
             {
                 warn!(
-                    name = %new_name,
+                    name = %name,
+                    new_name = %new_name,
                     error = %e,
                     "lexical index update failed during move; destination will not be \
-                     keyword-searchable until restart"
-                );
-            }
-            if let Err(e) = state.lexical.remove(&source_qualified) {
-                warn!(
-                    name = %name,
-                    error = %e,
-                    "lexical removal failed during move; stale source entry will be skipped at recall"
+                     keyword-searchable and the stale source entry will be skipped \
+                     at recall, until restart"
                 );
             }
 
@@ -1632,10 +1658,20 @@ impl ServerHandler for MemoryServer {
     }
 }
 
+/// Sentinel `distance` for hits that only the lexical strategy returned.
+///
+/// Lexical-only hits have no embedding distance, but the `distance` field
+/// predates hybrid retrieval and was always numeric on the wire — strict
+/// clients deserialize it as a required float, so it must stay numeric
+/// (never `null` or absent). `-1.0` is impossible as a real cosine distance
+/// and matches the recall log's lexical-only sentinel.
+const LEXICAL_ONLY_DISTANCE_SENTINEL: f64 = -1.0;
+
 /// Build one recall result entry as seen on the wire.
 ///
-/// `distance` is the semantic (cosine) distance and is `null` for hits that
-/// only the lexical strategy returned. `match_type` says which strategies
+/// `distance` is the semantic (cosine) distance, or the numeric sentinel
+/// [`LEXICAL_ONLY_DISTANCE_SENTINEL`] (`-1.0`) for hits that only the
+/// lexical strategy returned. `match_type` says which strategies
 /// contributed: `"semantic"`, `"lexical"`, or `"both"`.
 fn recall_entry_json(memory: &Memory, hit: &FusedHit) -> serde_json::Value {
     let (snippet, content_length, truncated) = build_snippet(&memory.content);
@@ -1647,7 +1683,9 @@ fn recall_entry_json(memory: &Memory, hit: &FusedHit) -> serde_json::Value {
         "content": snippet,
         "content_length": content_length,
         "truncated": truncated,
-        "distance": hit.semantic_distance,
+        "distance": hit
+            .semantic_distance
+            .map_or(LEXICAL_ONLY_DISTANCE_SENTINEL, f64::from),
         "match_type": hit.match_type(),
     })
 }
@@ -1910,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_entry_lexical_only_hit_has_null_distance() {
+    fn recall_entry_lexical_only_hit_has_numeric_sentinel_distance() {
         let hit = FusedHit {
             qualified_name: "v1:scope=global;name=wire-test".to_string(),
             semantic_distance: None,
@@ -1920,11 +1958,71 @@ mod tests {
 
         let entry = recall_entry_json(&wire_test_memory(), &hit);
 
-        assert!(
-            entry["distance"].is_null(),
-            "lexical-only hits have no embedding distance"
-        );
+        // The pre-hybrid wire contract has `distance` as a required numeric
+        // field; lexical-only hits must keep it numeric (never null/absent)
+        // so strict older clients still deserialize the entry.
+        let distance = entry["distance"]
+            .as_f64()
+            .expect("distance must stay numeric for lexical-only hits");
+        assert!((distance - LEXICAL_ONLY_DISTANCE_SENTINEL).abs() < 1e-12);
         assert_eq!(entry["match_type"], "lexical");
+    }
+
+    #[test]
+    fn recall_entry_lexical_only_hit_keeps_the_full_contract_shape() {
+        // Both hit shapes — with a real distance and with the sentinel —
+        // must expose exactly the same field set.
+        let hit = FusedHit {
+            qualified_name: "v1:scope=global;name=wire-test".to_string(),
+            semantic_distance: None,
+            lexical_score: Some(7.5),
+            score: 0.016,
+        };
+
+        let entry = recall_entry_json(&wire_test_memory(), &hit);
+
+        assert_eq!(
+            entry_keys(&entry),
+            vec![
+                "content",
+                "content_length",
+                "distance",
+                "id",
+                "match_type",
+                "name",
+                "scope",
+                "tags",
+                "truncated",
+            ]
+        );
+    }
+
+    #[test]
+    fn recall_entry_deserializes_for_a_strict_numeric_distance_client() {
+        // Simulates a pre-hybrid client that models `distance` as a
+        // required f32 — both hit shapes must satisfy it.
+        #[derive(serde::Deserialize)]
+        struct StrictClientEntry {
+            #[allow(dead_code)]
+            name: String,
+            distance: f32,
+        }
+
+        for semantic_distance in [Some(0.25_f32), None] {
+            let hit = FusedHit {
+                qualified_name: "v1:scope=global;name=wire-test".to_string(),
+                semantic_distance,
+                lexical_score: Some(7.5),
+                score: 0.016,
+            };
+            let entry = recall_entry_json(&wire_test_memory(), &hit);
+            let parsed: StrictClientEntry = serde_json::from_value(entry)
+                .expect("strict numeric-distance clients must keep working");
+            assert!(
+                parsed.distance >= -1.0,
+                "sentinel is the only negative value"
+            );
+        }
     }
 
     #[test]
