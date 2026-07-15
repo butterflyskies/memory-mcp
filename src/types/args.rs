@@ -8,6 +8,8 @@ use crate::{
     repo::MemoryRepo,
 };
 
+pub(crate) const LIST_MAX_LIMIT: usize = 100;
+
 // ---------------------------------------------------------------------------
 // Tool argument structs
 // ---------------------------------------------------------------------------
@@ -122,9 +124,20 @@ pub struct ListArgs {
     /// Scope: 'global', a bare namespace path like 'my-project' or 'org/team', 'all', or omit for global-only. Use 'all' to list everything.
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+/// Wire arguments for the paginated `list` MCP tool.
+///
+/// Kept crate-private so extending the tool's JSON request does not break
+/// downstream Rust callers that construct the legacy public [`ListArgs`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ListToolArgs {
+    /// Scope: 'global', a bare namespace path like 'my-project' or 'org/team', 'all', or omit for global-only. Use 'all' to list everything.
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Maximum number of summaries to return. Defaults to 50; maximum 100.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 100))]
+    #[schemars(range(min = 1, max = LIST_MAX_LIMIT))]
     pub limit: Option<usize>,
     /// Opaque cursor returned by a previous list page. Cursors are bound to the queried scope.
     #[serde(default)]
@@ -414,6 +427,34 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn list_tool_args_deserializes_minimal() {
+        let args: ListToolArgs = serde_json::from_str(r#"{"scope":"all"}"#).unwrap();
+        assert_eq!(args.scope.as_deref(), Some("all"));
+        assert_eq!(args.limit, None);
+        assert_eq!(args.cursor, None);
+        assert_eq!(args.fields, None);
+    }
+
+    #[test]
+    fn list_tool_args_deserializes_full() {
+        let args: ListToolArgs = serde_json::from_str(
+            r#"{"scope":"all","limit":25,"cursor":"lc1_abc","fields":["name","scope"]}"#,
+        )
+        .unwrap();
+        assert_eq!(args.scope.as_deref(), Some("all"));
+        assert_eq!(args.limit, Some(25));
+        assert_eq!(args.cursor.as_deref(), Some("lc1_abc"));
+        assert_eq!(args.fields, Some(vec![ListField::Name, ListField::Scope]));
+    }
+
+    #[test]
+    fn list_tool_args_rejects_unknown_field_variant() {
+        let error = serde_json::from_str::<ListToolArgs>(r#"{"fields":["content"]}"#)
+            .expect_err("unknown projection field must fail");
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
     fn batch_mark_applied_deserializes_minimal() {
         let json = r#"{
             "verdicts": [
@@ -483,7 +524,7 @@ mod tests {
 
     #[test]
     fn list_schema_exposes_pagination_and_projection_inputs() {
-        let schema = schemars::schema_for!(ListArgs);
+        let schema = schemars::schema_for!(ListToolArgs);
         let root = serde_json::to_value(&schema).unwrap();
         let props = root["properties"].as_object().unwrap();
 
