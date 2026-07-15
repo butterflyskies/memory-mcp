@@ -22,6 +22,8 @@ pub mod index;
 pub mod recall_log;
 /// Git-backed memory repository — read, write, sync, and diff operations.
 pub mod repo;
+/// Hybrid retrieval — semantic + BM25 lexical search merged via rank fusion.
+pub mod search;
 /// MCP server implementation — tool handlers for the memory protocol.
 pub mod server;
 /// Domain types: memories, scopes, metadata, validation, and application state.
