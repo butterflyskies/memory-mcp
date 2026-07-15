@@ -223,16 +223,32 @@ pub enum PullResult {
 // ---------------------------------------------------------------------------
 
 /// Memories that changed between two git commits.
+///
+/// References are resolved from each changed file's YAML frontmatter (the
+/// same authority `list_memories` uses), never from ad-hoc splitting of the
+/// on-disk path — which is ambiguous for hierarchical scopes, where
+/// `projects/a/b/mem.md` could be scope `a/b`, name `mem` or scope `a`,
+/// name `b/mem`. Files that cannot be resolved (unparseable frontmatter,
+/// non-UTF-8 content) are counted in `unresolved` so callers can degrade
+/// derived indexes instead of committing a silently reduced change set.
 #[derive(Debug, Default)]
 pub struct ChangedMemories {
-    /// Qualified names (e.g. `"global/foo"`) that were added or modified.
-    pub upserted: Vec<String>,
-    /// Qualified names that were deleted.
-    pub removed: Vec<String>,
+    /// Memories that were added or modified (resolved from the new tree).
+    pub upserted: Vec<super::MemoryRef>,
+    /// Memories that were deleted (resolved from the old tree).
+    pub removed: Vec<super::MemoryRef>,
+    /// Changed memory files whose reference could not be resolved. Any
+    /// non-zero value means the change set is incomplete: derived indexes
+    /// must be marked for rebuild rather than treated as fully mirrored.
+    pub unresolved: usize,
 }
 
 impl ChangedMemories {
-    /// Returns `true` if there are no changes.
+    /// Returns `true` if there are no resolved changes to apply.
+    ///
+    /// Deliberately ignores `unresolved` — callers must check that field
+    /// separately, because an all-unresolved change set still requires the
+    /// derived indexes to be degraded and repaired.
     pub fn is_empty(&self) -> bool {
         self.upserted.is_empty() && self.removed.is_empty()
     }

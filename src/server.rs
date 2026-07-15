@@ -43,7 +43,10 @@ use crate::{
     index::VectorStore,
     recall_log::{BatchVerdict, RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
-    search::{hybrid_search, spawn_lexical_repair, FusedHit, LexicalDoc, LexicalIndex, LexicalOp},
+    search::{
+        bm25::DegradeOnDrop, hybrid_search, spawn_lexical_repair, FusedHit, LexicalDoc,
+        LexicalIndex, LexicalOp,
+    },
     types::{
         parse_qualified_name, AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs,
         ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
@@ -179,9 +182,16 @@ impl Drop for EditStageTiming {
 /// The unit runs on its own task: dropping the returned future (client
 /// disconnect, timeout, abort) only abandons the *response*. The unit itself
 /// always runs to completion, either dispatching the mirror or failing
-/// through the normal paths that flag the index degraded. If the unit's task
-/// itself dies (panic or executor teardown), the git outcome is unknowable,
-/// so the lexical index is conservatively marked rebuild-required.
+/// through the normal paths that flag the index degraded.
+///
+/// Supervision is cancellation-independent (#314): the detached task itself
+/// owns the dirty-marking through a [`DegradeOnDrop`] guard armed before the
+/// unit runs and defused only on normal completion. If the unit panics at an
+/// unknown point (possibly after the git commit) or the runtime drops the
+/// task, the guard's `Drop` marks the index rebuild-required — no surviving
+/// requester is needed to observe the failure. The `JoinError` arm below is
+/// only the *reporting* path for a requester that is still awaiting; it is
+/// not what the contract relies on.
 async fn shielded_mutation_unit<T, F>(
     lexical: &Arc<LexicalIndex>,
     unit: F,
@@ -190,12 +200,19 @@ where
     F: std::future::Future<Output = Result<T, MemoryError>> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::spawn(unit.in_current_span()).await {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            lexical.mark_rebuild_required("mutation unit task did not run to completion");
-            Err(MemoryError::Join(format!("mutation unit task failed: {e}")))
+    let guard_lexical = Arc::clone(lexical);
+    let worker = tokio::spawn(
+        async move {
+            let guard = DegradeOnDrop::new(guard_lexical, "mutation unit died before completing");
+            let outcome = unit.await;
+            guard.defuse();
+            outcome
         }
+        .in_current_span(),
+    );
+    match worker.await {
+        Ok(outcome) => outcome,
+        Err(e) => Err(MemoryError::Join(format!("mutation unit task failed: {e}"))),
     }
 }
 
@@ -209,6 +226,15 @@ where
 /// the same pull gets a fresh entry rather than a ghost. Lexical mutations
 /// are accumulated and applied as one batch (a single Tantivy commit and
 /// reader reload on the blocking pool), not one commit per memory.
+///
+/// Complete-or-degraded (#314): the changed refs arrive pre-resolved from
+/// frontmatter (see `MemoryRepo::diff_changed_memories`) and their canonical
+/// keys come from `MemoryRef::qualified_path` — the same function every
+/// index entry was written with — so removals and upserts can never target
+/// an ambiguously derived key. Any preparation gap that would reduce the
+/// lexical batch (a changed memory that cannot be read back) marks the
+/// index rebuild-required *before* the reduced batch commits and schedules
+/// repair, instead of committing the partial mirror as healthy.
 async fn incremental_reindex(
     repo: &Arc<MemoryRepo>,
     embedding: &dyn EmbeddingBackend,
@@ -218,82 +244,32 @@ async fn incremental_reindex(
 ) -> ReindexStats {
     let mut stats = ReindexStats::default();
     let mut lexical_ops: Vec<LexicalOp> = Vec::new();
+    let mut lexical_gap = false;
 
     // ---- 1. Removals --------------------------------------------------------
-    for name in &changes.removed {
-        match parse_qualified_name(name) {
-            Ok(mref) => {
-                let canonical = mref.qualified_path();
-                lexical_ops.push(LexicalOp::Remove(canonical.clone()));
-                match index.remove(&mref.scope, &canonical) {
-                    Ok(()) => {
-                        stats.removed += 1;
-                    }
-                    Err(e) => {
-                        // For on-disk path keys with multi-segment hierarchical scopes,
-                        // parse_qualified_name splits at the first slash, producing the
-                        // wrong scope/name split. The canonical key computed here will
-                        // then not match the actual index entry, and the remove is a
-                        // no-op. This is acceptable: hierarchical scopes are new in this
-                        // release, so no existing index entries use the legacy on-disk
-                        // path form with multi-segment scopes. A full reindex resolves
-                        // any stale entries if they exist.
-                        let is_multi_segment_legacy = name.starts_with("projects/")
-                            && name
-                                .strip_prefix("projects/")
-                                .map(|rest| rest.matches('/').count() >= 2)
-                                .unwrap_or(false);
-                        if is_multi_segment_legacy {
-                            warn!(
-                                qualified_name = %name,
-                                canonical = %canonical,
-                                error = %e,
-                                "incremental_reindex: removal of multi-segment legacy path key \
-                                 failed (scope ambiguity); a full reindex may be needed"
-                            );
-                        } else {
-                            warn!(
-                                qualified_name = %name,
-                                error = %e,
-                                "incremental_reindex: failed to remove vector; skipping"
-                            );
-                            stats.errors += 1;
-                        }
-                    }
-                }
+    for mref in &changes.removed {
+        let canonical = mref.qualified_path();
+        lexical_ops.push(LexicalOp::Remove(canonical.clone()));
+        match index.remove(&mref.scope, &canonical) {
+            Ok(()) => {
+                stats.removed += 1;
             }
             Err(e) => {
                 warn!(
-                    qualified_name = %name,
+                    qualified_name = %canonical,
                     error = %e,
-                    "incremental_reindex: cannot parse qualified name for removal; skipping"
+                    "incremental_reindex: failed to remove vector; skipping"
                 );
-                // If we can't parse the name, we can't look it up — not an indexing error.
+                stats.errors += 1;
             }
         }
         // If not in index, remove is a no-op — not an error.
     }
 
-    // ---- 2. Resolve MemoryRefs for upserts ----------------------------------
-    let mut refs: Vec<MemoryRef> = Vec::new();
-    for qualified in &changes.upserted {
-        match parse_qualified_name(qualified) {
-            Ok(mref) => refs.push(mref),
-            Err(e) => {
-                warn!(
-                    qualified_name = %qualified,
-                    error = %e,
-                    "incremental_reindex: cannot parse qualified name; skipping"
-                );
-                stats.errors += 1;
-            }
-        }
-    }
-
-    // ---- 3. Read memories from disk -----------------------------------------
+    // ---- 2. Read upserted memories from disk ---------------------------------
     // (MemoryRef, content)
     let mut to_embed: Vec<(MemoryRef, String)> = Vec::new();
-    for mref in &refs {
+    for mref in &changes.upserted {
         let qualified = mref.qualified_path();
         let memory = match repo.read_memory(&mref.name, &mref.scope).await {
             Ok(m) => m,
@@ -301,9 +277,13 @@ async fn incremental_reindex(
                 warn!(
                     qualified_name = %qualified,
                     error = %e,
-                    "incremental_reindex: failed to read memory; skipping"
+                    "incremental_reindex: failed to read changed memory; lexical \
+                     batch is incomplete — marking index rebuild-required"
                 );
                 stats.errors += 1;
+                lexical_gap = true;
+                lexical
+                    .mark_rebuild_required("incremental reindex could not read a changed memory");
                 continue;
             }
         };
@@ -315,10 +295,12 @@ async fn incremental_reindex(
         to_embed.push((mref.clone(), memory.content));
     }
 
-    // ---- 3b. Mirror all changes into the lexical index ----------------------
+    // ---- 2b. Mirror all changes into the lexical index ----------------------
     // One batch: a single commit and reader reload for the whole changed
     // set, on the blocking pool. Best-effort — a failure flags the index
     // degraded (semantic-only recall) and repair rebuilds from git truth.
+    // A preparation gap above already flagged the index before this partial
+    // batch could commit; repair converges it either way.
     if let Err(e) = lexical.apply_async(lexical_ops).await {
         warn!(
             error = %e,
@@ -326,13 +308,15 @@ async fn incremental_reindex(
              degraded until repair completes"
         );
         spawn_lexical_repair(repo, lexical);
+    } else if lexical_gap {
+        spawn_lexical_repair(repo, lexical);
     }
 
     if to_embed.is_empty() {
         return stats;
     }
 
-    // ---- 4. Batch embed all content -----------------------------------------
+    // ---- 3. Batch embed all content -----------------------------------------
     let contents: Vec<String> = to_embed.iter().map(|(_, c)| c.clone()).collect();
     let vectors = match embedding.embed(&contents).await {
         Ok(v) => v,
@@ -362,7 +346,7 @@ async fn incremental_reindex(
         }
     };
 
-    // ---- 5. Update index entries --------------------------------------------
+    // ---- 4. Update index entries --------------------------------------------
     for ((mref, _), vector) in to_embed.iter().zip(vectors.iter()) {
         let qualified_name = mref.qualified_path();
         let is_update = index.find_by_name(&qualified_name).is_some();
@@ -388,6 +372,97 @@ async fn incremental_reindex(
     }
 
     stats
+}
+
+/// Mirror a pull's git changes into the vector and lexical indexes.
+///
+/// Runs inside sync's cancellation-shielded unit, after `repo.pull` has
+/// already moved git truth. Complete-or-degraded (#314): any failure
+/// preparing the mirror — the pulled-range diff erroring, the diff task
+/// dying, or pulled files that cannot be resolved to memory references —
+/// marks the lexical index rebuild-required and schedules repair, so a
+/// partial or stale mirror can never keep reporting `Available`.
+async fn mirror_pulled_changes(
+    state: &Arc<AppState>,
+    old_head: [u8; 20],
+    new_head: [u8; 20],
+) -> Result<Option<ReindexStats>, MemoryError> {
+    let repo = Arc::clone(&state.repo);
+    let changes = match crate::repo::traced_spawn_blocking(move || {
+        repo.diff_changed_memories(old_head, new_head)
+    })
+    .await
+    {
+        Ok(Ok(changes)) => changes,
+        Ok(Err(e)) => {
+            state.lexical.mark_rebuild_required(
+                "post-pull change diff failed — pulled changes not mirrored",
+            );
+            spawn_lexical_repair(&state.repo, &state.lexical);
+            return Err(e);
+        }
+        Err(e) => {
+            state
+                .lexical
+                .mark_rebuild_required("post-pull change diff task did not run to completion");
+            spawn_lexical_repair(&state.repo, &state.lexical);
+            return Err(MemoryError::Join(e.to_string()));
+        }
+    };
+
+    if changes.unresolved > 0 {
+        // Some pulled files could not be resolved to memory references, so
+        // the mirror below is incomplete by construction. Flag *before* the
+        // reduced batch commits; repair (a rebuild from `list_memories`
+        // truth, which applies the same resolution rules) converges
+        // deterministically.
+        warn!(
+            unresolved = changes.unresolved,
+            "pulled changes contained unresolvable memory files; lexical \
+             mirror incomplete — marking index rebuild-required"
+        );
+        state
+            .lexical
+            .mark_rebuild_required("pulled changes contained unresolvable memory files");
+    }
+
+    let mut reindex_stats = None;
+    let mut reindex_failed_completely = false;
+    if !changes.is_empty() {
+        let stats = incremental_reindex(
+            &state.repo,
+            state.embedding.as_ref(),
+            state.index.as_ref(),
+            &state.lexical,
+            &changes,
+        )
+        .instrument(tracing::info_span!("server.incremental_reindex"))
+        .await;
+        info!(
+            added = stats.added,
+            updated = stats.updated,
+            removed = stats.removed,
+            errors = stats.errors,
+            "incremental reindex complete"
+        );
+        reindex_failed_completely = stats.added == 0 && stats.updated == 0 && stats.errors > 0;
+        reindex_stats = Some(stats);
+    }
+
+    if changes.unresolved > 0 {
+        spawn_lexical_repair(&state.repo, &state.lexical);
+    }
+
+    // Advance the stored SHA so the next startup doesn't trigger a full
+    // reindex for changes already processed. Skip when every embed failed
+    // so the next startup retries.
+    if !reindex_failed_completely {
+        if let Some(sha) = state.repo.head_sha().await {
+            state.index.set_commit_sha(Some(&sha));
+        }
+    }
+
+    Ok(reindex_stats)
 }
 
 /// Re-embed and re-index all memories in the repository.
@@ -1339,44 +1414,13 @@ impl MemoryServer {
                         };
 
                         if let Some((old_head, new_head)) = oid_range {
-                            let repo = Arc::clone(&unit_state.repo);
-                            let changes = crate::repo::traced_spawn_blocking(move || {
-                                repo.diff_changed_memories(old_head, new_head)
-                            })
-                            .await
-                            .map_err(|e| MemoryError::Join(e.to_string()))??;
-
-                            let mut reindex_failed_completely = false;
-                            if !changes.is_empty() {
-                                let stats = incremental_reindex(
-                                    &unit_state.repo,
-                                    unit_state.embedding.as_ref(),
-                                    unit_state.index.as_ref(),
-                                    &unit_state.lexical,
-                                    &changes,
-                                )
-                                .instrument(tracing::info_span!("server.incremental_reindex"))
-                                .await;
-                                info!(
-                                    added = stats.added,
-                                    updated = stats.updated,
-                                    removed = stats.removed,
-                                    errors = stats.errors,
-                                    "incremental reindex complete"
-                                );
-                                reindex_failed_completely =
-                                    stats.added == 0 && stats.updated == 0 && stats.errors > 0;
-                                reindex_stats = Some(stats);
-                            }
-
-                            // Advance the stored SHA so the next startup doesn't trigger
-                            // a full reindex for changes already processed. Skip when every
-                            // embed failed so the next startup retries.
-                            if !reindex_failed_completely {
-                                if let Some(sha) = unit_state.repo.head_sha().await {
-                                    unit_state.index.set_commit_sha(Some(&sha));
-                                }
-                            }
+                            // Complete-or-degraded: the pull has already
+                            // moved git truth, so `mirror_pulled_changes`
+                            // owns flagging the lexical index and scheduling
+                            // repair for every preparation failure before
+                            // propagating the error (#314).
+                            reindex_stats =
+                                mirror_pulled_changes(&unit_state, old_head, new_head).await?;
                         }
 
                         Ok((status, reindex_stats, has_remote))
@@ -2374,8 +2418,12 @@ mod tests {
             state.repo.save_memory(&memory).await.expect("save");
 
             let changes = ChangedMemories {
-                upserted: vec![qualified(&Scope::Root, "pulled")],
+                upserted: vec![MemoryRef::new(
+                    Scope::Root,
+                    MemoryName::new("pulled".to_string()).unwrap(),
+                )],
                 removed: vec![],
+                unresolved: 0,
             };
 
             state.lexical.fail_next(FailPoint::Commit);
@@ -2665,11 +2713,25 @@ mod tests {
                 .await;
         }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn sync_cancelled_after_pull_commit_still_reindexes() {
-            use crate::auth::AuthProvider;
+        // -------------------------------------------------------------------
+        // Sync fixture: bare origin + writer repo + server state over the
+        // same origin, so tests can author pulled changes.
+        // -------------------------------------------------------------------
 
-            // Bare origin holding one memory pushed from a writer repo.
+        struct SyncFixture {
+            _remote_dir: tempfile::TempDir,
+            writer_dir: tempfile::TempDir,
+            writer: Arc<MemoryRepo>,
+            _server_dir: tempfile::TempDir,
+            state: Arc<AppState>,
+            server: MemoryServer,
+        }
+
+        fn sync_auth() -> AuthProvider {
+            AuthProvider::with_token("ghp_fake_token")
+        }
+
+        fn sync_fixture() -> SyncFixture {
             let remote_dir = tempfile::tempdir().expect("tempdir");
             git2::Repository::init_bare(remote_dir.path()).expect("bare init");
             let remote_url = format!("file://{}", remote_dir.path().display());
@@ -2679,18 +2741,7 @@ mod tests {
                 MemoryRepo::init_or_open(writer_dir.path(), Some(&remote_url))
                     .expect("writer repo"),
             );
-            let memory = Memory::from_validated(
-                MemoryName::new("pulled".to_string()).unwrap(),
-                "syncword content".to_string(),
-                MemoryMetadata::new(Scope::Root, vec![], None),
-            );
-            writer.save_memory(&memory).await.expect("save");
-            writer
-                .push(&AuthProvider::with_token("ghp_fake_token"), "main")
-                .await
-                .expect("push");
 
-            // Server over its own repo pointing at the same origin.
             let server_dir = tempfile::tempdir().expect("tempdir");
             let repo = Arc::new(
                 MemoryRepo::init_or_open(server_dir.path(), Some(&remote_url))
@@ -2701,23 +2752,79 @@ mod tests {
                 "main".to_string(),
                 Box::new(MockEmbedding),
                 Box::new(InMemoryStore::new(4)),
-                AuthProvider::with_token("ghp_fake_token"),
+                sync_auth(),
                 HealthRegistry::new(),
                 None,
             ));
             let server = MemoryServer::new(Arc::clone(&state));
 
-            let sync_server = server.clone();
-            let handle = tokio::spawn(async move {
-                sync_server
-                    .sync(
-                        Parameters(SyncArgs {
-                            pull_first: Some(true),
-                        }),
-                        Extension(parts()),
-                    )
-                    .await
-            });
+            SyncFixture {
+                _remote_dir: remote_dir,
+                writer_dir,
+                writer,
+                _server_dir: server_dir,
+                state,
+                server,
+            }
+        }
+
+        async fn save_to_writer(fx: &SyncFixture, scope: &Scope, name: &str, content: &str) {
+            let memory = Memory::from_validated(
+                MemoryName::new(name.to_string()).unwrap(),
+                content.to_string(),
+                MemoryMetadata::new(scope.clone(), vec![], None),
+            );
+            fx.writer.save_memory(&memory).await.expect("writer save");
+        }
+
+        async fn push_writer(fx: &SyncFixture) {
+            fx.writer.push(&sync_auth(), "main").await.expect("push");
+        }
+
+        /// Commit a raw file into the writer repo, bypassing memory
+        /// validation — for authoring pulled files that `save_memory` would
+        /// refuse to produce.
+        ///
+        /// Must be the *last* write before pushing: it opens a fresh
+        /// `git2::Repository` handle whose index is read from disk, whereas
+        /// a later `save_memory` through the writer's cached handle could
+        /// write a tree from a stale index snapshot that drops this file.
+        fn raw_commit_to_writer(fx: &SyncFixture, rel_path: &str, content: &str) {
+            let repo = git2::Repository::open(fx.writer_dir.path()).expect("open writer");
+            let full = fx.writer_dir.path().join(rel_path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&full, content).expect("write");
+            let mut index = repo.index().expect("index");
+            index.add_path(std::path::Path::new(rel_path)).expect("add");
+            index.write().expect("index write");
+            let tree_oid = index.write_tree().expect("write tree");
+            let tree = repo.find_tree(tree_oid).expect("tree");
+            let sig = git2::Signature::now("test", "test@test.com").expect("sig");
+            let parent = repo.head().expect("head").peel_to_commit().expect("commit");
+            repo.commit(Some("HEAD"), &sig, &sig, "raw commit", &tree, &[&parent])
+                .expect("commit");
+        }
+
+        async fn run_sync(server: &MemoryServer) -> Result<String, ErrorData> {
+            server
+                .sync(
+                    Parameters(SyncArgs {
+                        pull_first: Some(true),
+                    }),
+                    Extension(parts()),
+                )
+                .await
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sync_cancelled_after_pull_commit_still_reindexes() {
+            let fx = sync_fixture();
+            save_to_writer(&fx, &Scope::Root, "pulled", "syncword content").await;
+            push_writer(&fx).await;
+            let state = Arc::clone(&fx.state);
+
+            let sync_server = fx.server.clone();
+            let handle = tokio::spawn(async move { run_sync(&sync_server).await });
 
             // Gate: the pull's git commits are on disk…
             await_git_truth(|| {
@@ -2731,8 +2838,200 @@ mod tests {
             let _ = handle.await;
 
             // The shielded pull+reindex unit still mirrors the pulled memory.
-            assert_lexical_converges(&state, "syncword", &[qualified(&Scope::Root, "pulled")])
+            assert_lexical_converges(&fx.state, "syncword", &[qualified(&Scope::Root, "pulled")])
                 .await;
+        }
+
+        // -------------------------------------------------------------------
+        // Post-pull complete-or-degraded receipts (#314 round three,
+        // finding 1)
+        //
+        // After a pull has moved git truth, the lexical mirror preparation
+        // must be complete-or-degraded: hierarchical-scope changes resolve
+        // through frontmatter to the canonical key (never ad-hoc path
+        // splitting), and every preparation gap — diff failure, unresolvable
+        // pulled file, unreadable changed memory — marks the index
+        // rebuild-required and schedules deterministic repair instead of
+        // committing a reduced mirror as healthy.
+        // -------------------------------------------------------------------
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sync_pulled_hierarchical_scope_edit_targets_the_right_key() {
+            let fx = sync_fixture();
+            let scope_ab = Scope::parse_or_default(Some("a/b")).unwrap();
+            let scope_a = Scope::parse_or_default(Some("a")).unwrap();
+
+            // `projects/a/b/mem.md` is the ambiguous case: path splitting
+            // would read it as scope `a`, name `b/mem`. The sibling in
+            // scope `a` guards against prefix cross-talk.
+            save_to_writer(&fx, &scope_ab, "mem", "hieroldword payload").await;
+            save_to_writer(&fx, &scope_a, "sibling", "siblingword payload").await;
+            push_writer(&fx).await;
+
+            run_sync(&fx.server).await.expect("first sync");
+            assert_lexical_converges(&fx.state, "hieroldword", &[qualified(&scope_ab, "mem")])
+                .await;
+            assert_lexical_converges(&fx.state, "siblingword", &[qualified(&scope_a, "sibling")])
+                .await;
+
+            // Writer edits the hierarchical-scope memory and pushes.
+            fx.writer
+                .pull(&sync_auth(), "main")
+                .await
+                .expect("writer pull");
+            save_to_writer(&fx, &scope_ab, "mem", "hiernewword payload").await;
+            push_writer(&fx).await;
+
+            run_sync(&fx.server).await.expect("second sync");
+
+            // The edit must land on the canonical `a/b` key: new content
+            // searchable there, no ghost of the old content under any key.
+            assert_lexical_converges(&fx.state, "hiernewword", &[qualified(&scope_ab, "mem")])
+                .await;
+            let stale = fx
+                .state
+                .lexical
+                .search(&ScopeFilter::All, "hieroldword", 10)
+                .expect("post-sync search");
+            assert!(
+                stale.is_empty(),
+                "old content survived under a misresolved key: {stale:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sync_pulled_hierarchical_scope_delete_removes_the_right_key() {
+            let fx = sync_fixture();
+            let scope_ab = Scope::parse_or_default(Some("a/b")).unwrap();
+            let scope_a = Scope::parse_or_default(Some("a")).unwrap();
+
+            save_to_writer(&fx, &scope_ab, "mem", "doomedhierword payload").await;
+            save_to_writer(&fx, &scope_a, "keeper", "keeperword payload").await;
+            push_writer(&fx).await;
+
+            run_sync(&fx.server).await.expect("first sync");
+            assert_lexical_converges(&fx.state, "doomedhierword", &[qualified(&scope_ab, "mem")])
+                .await;
+
+            // Writer deletes the hierarchical-scope memory and pushes.
+            fx.writer
+                .pull(&sync_auth(), "main")
+                .await
+                .expect("writer pull");
+            fx.writer
+                .delete_memory(&MemoryName::new("mem".to_string()).unwrap(), &scope_ab)
+                .await
+                .expect("writer delete");
+            push_writer(&fx).await;
+
+            run_sync(&fx.server).await.expect("second sync");
+
+            // The removal must target the canonical `a/b` key (a misparsed
+            // `scope=a;name=b/mem` removal would be a silent no-op, leaving
+            // a ghost), and the `a`-scoped sibling must survive.
+            assert_lexical_converges(&fx.state, "doomedhierword", &[]).await;
+            assert_lexical_converges(&fx.state, "keeperword", &[qualified(&scope_a, "keeper")])
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sync_pulled_unresolvable_file_marks_degraded_and_repairs() {
+            let fx = sync_fixture();
+            save_to_writer(&fx, &Scope::Root, "good", "goodword payload").await;
+            raw_commit_to_writer(&fx, "global/broken.md", "not a parseable memory");
+            push_writer(&fx).await;
+
+            // Hold the repair slot so the degraded window is observable
+            // instead of racing the background repair.
+            assert!(fx.state.lexical.try_claim_repair());
+
+            run_sync(&fx.server)
+                .await
+                .expect("sync stays best-effort for unresolvable pulled files");
+            assert!(
+                fx.state.lexical.is_degraded(),
+                "an unresolvable pulled file must mark the index rebuild-required"
+            );
+
+            // Release the slot; repair converges from git truth (the same
+            // resolution rules skip the unparseable file).
+            fx.state.lexical.finish_repair();
+            spawn_lexical_repair(&fx.state.repo, &fx.state.lexical);
+            assert_lexical_converges(&fx.state, "goodword", &[qualified(&Scope::Root, "good")])
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sync_pulled_unreadable_memory_marks_degraded_and_repairs() {
+            let fx = sync_fixture();
+            // A pulled file whose frontmatter scope disagrees with its
+            // on-disk location: the resolved reference cannot be read back
+            // from disk — the read-failure preparation gap.
+            let elsewhere = Scope::parse_or_default(Some("somewhere/else")).unwrap();
+            let misplaced = Memory::from_validated(
+                MemoryName::new("misplaced".to_string()).unwrap(),
+                "misplacedword payload".to_string(),
+                MemoryMetadata::new(elsewhere.clone(), vec![], None),
+            )
+            .to_markdown()
+            .expect("markdown");
+            save_to_writer(&fx, &Scope::Root, "good", "goodword payload").await;
+            raw_commit_to_writer(&fx, "global/misplaced.md", &misplaced);
+            push_writer(&fx).await;
+
+            assert!(fx.state.lexical.try_claim_repair());
+
+            run_sync(&fx.server)
+                .await
+                .expect("sync stays best-effort for unreadable changed memories");
+            assert!(
+                fx.state.lexical.is_degraded(),
+                "an unreadable changed memory must mark the index rebuild-required \
+                 instead of committing the reduced batch as healthy"
+            );
+
+            // Repair reads the misplaced file through `list_memories`
+            // (frontmatter authority), so convergence lands it under its
+            // canonical frontmatter key.
+            fx.state.lexical.finish_repair();
+            spawn_lexical_repair(&fx.state.repo, &fx.state.lexical);
+            assert_lexical_converges(
+                &fx.state,
+                "misplacedword",
+                &[qualified(&elsewhere, "misplaced")],
+            )
+            .await;
+            assert_lexical_converges(&fx.state, "goodword", &[qualified(&Scope::Root, "good")])
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn post_pull_diff_failure_marks_degraded_and_schedules_repair() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            let memory = Memory::from_validated(
+                MemoryName::new("note".to_string()).unwrap(),
+                "diffword payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&memory).await.expect("save");
+
+            // Hold the repair slot so the degraded window is observable.
+            assert!(state.lexical.try_claim_repair());
+
+            // Bogus OIDs: the post-pull diff itself fails after git truth
+            // has (nominally) moved.
+            let result = mirror_pulled_changes(&state, [0x11; 20], [0x22; 20]).await;
+            assert!(result.is_err(), "diff failure must propagate");
+            assert!(
+                state.lexical.is_degraded(),
+                "a post-pull diff failure must mark the index rebuild-required"
+            );
+
+            state.lexical.finish_repair();
+            spawn_lexical_repair(&state.repo, &state.lexical);
+            assert_lexical_converges(&state, "diffword", &[qualified(&Scope::Root, "note")]).await;
         }
 
         // -------------------------------------------------------------------
@@ -2807,6 +3106,111 @@ mod tests {
 
             // …which converges to git truth.
             assert_lexical_converges(&state, "listword", &[qualified(&Scope::Root, "note")]).await;
+        }
+
+        // -------------------------------------------------------------------
+        // Cancellation-independent panic supervision (#314 round three,
+        // finding 2)
+        //
+        // A panic at an unknown point must be observed by the detached work
+        // itself — never only by the (cancellable) request future. Each test
+        // abandons the requester first and then proves the divergence is
+        // still recorded.
+        // -------------------------------------------------------------------
+
+        /// Poll until the lexical index reports degraded.
+        async fn await_degraded(state: &Arc<AppState>) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !state.lexical.is_degraded() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the divergence was never recorded — no independent observer \
+                     marked the index rebuild-required"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn mutation_unit_panic_after_git_commit_with_aborted_request_marks_degraded() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            let (committed_tx, committed_rx) = tokio::sync::oneshot::channel::<()>();
+            let release = Arc::new(tokio::sync::Notify::new());
+
+            let unit_state = Arc::clone(&state);
+            let unit_release = Arc::clone(&release);
+            let requester_lexical = Arc::clone(&state.lexical);
+            let requester = tokio::spawn(async move {
+                shielded_mutation_unit::<(), _>(&requester_lexical, async move {
+                    // Real git commit — the unit dies *after* truth moved.
+                    let memory = Memory::from_validated(
+                        MemoryName::new("committed".to_string()).unwrap(),
+                        "panicunitword payload".to_string(),
+                        MemoryMetadata::new(Scope::Root, vec![], None),
+                    );
+                    unit_state.repo.save_memory(&memory).await?;
+                    let _ = committed_tx.send(());
+                    unit_release.notified().await;
+                    panic!("injected panic after the git commit");
+                })
+                .await
+            });
+
+            // Gate: the git commit has resolved…
+            committed_rx.await.expect("git commit signal");
+            // …the request future is aborted (no surviving requester)…
+            requester.abort();
+            let _ = requester.await;
+            // …and only now does the detached unit panic.
+            release.notify_one();
+
+            // The Drop-guard owned by the detached task must record the
+            // divergence with no requester left to observe a JoinError.
+            await_degraded(&state).await;
+
+            // Git truth holds the memory the panic stranded.
+            state
+                .repo
+                .read_memory("committed", &Scope::Root)
+                .await
+                .expect("git truth must hold the committed memory");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn apply_worker_panic_marks_degraded_without_a_surviving_awaiter() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            // Git truth exists so post-repair convergence is meaningful.
+            let memory = Memory::from_validated(
+                MemoryName::new("note".to_string()).unwrap(),
+                "applypanicword payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&memory).await.expect("save");
+
+            // Dispatch a batch whose blocking worker panics, and abandon the
+            // returned future immediately — the eager dispatch means the
+            // worker still runs, and the panic must be observed without any
+            // surviving awaiter to see the JoinError.
+            state.lexical.fail_next(FailPoint::Panic);
+            let fut = state
+                .lexical
+                .apply_async(vec![LexicalOp::Upsert(LexicalDoc {
+                    qualified_name: qualified(&Scope::Root, "note"),
+                    name: "note".to_string(),
+                    content: "applypanicword payload".to_string(),
+                })]);
+            drop(fut);
+
+            await_degraded(&state).await;
+
+            // Deterministic repair converges from git truth.
+            spawn_lexical_repair(&state.repo, &state.lexical);
+            assert_lexical_converges(&state, "applypanicword", &[qualified(&Scope::Root, "note")])
+                .await;
         }
     }
 }

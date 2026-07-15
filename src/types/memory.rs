@@ -377,11 +377,11 @@ impl fmt::Display for MemoryRef {
 /// unambiguous and is what [`MemoryRef::qualified_path`] produces. All new index
 /// entries use the canonical form.
 ///
-/// **Implications for `incremental_reindex` removals:** if the index contains a
-/// legacy on-disk key for a hierarchical scope (e.g. produced by an older build),
-/// the removal path may compute the wrong canonical key and silently skip the
-/// removal. A full reindex resolves any such stale entries. Hierarchical scopes
-/// are new in this release, so no existing data is affected.
+/// Incremental reindexing never parses on-disk paths: changed memories are
+/// resolved from their frontmatter by `MemoryRepo::diff_changed_memories`
+/// (the same authority `list_memories` uses), so this ambiguity is confined
+/// to legacy index entries from pre-hierarchical-scope builds — a full
+/// reindex resolves any such stale entries.
 pub fn parse_qualified_name(qualified: &str) -> Result<MemoryRef, MemoryError> {
     // Versioned canonical key form: "v1:scope=...;name=..."
     // Unversioned form "scope=...;name=..." is also accepted as v1 for backward compat.

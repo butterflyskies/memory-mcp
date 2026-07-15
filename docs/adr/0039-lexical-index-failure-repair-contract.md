@@ -72,9 +72,29 @@ Define and implement a failure/repair contract for the lexical index:
    (healthy-but-stale, the forbidden class). This covers remember, edit,
    forget, move, and sync's pull + incremental reindex; move dispatches
    its lexical mirror directly after the git commit, before the embedding
-   await, so an embedding failure cannot strand the mirror either. If a
-   unit's task itself dies (panic, executor teardown), the index is
-   conservatively marked rebuild-required.
+   await, so an embedding failure cannot strand the mirror either.
+6. **Panic supervision is cancellation-independent.** Task death is
+   observed by the detached work itself, never only by the (cancellable)
+   request future. The shielded unit's task owns a drop-guard
+   (`DegradeOnDrop`) armed before the unit runs and defused only on
+   normal completion: a panic at an unknown point — possibly after the
+   git commit — or the runtime dropping the task marks the index
+   rebuild-required even when the request was already aborted and no
+   `JoinError` observer survives. `apply_async`'s blocking worker
+   carries the same guard, and an observed join failure (worker never
+   ran) also marks the index: whether the commit landed is unknowable
+   from a dead worker.
+7. **Post-pull mirror preparation is complete-or-degraded.** Once
+   `sync`'s pull has moved git truth, every failure preparing the mirror
+   marks the index rebuild-required and schedules repair before any
+   error propagates or any reduced batch commits: a failed or dead
+   pulled-range diff, pulled files that cannot be resolved to memory
+   references, and changed memories that cannot be read back. Changed
+   refs are resolved from each blob's YAML frontmatter (new tree for
+   upserts, old tree for removals) — the same authority `list_memories`
+   and the rebuild use — so hierarchical scope paths are never split
+   ambiguously and removals/upserts always target the canonical
+   `MemoryRef::qualified_path` key.
 
 Detection mechanism — epoch bookkeeping, the smallest thing that makes
 the clauses true:
@@ -130,6 +150,14 @@ the raw flags. The readiness surface never gates on lexical state.
   lexical index to git truth. A pre-list failure-injection test proves a
   repository-listing failure at startup degrades a fresh index and that
   recall triggers the repair.
+- Panic-supervision tests abandon the requester first: a unit that
+  panics after a real git commit with its request already aborted, and
+  an apply worker that panics with its future already dropped, must both
+  still mark the index degraded. Sync tests prove hierarchical-scope
+  edits/deletes pulled from a remote target the canonical frontmatter
+  key, and that post-pull diff failures, unresolvable pulled files, and
+  unreadable changed memories each degrade-and-repair instead of
+  committing a reduced mirror as healthy.
 - Mutation handlers spend one extra task spawn per request (the
   shielded unit); the response is abandoned on cancellation but the
   work never is.

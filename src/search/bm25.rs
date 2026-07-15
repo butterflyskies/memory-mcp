@@ -161,6 +161,46 @@ pub(crate) enum FailPoint {
     Commit,
     /// Fail the reader reload: the commit has already succeeded.
     Reload,
+    /// Panic inside `apply` (before the writer lock is taken), simulating a
+    /// worker that dies at an unknown point instead of erroring cleanly.
+    Panic,
+}
+
+/// Marks the lexical index rebuild-required when dropped without being
+/// defused.
+///
+/// This is the cancellation-independent supervision primitive for detached
+/// mutation work (#314, ADR-0039): the guard lives *inside* the detached
+/// task or blocking worker, so a panic at an unknown point — or the runtime
+/// dropping the task at shutdown — records the divergence even when no
+/// request future survives to observe a `JoinError`. Normal completion
+/// (`Ok` *or* `Err`, both of which handle their own bookkeeping) defuses it.
+pub(crate) struct DegradeOnDrop {
+    index: Option<Arc<LexicalIndex>>,
+    reason: &'static str,
+}
+
+impl DegradeOnDrop {
+    /// Arm a guard that flags `index` with `reason` unless defused.
+    pub(crate) fn new(index: Arc<LexicalIndex>, reason: &'static str) -> Self {
+        Self {
+            index: Some(index),
+            reason,
+        }
+    }
+
+    /// Disarm the guard: the protected section completed normally.
+    pub(crate) fn defuse(mut self) {
+        self.index = None;
+    }
+}
+
+impl Drop for DegradeOnDrop {
+    fn drop(&mut self) {
+        if let Some(index) = self.index.take() {
+            index.mark_rebuild_required(self.reason);
+        }
+    }
 }
 
 struct Inner {
@@ -365,6 +405,19 @@ impl LexicalIndex {
         Ok(())
     }
 
+    /// Consume an armed [`FailPoint::Panic`] and panic, simulating a worker
+    /// that dies mid-mutation rather than erroring cleanly. The failpoint
+    /// lock is released first so the unwind does not poison it.
+    #[cfg(test)]
+    fn check_panic_failpoint(&self) {
+        let mut armed = self.fail_next.lock().expect("failpoint lock");
+        if *armed == Some(FailPoint::Panic) {
+            *armed = None;
+            drop(armed);
+            panic!("lexical index: injected panic in apply");
+        }
+    }
+
     fn inner(&self) -> Result<&Inner, MemoryError> {
         self.inner.as_ref().ok_or_else(|| {
             MemoryError::Index("lexical index unavailable (initialisation failed)".to_string())
@@ -389,6 +442,8 @@ impl LexicalIndex {
         if ops.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        self.check_panic_failpoint();
         let inner = match self.inner() {
             Ok(inner) => inner,
             Err(e) => {
@@ -477,13 +532,37 @@ impl LexicalIndex {
     /// future (request cancellation, timeouts) therefore never abandons a
     /// half-mirrored git write — the batch still runs to completion, either
     /// converging with git truth or failing and flagging the index degraded.
+    ///
+    /// Panic supervision is owned by the worker itself (#314): a
+    /// [`DegradeOnDrop`] guard inside the blocking closure marks the index
+    /// rebuild-required if `apply` unwinds, so a panic at an unknown point
+    /// is recorded even when the returned future was already dropped and no
+    /// caller survives to observe the `JoinError`. A `JoinError` that *is*
+    /// observed (worker never ran, e.g. shutdown) also marks the index —
+    /// whether the commit landed is unknowable from a dead worker.
     pub fn apply_async(
         self: &Arc<Self>,
         ops: Vec<LexicalOp>,
     ) -> impl std::future::Future<Output = Result<(), MemoryError>> {
         let index = Arc::clone(self);
-        let handle = traced_spawn_blocking(move || index.apply(ops));
-        async move { handle.await.map_err(|e| MemoryError::Join(e.to_string()))? }
+        let worker_guard_index = Arc::clone(self);
+        let handle = traced_spawn_blocking(move || {
+            let guard = DegradeOnDrop::new(worker_guard_index, "lexical apply worker panicked");
+            let result = index.apply(ops);
+            guard.defuse();
+            result
+        });
+        let observer = Arc::clone(self);
+        async move {
+            match handle.await {
+                Ok(result) => result,
+                Err(e) => {
+                    observer
+                        .mark_rebuild_required("lexical apply worker did not run to completion");
+                    Err(MemoryError::Join(e.to_string()))
+                }
+            }
+        }
     }
 
     /// Insert or replace the document for `qualified_name`.
