@@ -113,6 +113,30 @@ pub struct LexicalIndex {
     fail_next: Mutex<Option<FailPoint>>,
 }
 
+/// Explicit lifecycle signal for the lexical index, consumed by ADR-0039's
+/// status surface (health endpoints, lifecycle probes).
+///
+/// [`LexicalIndex::is_degraded`] and [`LexicalIndex::is_repairing`] alone
+/// cannot distinguish a *disabled* index (construction failed, every
+/// operation errors, repair can never recover it) from a healthy one — both
+/// report `false`/`false`. This enum removes that ambiguity: lifecycle
+/// consumers branch on [`LexicalIndex::status`] instead of inferring state
+/// from error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexicalStatus {
+    /// Construction failed; keyword search is unavailable for the process
+    /// lifetime. Rebuilds cannot recover this state (maps to the lifecycle
+    /// doc's `Failed`).
+    Failed,
+    /// Consistent with git truth as of the last converged rebuild.
+    Available,
+    /// Diverged from git truth; a rebuild is required but not running.
+    Degraded,
+    /// Diverged from git truth and a repair rebuild currently holds the
+    /// single-flight slot (maps to the lifecycle doc's `Rebuilding`).
+    Repairing,
+}
+
 /// Snapshot handed out by [`LexicalIndex::begin_rebuild`] and consumed by
 /// [`LexicalIndex::rebuild_from`].
 ///
@@ -286,6 +310,39 @@ impl LexicalIndex {
     /// not yet running).
     pub fn is_repairing(&self) -> bool {
         self.repairing.load(Ordering::Acquire)
+    }
+
+    /// Whether the underlying Tantivy index was constructed at all.
+    ///
+    /// `false` means construction failed and the instance is permanently
+    /// disabled: every operation errors and no rebuild can recover it.
+    /// This is a distinct axis from [`Self::is_degraded`] — a disabled
+    /// index may report `is_degraded() == false` simply because nothing
+    /// has recorded a divergence event yet.
+    pub fn is_available(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// Explicit lifecycle status for ADR-0039's status surface.
+    ///
+    /// Precedence: a disabled index is always [`LexicalStatus::Failed`],
+    /// regardless of the epoch counters (a disabled index also accumulates
+    /// divergence events, but repair can never recover it). Otherwise the
+    /// degraded/repairing flags map exactly onto the lifecycle contract:
+    /// degraded + repairing ⇒ `Repairing`, degraded ⇒ `Degraded`,
+    /// else ⇒ `Available`.
+    pub fn status(&self) -> LexicalStatus {
+        if !self.is_available() {
+            LexicalStatus::Failed
+        } else if self.is_degraded() {
+            if self.is_repairing() {
+                LexicalStatus::Repairing
+            } else {
+                LexicalStatus::Degraded
+            }
+        } else {
+            LexicalStatus::Available
+        }
     }
 
     /// Arm a one-shot injected failure for the next matching mutation stage.
@@ -1404,6 +1461,48 @@ mod tests {
         drop(fut);
 
         assert_converges(&index, "unpolledword", &[key(&scope, "note")]).await;
+    }
+
+    /// ADR-0039 status surface: every lifecycle state is explicit and
+    /// unambiguous — no error-string inference required.
+    #[test]
+    fn status_reports_explicit_lifecycle_states() {
+        let scope = Scope::Root;
+
+        let disabled = LexicalIndex::disabled();
+        assert!(!disabled.is_available());
+        assert_eq!(disabled.status(), LexicalStatus::Failed);
+
+        let index = LexicalIndex::new();
+        assert!(index.is_available());
+        assert_eq!(index.status(), LexicalStatus::Available);
+
+        index.mark_rebuild_required("test: forced divergence");
+        assert_eq!(index.status(), LexicalStatus::Degraded);
+
+        assert!(index.try_claim_repair());
+        assert_eq!(index.status(), LexicalStatus::Repairing);
+        index.finish_repair();
+        assert_eq!(index.status(), LexicalStatus::Degraded);
+
+        index
+            .rebuild(vec![ldoc(&scope, "note", "statusword")])
+            .expect("rebuild");
+        assert_eq!(index.status(), LexicalStatus::Available);
+    }
+
+    /// A disabled index also accumulates divergence events (its failed ops
+    /// call `mark_rebuild_required`), but construction failure dominates:
+    /// the status must stay `Failed`, never masquerade as repairable
+    /// `Degraded`.
+    #[test]
+    fn disabled_index_status_is_failed_even_after_divergence_events() {
+        let disabled = LexicalIndex::disabled();
+        assert!(disabled
+            .apply(vec![LexicalOp::Remove("key".to_string())])
+            .is_err());
+        assert!(disabled.is_degraded());
+        assert_eq!(disabled.status(), LexicalStatus::Failed);
     }
 
     #[test]

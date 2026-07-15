@@ -48,17 +48,33 @@ Define and implement a failure/repair contract for the lexical index:
    the same code path as the startup rebuild
    (`search::rebuild_lexical_from_repo`), on the blocking pool,
    single-flight (`try_claim_repair`). It is triggered in the background
-   wherever degradation is observed: at each mutation-mirror failure site
-   and from the recall handler (`search::spawn_lexical_repair`). Recall
-   serves semantic-only for the whole degraded window, including during
-   the rebuild.
-5. **Cancellation is a non-event.** `apply_async` dispatches its batch to
-   the blocking pool **eagerly** (before the returned future is first
-   polled), so dropping the future never strands a half-mirrored git
-   write: the batch still runs to completion, either converging with git
-   truth or failing and flagging degraded. Handlers mirror after the repo
-   save with no intervening await point, so request cancellation cannot
-   separate a git write from its mirror dispatch.
+   wherever degradation is observed: at each mutation-mirror failure site,
+   from the recall handler (`search::spawn_lexical_repair`), and at
+   startup when the initial rebuild fails. Recall serves semantic-only
+   for the whole degraded window, including during the rebuild. *Every*
+   failure while obtaining repository truth marks the index
+   rebuild-required — including a `list_memories` failure **before** the
+   `rebuild_from` seam, which would otherwise leave a fresh index falsely
+   healthy at 0/0 epochs with no repair trigger. A rebuild that returns
+   `Ok` while a raced mirror re-flagged the index is logged as a raced
+   outcome, not as a repair receipt.
+5. **Cancellation is a non-event.** Two layers make this true. First,
+   `apply_async` dispatches its batch to the blocking pool **eagerly**
+   (before the returned future is first polled), so dropping that future
+   never strands a dispatched batch. Second, every handler runs its
+   repository write plus index mirror as a **cancellation-shielded
+   mutation unit** (`server::shielded_mutation_unit`): the unit executes
+   on a detached task, so dropping the request future (client disconnect,
+   timeout) abandons only the response — the git commit and its mirror
+   dispatch always run to completion together. Without the shield, a
+   request cancelled while awaiting the detached blocking git commit
+   could let the commit land while the mirror continuation never ran
+   (healthy-but-stale, the forbidden class). This covers remember, edit,
+   forget, move, and sync's pull + incremental reindex; move dispatches
+   its lexical mirror directly after the git commit, before the embedding
+   await, so an embedding failure cannot strand the mirror either. If a
+   unit's task itself dies (panic, executor teardown), the index is
+   conservatively marked rebuild-required.
 
 Detection mechanism — epoch bookkeeping, the smallest thing that makes
 the clauses true:
@@ -81,16 +97,42 @@ a lifecycle state, not a divergence event. Lifecycle states
 (Booting / SemanticReady / Rebuilding / FullyReady / Degraded / Failed)
 and their exposure through health endpoints and probes are specified in
 the startup/lifecycle design doc (Lain's lane); this contract defines
-what the failure-side states mean and their transitions:
-`is_degraded && is_repairing` ⇒ Rebuilding, `is_degraded && !is_repairing`
-⇒ Degraded, construction failure (disabled index, every op errors) ⇒
-Failed. The readiness surface never gates on lexical state.
+what the failure-side states mean and exports them explicitly.
+
+**Lifecycle seam.** `LexicalIndex::status()` returns a
+`LexicalStatus` enum — the explicit signal the lifecycle surface
+consumes, with no error-string inference:
+
+- `LexicalStatus::Failed` — construction failed (disabled index, every
+  op errors, repair can never recover it). Also queryable as
+  `is_available() == false`. This axis is deliberately explicit because
+  `is_degraded`/`is_repairing` are both `false` on a disabled index,
+  which is indistinguishable from healthy without it. A disabled index
+  that has additionally accumulated divergence events still reports
+  `Failed` — construction failure dominates.
+- `LexicalStatus::Repairing` — degraded and a repair rebuild holds the
+  single-flight slot (maps to lifecycle `Rebuilding`).
+- `LexicalStatus::Degraded` — degraded, rebuild required, none running.
+- `LexicalStatus::Available` — consistent with git truth as of the last
+  converged rebuild.
+
+`is_degraded()`/`is_repairing()` remain available for callers that need
+the raw flags. The readiness surface never gates on lexical state.
 
 ## Consequences
 - Failure-injection tests across all mutation paths (remember, edit,
   forget, move, incremental reindex, startup rebuild) plus cancellation
   are the permanent acceptance proof: no silent divergence, deterministic
   post-repair convergence, semantic-only recall while degraded.
+- Handler-level cancellation tests cover every mutation family: each
+  drives the real handler, waits until the git commit resolves, aborts
+  the request future, and asserts the shielded unit still converges the
+  lexical index to git truth. A pre-list failure-injection test proves a
+  repository-listing failure at startup degrades a fresh index and that
+  recall triggers the repair.
+- Mutation handlers spend one extra task spawn per request (the
+  shielded unit); the response is abandoned on cancellation but the
+  work never is.
 - A degraded index refuses lexical queries until repaired; recall quality
   temporarily drops to semantic-only instead of risking stale hits.
   Repair is automatic and self-healing on the next recall at the latest.
