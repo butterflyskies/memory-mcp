@@ -108,10 +108,16 @@ pub async fn hybrid_search(
 /// unlike the vector index, which is persisted because embedding is
 /// expensive. The rebuild is a single Tantivy commit and runs on the
 /// blocking pool. Returns the number of indexed memories.
+///
+/// This is also the repair path for a degraded index (ADR-0039): the
+/// rebuild token is captured *before* the repo listing, so divergence
+/// events or mirrors racing the listing keep the index flagged and a
+/// follow-up rebuild converges instead of silently losing them.
 pub async fn rebuild_lexical_from_repo(
     repo: &Arc<MemoryRepo>,
     lexical: &Arc<LexicalIndex>,
 ) -> Result<usize, MemoryError> {
+    let token = lexical.begin_rebuild();
     let memories = repo.list_memories(None).await?;
     let docs: Vec<LexicalDoc> = memories
         .into_iter()
@@ -122,7 +128,30 @@ pub async fn rebuild_lexical_from_repo(
         })
         .collect();
     let lexical = Arc::clone(lexical);
-    traced_spawn_blocking(move || lexical.rebuild(docs))
+    traced_spawn_blocking(move || lexical.rebuild_from(token, docs))
         .await
         .map_err(|e| MemoryError::Join(e.to_string()))?
+}
+
+/// Spawn a background repair rebuild if the lexical index is degraded and
+/// no repair is already running.
+///
+/// Deterministic repair per ADR-0039: rebuild from git truth on the
+/// blocking pool, single-flight. Recall serves semantic-only for the whole
+/// degraded window (search errors until the rebuild converges). Failures
+/// leave the index degraded; the next trigger retries.
+pub fn spawn_lexical_repair(repo: &Arc<MemoryRepo>, lexical: &Arc<LexicalIndex>) {
+    if !lexical.is_degraded() || !lexical.try_claim_repair() {
+        return;
+    }
+    let repo = Arc::clone(repo);
+    let lexical = Arc::clone(lexical);
+    tokio::spawn(async move {
+        let result = rebuild_lexical_from_repo(&repo, &lexical).await;
+        lexical.finish_repair();
+        match result {
+            Ok(count) => info!(count, "lexical index repaired from git truth"),
+            Err(e) => warn!(error = %e, "lexical repair failed — index stays degraded"),
+        }
+    });
 }

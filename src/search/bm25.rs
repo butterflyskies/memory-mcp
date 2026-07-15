@@ -10,8 +10,27 @@
 //! reload for the whole batch, and [`LexicalIndex::apply_async`] runs that
 //! blocking work on the Tokio blocking pool so async workers are never
 //! stalled behind a commit.
+//!
+//! # Failure/repair contract (#310, ADR-0039)
+//!
+//! Git is authoritative; this index is derived state. Any failed mutation
+//! rolls back its uncommitted ops (so a later batch can never commit them)
+//! and marks the index **degraded** — [`LexicalIndex::is_degraded`] — after
+//! which [`LexicalIndex::search`] errors and hybrid recall falls back to
+//! semantic-only. Repair is a rebuild from git truth: capture a token with
+//! [`LexicalIndex::begin_rebuild`] *before* listing the repo, then call
+//! [`LexicalIndex::rebuild_from`]; the token detects failures and concurrent
+//! mirrors that raced the rebuild, keeping the index degraded until a
+//! quiescent rebuild converges. Cancellation is a non-event:
+//! [`LexicalIndex::apply_async`] dispatches its batch to the blocking pool
+//! *eagerly*, so a caller dropping the future (request cancellation) never
+//! strands a half-mirrored git write — the batch still applies, or fails and
+//! flags degraded.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use tantivy::{
     collector::TopDocs,
@@ -75,6 +94,49 @@ pub enum LexicalOp {
 /// treat as best-effort degradation to semantic-only retrieval.
 pub struct LexicalIndex {
     inner: Option<Inner>,
+    /// Count of divergence events (failed or interrupted mutations). The
+    /// index is consistent with git truth only when a rebuild has observed
+    /// every event so far: `clean_epoch == dirty_epoch`.
+    dirty_epoch: AtomicU64,
+    /// The `dirty_epoch` value captured by the most recent successful
+    /// rebuild, *before* its repo listing. Always `<= dirty_epoch`.
+    clean_epoch: AtomicU64,
+    /// Count of successfully committed `apply` batches. Used by
+    /// [`Self::rebuild_from`] to detect mirrors that raced a rebuild's repo
+    /// listing (the rebuild would silently drop them otherwise).
+    applied_batches: AtomicU64,
+    /// Single-flight guard for background repair rebuilds.
+    repairing: AtomicBool,
+    /// Test-only failure injection: the next matching operation stage fails
+    /// with an error taking exactly the code path a real Tantivy error would.
+    #[cfg(test)]
+    fail_next: Mutex<Option<FailPoint>>,
+}
+
+/// Snapshot handed out by [`LexicalIndex::begin_rebuild`] and consumed by
+/// [`LexicalIndex::rebuild_from`].
+///
+/// Must be captured **before** listing the repo: it records which divergence
+/// events and committed mirrors the rebuild's document set can possibly
+/// reflect, so anything that happens after the capture keeps (or puts) the
+/// index in the degraded state instead of being silently lost.
+#[derive(Debug, Clone, Copy)]
+pub struct RebuildToken {
+    dirty: u64,
+    applied: u64,
+}
+
+/// Test-only injection point inside a lexical mutation.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailPoint {
+    /// Fail before applying the op (or rebuild doc) at this zero-based
+    /// position — earlier ops have already been queued on the writer.
+    BeforeOp(usize),
+    /// Fail the commit: the whole batch is queued but not durably committed.
+    Commit,
+    /// Fail the reader reload: the commit has already succeeded.
+    Reload,
 }
 
 struct Inner {
@@ -146,12 +208,104 @@ impl LexicalIndex {
                 None
             }
         };
-        Self { inner }
+        Self {
+            inner,
+            dirty_epoch: AtomicU64::new(0),
+            clean_epoch: AtomicU64::new(0),
+            applied_batches: AtomicU64::new(0),
+            repairing: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next: Mutex::new(None),
+        }
     }
 
     #[cfg(test)]
     fn disabled() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            dirty_epoch: AtomicU64::new(0),
+            clean_epoch: AtomicU64::new(0),
+            applied_batches: AtomicU64::new(0),
+            repairing: AtomicBool::new(false),
+            fail_next: Mutex::new(None),
+        }
+    }
+
+    /// Whether the index has diverged from git truth: a mutation failed or
+    /// was interrupted and no rebuild has covered it yet.
+    ///
+    /// While degraded, [`Self::search`] errors and hybrid recall serves
+    /// semantic-only results; repair is a rebuild from git truth
+    /// ([`Self::begin_rebuild`] + [`Self::rebuild_from`]).
+    ///
+    /// A freshly created (empty) index is *not* degraded: unbuilt-at-boot is
+    /// a lifecycle state (Booting/SemanticReady), not a divergence event.
+    pub fn is_degraded(&self) -> bool {
+        self.clean_epoch.load(Ordering::Acquire) < self.dirty_epoch.load(Ordering::Acquire)
+    }
+
+    /// Record a divergence event: the index can no longer be proven
+    /// consistent with git truth and must be rebuilt from it.
+    ///
+    /// Idempotent in effect (extra calls just require the next rebuild to be
+    /// more recent). Public so external coordinators (lifecycle management,
+    /// operational tooling) can force a rebuild-required state.
+    pub fn mark_rebuild_required(&self, reason: &str) {
+        let epoch = self.dirty_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        warn!(
+            reason,
+            epoch, "lexical index degraded — rebuild from git truth required"
+        );
+    }
+
+    /// Capture the rebuild token. Must be called **before** listing the repo
+    /// for the document set passed to [`Self::rebuild_from`].
+    pub fn begin_rebuild(&self) -> RebuildToken {
+        RebuildToken {
+            dirty: self.dirty_epoch.load(Ordering::Acquire),
+            applied: self.applied_batches.load(Ordering::Acquire),
+        }
+    }
+
+    /// Try to claim the single-flight repair slot. Returns `true` if the
+    /// caller now owns it and must call [`Self::finish_repair`] when done.
+    pub fn try_claim_repair(&self) -> bool {
+        self.repairing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release the repair slot claimed with [`Self::try_claim_repair`].
+    pub fn finish_repair(&self) {
+        self.repairing.store(false, Ordering::Release);
+    }
+
+    /// Whether a repair rebuild currently holds the single-flight slot.
+    /// Together with [`Self::is_degraded`] this distinguishes the
+    /// `Rebuilding` lifecycle state from `Degraded` (rebuild required but
+    /// not yet running).
+    pub fn is_repairing(&self) -> bool {
+        self.repairing.load(Ordering::Acquire)
+    }
+
+    /// Arm a one-shot injected failure for the next matching mutation stage.
+    #[cfg(test)]
+    pub(crate) fn fail_next(&self, point: FailPoint) {
+        *self.fail_next.lock().expect("failpoint lock") = Some(point);
+    }
+
+    /// Consume the armed failpoint if it matches `point`, erroring exactly
+    /// where a real Tantivy failure would.
+    #[cfg(test)]
+    fn check_failpoint(&self, point: FailPoint) -> Result<(), MemoryError> {
+        let mut armed = self.fail_next.lock().expect("failpoint lock");
+        if *armed == Some(point) {
+            *armed = None;
+            return Err(MemoryError::Index(format!(
+                "lexical index: injected failure at {point:?}"
+            )));
+        }
+        Ok(())
     }
 
     fn inner(&self) -> Result<&Inner, MemoryError> {
@@ -163,6 +317,12 @@ impl LexicalIndex {
     /// Apply a batch of mutations with exactly one commit and one reader
     /// reload, regardless of batch size.
     ///
+    /// Failure contract: on any error the batch's queued-but-uncommitted ops
+    /// are rolled back (a later batch can never commit them) and the index
+    /// is marked degraded ([`Self::is_degraded`]) until a rebuild from git
+    /// truth repairs it. An `Err` therefore always means "index flagged, no
+    /// partial state left behind".
+    ///
     /// Blocking: takes the writer mutex and performs a Tantivy commit.
     /// Callers on the async runtime must use [`Self::apply_async`] instead.
     pub fn apply(&self, ops: Vec<LexicalOp>) -> Result<(), MemoryError> {
@@ -172,32 +332,81 @@ impl LexicalIndex {
         if ops.is_empty() {
             return Ok(());
         }
-        let inner = self.inner()?;
-        let mut writer = inner.lock_writer()?;
-        for op in &ops {
-            match op {
-                LexicalOp::Upsert(item) => {
-                    writer.delete_term(Term::from_field_text(
-                        inner.field_qualified_name,
-                        &item.qualified_name,
-                    ));
-                    let mut doc = TantivyDocument::default();
-                    doc.add_text(inner.field_qualified_name, &item.qualified_name);
-                    doc.add_text(inner.field_name, &item.name);
-                    doc.add_text(inner.field_content, &item.content);
-                    writer.add_document(doc).map_err(lexical_error)?;
-                }
-                LexicalOp::Remove(qualified_name) => {
-                    writer.delete_term(Term::from_field_text(
-                        inner.field_qualified_name,
-                        qualified_name,
-                    ));
+        let inner = match self.inner() {
+            Ok(inner) => inner,
+            Err(e) => {
+                self.mark_rebuild_required("lexical index unavailable");
+                return Err(e);
+            }
+        };
+        let mut writer = match inner.lock_writer() {
+            Ok(writer) => writer,
+            Err(e) => {
+                self.mark_rebuild_required("writer lock poisoned");
+                return Err(e);
+            }
+        };
+
+        let queued = (|| {
+            // The index is only consumed by the test-only failpoint seam.
+            #[allow(clippy::unused_enumerate_index)]
+            for (_i, op) in ops.iter().enumerate() {
+                #[cfg(test)]
+                self.check_failpoint(FailPoint::BeforeOp(_i))?;
+                match op {
+                    LexicalOp::Upsert(item) => {
+                        writer.delete_term(Term::from_field_text(
+                            inner.field_qualified_name,
+                            &item.qualified_name,
+                        ));
+                        let mut doc = TantivyDocument::default();
+                        doc.add_text(inner.field_qualified_name, &item.qualified_name);
+                        doc.add_text(inner.field_name, &item.name);
+                        doc.add_text(inner.field_content, &item.content);
+                        writer.add_document(doc).map_err(lexical_error)?;
+                    }
+                    LexicalOp::Remove(qualified_name) => {
+                        writer.delete_term(Term::from_field_text(
+                            inner.field_qualified_name,
+                            qualified_name,
+                        ));
+                    }
                 }
             }
+            #[cfg(test)]
+            self.check_failpoint(FailPoint::Commit)?;
+            writer.commit().map_err(lexical_error)?;
+            Ok(())
+        })();
+
+        if let Err(e) = queued {
+            // Discard the batch's uncommitted ops so a later successful
+            // batch can never ghost-commit them.
+            if let Err(rb) = writer.rollback() {
+                warn!(error = %rb, "lexical writer rollback failed after batch error");
+            }
+            drop(writer);
+            self.mark_rebuild_required("mutation batch failed");
+            return Err(e);
         }
-        writer.commit().map_err(lexical_error)?;
+
+        // Record the committed mirror while still holding the writer lock,
+        // so a concurrent rebuild (serialised on the same lock) can never
+        // observe the commit without the counter.
+        self.applied_batches.fetch_add(1, Ordering::AcqRel);
         drop(writer);
-        inner.reader.reload().map_err(lexical_error)
+
+        #[cfg(test)]
+        if let Err(e) = self.check_failpoint(FailPoint::Reload) {
+            self.mark_rebuild_required("reader reload failed");
+            return Err(e);
+        }
+        inner.reader.reload().map_err(|e| {
+            // The commit is durable but the reader view is stale; treat the
+            // reported failure as divergence so repair restores certainty.
+            self.mark_rebuild_required("reader reload failed");
+            lexical_error(e)
+        })
     }
 
     /// Run [`Self::apply`] on the Tokio blocking pool.
@@ -205,11 +414,19 @@ impl LexicalIndex {
     /// This is the mutation entry point for async handlers: the writer
     /// lock, the Tantivy commit, and the reader reload never run on an
     /// async worker thread.
-    pub async fn apply_async(self: &Arc<Self>, ops: Vec<LexicalOp>) -> Result<(), MemoryError> {
+    ///
+    /// Cancellation contract: the batch is dispatched to the blocking pool
+    /// **eagerly**, before the returned future is first polled. Dropping the
+    /// future (request cancellation, timeouts) therefore never abandons a
+    /// half-mirrored git write — the batch still runs to completion, either
+    /// converging with git truth or failing and flagging the index degraded.
+    pub fn apply_async(
+        self: &Arc<Self>,
+        ops: Vec<LexicalOp>,
+    ) -> impl std::future::Future<Output = Result<(), MemoryError>> {
         let index = Arc::clone(self);
-        traced_spawn_blocking(move || index.apply(ops))
-            .await
-            .map_err(|e| MemoryError::Join(e.to_string()))?
+        let handle = traced_spawn_blocking(move || index.apply(ops));
+        async move { handle.await.map_err(|e| MemoryError::Join(e.to_string()))? }
     }
 
     /// Insert or replace the document for `qualified_name`.
@@ -238,7 +455,29 @@ impl LexicalIndex {
     }
 
     /// Replace the entire index contents with `docs` in a single commit.
+    ///
+    /// Convenience wrapper over [`Self::rebuild_from`] for callers whose
+    /// `docs` are already in hand. When the document set comes from an async
+    /// repo listing, capture the token with [`Self::begin_rebuild`] *before*
+    /// listing and use [`Self::rebuild_from`] instead — otherwise divergence
+    /// events between the listing and this call would be silently absorbed.
     pub fn rebuild<I>(&self, docs: I) -> Result<usize, MemoryError>
+    where
+        I: IntoIterator<Item = LexicalDoc>,
+    {
+        self.rebuild_from(self.begin_rebuild(), docs)
+    }
+
+    /// Replace the entire index contents with `docs` — the repo listing made
+    /// after `token` was captured — in a single commit.
+    ///
+    /// Repair contract: on success the index is marked consistent with git
+    /// truth *as of the token*. Divergence events after the capture keep the
+    /// index degraded, and mirrors committed concurrently with the rebuild
+    /// (which the listing may predate) re-flag it, so repeated repair
+    /// deterministically converges. On failure the partial rebuild is rolled
+    /// back and the index stays degraded.
+    pub fn rebuild_from<I>(&self, token: RebuildToken, docs: I) -> Result<usize, MemoryError>
     where
         I: IntoIterator<Item = LexicalDoc>,
     {
@@ -246,20 +485,70 @@ impl LexicalIndex {
         let _guard = span.enter();
 
         let inner = self.inner()?;
-        let mut writer = inner.lock_writer()?;
-        writer.delete_all_documents().map_err(lexical_error)?;
+        let mut writer = match inner.lock_writer() {
+            Ok(writer) => writer,
+            Err(e) => {
+                self.mark_rebuild_required("writer lock poisoned");
+                return Err(e);
+            }
+        };
+
         let mut count = 0usize;
-        for item in docs {
-            let mut doc = TantivyDocument::default();
-            doc.add_text(inner.field_qualified_name, &item.qualified_name);
-            doc.add_text(inner.field_name, &item.name);
-            doc.add_text(inner.field_content, &item.content);
-            writer.add_document(doc).map_err(lexical_error)?;
-            count += 1;
+        let queued = (|| {
+            writer.delete_all_documents().map_err(lexical_error)?;
+            for item in docs {
+                #[cfg(test)]
+                self.check_failpoint(FailPoint::BeforeOp(count))?;
+                let mut doc = TantivyDocument::default();
+                doc.add_text(inner.field_qualified_name, &item.qualified_name);
+                doc.add_text(inner.field_name, &item.name);
+                doc.add_text(inner.field_content, &item.content);
+                writer.add_document(doc).map_err(lexical_error)?;
+                count += 1;
+            }
+            #[cfg(test)]
+            self.check_failpoint(FailPoint::Commit)?;
+            writer.commit().map_err(lexical_error)?;
+            Ok(())
+        })();
+
+        if let Err(e) = queued {
+            // Discard everything queued (including `delete_all_documents`)
+            // so a later successful batch can never wipe the index.
+            if let Err(rb) = writer.rollback() {
+                warn!(error = %rb, "lexical writer rollback failed after rebuild error");
+            }
+            drop(writer);
+            self.mark_rebuild_required("rebuild failed");
+            return Err(e);
         }
-        writer.commit().map_err(lexical_error)?;
+
+        // Read the mirror counter while still holding the writer lock: any
+        // apply that committed before this point is either reflected in the
+        // listing or detected here; any apply after this point sees the
+        // rebuilt contents.
+        let raced_mirror = self.applied_batches.load(Ordering::Acquire) != token.applied;
+        // Mark consistency as of the token's capture point. Divergence
+        // events since then keep `dirty_epoch` ahead — still degraded.
+        self.clean_epoch.fetch_max(token.dirty, Ordering::AcqRel);
         drop(writer);
-        inner.reader.reload().map_err(lexical_error)?;
+
+        if raced_mirror {
+            // A mirror committed between the token capture (pre-listing) and
+            // the rebuild commit; the listing may not include it. Require
+            // another rebuild rather than silently dropping the mirror.
+            self.mark_rebuild_required("mirror raced the rebuild's repo listing");
+        }
+
+        #[cfg(test)]
+        if let Err(e) = self.check_failpoint(FailPoint::Reload) {
+            self.mark_rebuild_required("reader reload failed");
+            return Err(e);
+        }
+        inner.reader.reload().map_err(|e| {
+            self.mark_rebuild_required("reader reload failed");
+            lexical_error(e)
+        })?;
         tracing::Span::current().record("count", count);
         debug!(count, "lexical index rebuilt");
         Ok(count)
@@ -281,6 +570,11 @@ impl LexicalIndex {
     /// Scope filtering matches recall semantics exactly: candidate scopes
     /// are parsed from the canonical key and checked with
     /// [`ScopeFilter::matches`].
+    ///
+    /// While the index is degraded ([`Self::is_degraded`]) — including for
+    /// the whole duration of a repair rebuild — this errors instead of
+    /// serving potentially stale results; hybrid recall treats the error as
+    /// "semantic-only for this query".
     pub fn search(
         &self,
         filter: &ScopeFilter,
@@ -291,6 +585,11 @@ impl LexicalIndex {
         let _guard = span.enter();
 
         let inner = self.inner()?;
+        if self.is_degraded() {
+            return Err(MemoryError::Index(
+                "lexical index degraded — rebuild from git truth pending".to_string(),
+            ));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -745,6 +1044,366 @@ mod tests {
             .is_err());
         assert!(index.rebuild(Vec::new()).is_err());
         assert!(index.search(&ScopeFilter::All, "query", 10).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Failure/repair contract (#310)
+    //
+    // Written first as a characterization instrument: run against the
+    // pre-contract code, the failing tests below are the evidence of where
+    // failed mutations strand state. They assert the contract; the
+    // implementation must make them pass and keep them green.
+    // -----------------------------------------------------------------------
+
+    fn ldoc(scope: &Scope, name: &str, content: &str) -> LexicalDoc {
+        LexicalDoc {
+            qualified_name: key(scope, name),
+            name: name.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    /// Names returned for `query`, or `None` if the search itself errored
+    /// (degraded mode — the caller falls back to semantic-only).
+    fn search_names(index: &LexicalIndex, query: &str) -> Option<Vec<String>> {
+        index
+            .search(&ScopeFilter::All, query, 10)
+            .ok()
+            .map(|hits| hits.into_iter().map(|(n, _)| n).collect())
+    }
+
+    /// Poll until the index is consistent (`!is_degraded`) and `query`
+    /// returns exactly `expected`, or panic after a deadline. Used for
+    /// convergence assertions where a batch may complete on the blocking
+    /// pool after the caller stopped waiting.
+    async fn assert_converges(index: &LexicalIndex, query: &str, expected: &[String]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(hits) = search_names(index, query) {
+                if hits == expected {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "index never converged for query {query:?} (expected {expected:?})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Contract clause 2: ops queued before a mid-batch failure must never
+    /// be committed later by an unrelated successful batch.
+    #[test]
+    fn failed_batch_prefix_must_not_ghost_commit_with_next_batch() {
+        let scope = Scope::Root;
+        let index = LexicalIndex::new();
+
+        // Batch [ghost, doomed] fails before op 1 — "ghost" is already
+        // queued on the Tantivy writer when the batch errors.
+        index.fail_next(FailPoint::BeforeOp(1));
+        assert!(index
+            .apply(vec![
+                LexicalOp::Upsert(ldoc(&scope, "ghost", "ghostword content")),
+                LexicalOp::Upsert(ldoc(&scope, "doomed", "doomedword content")),
+            ])
+            .is_err());
+        assert!(index.is_degraded(), "failed batch must flag the index");
+
+        // Mirrors keep flowing while degraded…
+        index
+            .apply(vec![LexicalOp::Upsert(ldoc(&scope, "later", "laterword"))])
+            .expect("later batch");
+
+        // …and after repair from git truth the failed batch's prefix must
+        // not have ghost-committed.
+        index
+            .rebuild(vec![ldoc(&scope, "later", "laterword")])
+            .expect("repair rebuild");
+        assert!(!index.is_degraded());
+        let ghosts = search_names(&index, "ghostword").expect("post-repair search");
+        assert!(
+            ghosts.is_empty(),
+            "prefix op of a failed batch ghost-committed: {ghosts:?}"
+        );
+        let later = search_names(&index, "laterword").expect("post-repair search");
+        assert_eq!(later, vec![key(&scope, "later")]);
+    }
+
+    /// Contract clause 2: a batch whose commit fails must not be committed
+    /// later by an unrelated successful batch.
+    #[test]
+    fn failed_commit_batch_must_not_apply_later() {
+        let scope = Scope::Root;
+        let index = LexicalIndex::new();
+
+        index.fail_next(FailPoint::Commit);
+        assert!(index
+            .apply(vec![LexicalOp::Upsert(ldoc(
+                &scope,
+                "queued",
+                "queuedword"
+            ))])
+            .is_err());
+        assert!(index.is_degraded(), "failed commit must flag the index");
+
+        index
+            .apply(vec![LexicalOp::Upsert(ldoc(&scope, "later", "laterword"))])
+            .expect("later batch");
+        index
+            .rebuild(vec![ldoc(&scope, "later", "laterword")])
+            .expect("repair rebuild");
+        let hits = search_names(&index, "queuedword").expect("post-repair search");
+        assert!(
+            hits.is_empty(),
+            "batch with failed commit was committed later: {hits:?}"
+        );
+    }
+
+    /// Contract clause 2 (worst case): a failed rebuild strands
+    /// `delete_all_documents` on the writer; the next successful commit must
+    /// not wipe the whole index.
+    #[test]
+    fn failed_rebuild_must_not_wipe_index_via_next_commit() {
+        let scope = Scope::Root;
+        let index = index_with(&[(&scope, "keeper", "keeperword content")]);
+
+        index.fail_next(FailPoint::BeforeOp(0));
+        assert!(index
+            .rebuild(vec![ldoc(&scope, "fresh", "freshword content")])
+            .is_err());
+        assert!(index.is_degraded(), "failed rebuild must flag the index");
+
+        index
+            .apply(vec![LexicalOp::Upsert(ldoc(&scope, "later", "laterword"))])
+            .expect("later batch");
+
+        // Repair from git truth: both memories exist in the repo.
+        index
+            .rebuild(vec![
+                ldoc(&scope, "keeper", "keeperword content"),
+                ldoc(&scope, "later", "laterword"),
+            ])
+            .expect("repair rebuild");
+        assert!(!index.is_degraded());
+        let keeper = search_names(&index, "keeperword").expect("post-repair search");
+        assert_eq!(
+            keeper,
+            vec![key(&scope, "keeper")],
+            "failed rebuild's stranded delete_all wiped the index"
+        );
+    }
+
+    /// Contract clauses 2+3: after a failed mutation the index must not
+    /// silently keep serving results that no longer reflect git truth —
+    /// search degrades (errors) until repaired, and hybrid recall falls back
+    /// to semantic-only.
+    #[test]
+    fn failed_mutation_must_not_leave_silent_stale_results() {
+        let scope = Scope::Root;
+        let index = index_with(&[(&scope, "note", "oldword content")]);
+
+        // Git truth moves to v2 ("newword"); the mirroring batch fails.
+        index.fail_next(FailPoint::Commit);
+        assert!(index
+            .apply(vec![LexicalOp::Upsert(ldoc(
+                &scope,
+                "note",
+                "newword content"
+            ))])
+            .is_err());
+
+        // The index now diverges from git truth: it must refuse to serve
+        // the stale v1 hit as a healthy result.
+        assert!(index.is_degraded());
+        assert!(
+            index.search(&ScopeFilter::All, "oldword", 10).is_err(),
+            "degraded index must error instead of serving stale results"
+        );
+    }
+
+    /// Contract clause 4: repair after a failure is a rebuild from git truth
+    /// and deterministically converges.
+    #[test]
+    fn rebuild_after_failure_restores_consistency() {
+        let scope = Scope::Root;
+        let index = index_with(&[(&scope, "note", "oldword content")]);
+
+        index.fail_next(FailPoint::Commit);
+        assert!(index
+            .apply(vec![LexicalOp::Upsert(ldoc(
+                &scope,
+                "note",
+                "newword content"
+            ))])
+            .is_err());
+
+        // Repair: rebuild from git truth (v2).
+        index
+            .rebuild(vec![ldoc(&scope, "note", "newword content")])
+            .expect("repair rebuild");
+        assert!(!index.is_degraded());
+
+        let hits = search_names(&index, "newword").expect("post-repair search must work");
+        assert_eq!(hits, vec![key(&scope, "note")]);
+        let stale = search_names(&index, "oldword").expect("post-repair search must work");
+        assert!(stale.is_empty(), "stale content survived repair: {stale:?}");
+    }
+
+    /// Reload failure after a successful commit: the data IS committed but
+    /// the caller was told the mutation failed. The contract resolves the
+    /// report/truth mismatch by flagging degraded until repair.
+    #[test]
+    fn reload_failure_flags_degraded_and_repair_converges() {
+        let scope = Scope::Root;
+        let index = LexicalIndex::new();
+
+        index.fail_next(FailPoint::Reload);
+        assert!(index
+            .apply(vec![LexicalOp::Upsert(ldoc(&scope, "note", "reloadword"))])
+            .is_err());
+        assert!(index.is_degraded(), "reload failure must flag the index");
+        assert!(index.search(&ScopeFilter::All, "reloadword", 10).is_err());
+
+        index
+            .rebuild(vec![ldoc(&scope, "note", "reloadword")])
+            .expect("repair rebuild");
+        assert!(!index.is_degraded());
+        let hits = search_names(&index, "reloadword").expect("post-repair search");
+        assert_eq!(hits, vec![key(&scope, "note")]);
+    }
+
+    /// Contract clause 3: every failure stage flags the index degraded.
+    #[test]
+    fn every_failure_stage_marks_degraded() {
+        let scope = Scope::Root;
+        for point in [FailPoint::BeforeOp(0), FailPoint::Commit, FailPoint::Reload] {
+            let index = LexicalIndex::new();
+            index.fail_next(point);
+            assert!(
+                index
+                    .apply(vec![LexicalOp::Upsert(ldoc(&scope, "note", "word"))])
+                    .is_err(),
+                "{point:?} must error"
+            );
+            assert!(index.is_degraded(), "{point:?} must flag degraded");
+        }
+    }
+
+    /// A divergence event *after* the rebuild token was captured must keep
+    /// the index degraded even though the rebuild itself succeeds — the
+    /// rebuild's document set cannot reflect it.
+    #[test]
+    fn divergence_after_token_capture_keeps_degraded() {
+        let scope = Scope::Root;
+        let index = LexicalIndex::new();
+
+        let token = index.begin_rebuild();
+        // Simulates a mirror failing between the repo listing and the
+        // rebuild commit.
+        index.mark_rebuild_required("test: failure after token capture");
+
+        index
+            .rebuild_from(token, vec![ldoc(&scope, "note", "someword")])
+            .expect("rebuild itself succeeds");
+        assert!(
+            index.is_degraded(),
+            "a post-capture divergence event must survive the rebuild"
+        );
+
+        // A follow-up rebuild with a fresh token converges.
+        index
+            .rebuild(vec![ldoc(&scope, "note", "someword")])
+            .expect("follow-up rebuild");
+        assert!(!index.is_degraded());
+    }
+
+    /// A mirror committed after the token capture (i.e. racing the repo
+    /// listing) must re-flag the index: the rebuild's document set may not
+    /// include it. A follow-up quiescent rebuild converges.
+    #[test]
+    fn mirror_racing_rebuild_listing_keeps_degraded() {
+        let scope = Scope::Root;
+        let index = LexicalIndex::new();
+
+        let token = index.begin_rebuild();
+        // Mirror of a git write that the (already taken) listing missed.
+        index
+            .apply(vec![LexicalOp::Upsert(ldoc(&scope, "raced", "racedword"))])
+            .expect("raced mirror");
+
+        index
+            .rebuild_from(token, vec![ldoc(&scope, "old", "oldword")])
+            .expect("rebuild succeeds");
+        assert!(
+            index.is_degraded(),
+            "a mirror racing the listing must keep the index flagged"
+        );
+
+        // Follow-up rebuild from current git truth converges.
+        index
+            .rebuild(vec![
+                ldoc(&scope, "old", "oldword"),
+                ldoc(&scope, "raced", "racedword"),
+            ])
+            .expect("follow-up rebuild");
+        assert!(!index.is_degraded());
+        let hits = search_names(&index, "racedword").expect("post-repair search");
+        assert_eq!(hits, vec![key(&scope, "raced")]);
+    }
+
+    /// The repair slot is single-flight.
+    #[test]
+    fn repair_slot_is_single_flight() {
+        let index = LexicalIndex::new();
+        assert!(index.try_claim_repair());
+        assert!(index.is_repairing());
+        assert!(!index.try_claim_repair(), "second claim must fail");
+        index.finish_repair();
+        assert!(!index.is_repairing());
+        assert!(index.try_claim_repair(), "slot must be reusable");
+    }
+
+    /// Contract clause 5: dropping the `apply_async` future — polled or not —
+    /// never strands the batch. Dispatch is eager, so the batch runs to
+    /// completion on the blocking pool and converges with git truth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_apply_async_after_dispatch_converges() {
+        let scope = Scope::Root;
+        let index = Arc::new(LexicalIndex::new());
+
+        let fut = index.apply_async(vec![LexicalOp::Upsert(ldoc(
+            &scope,
+            "note",
+            "cancelword content",
+        ))]);
+        // Poll once, then drop the future (request cancellation).
+        let cancelled = tokio::time::timeout(std::time::Duration::from_nanos(1), fut)
+            .await
+            .is_err();
+
+        // Whether or not the timeout won the race, the batch must converge.
+        tracing::debug!(cancelled, "apply_async cancellation raced");
+        assert_converges(&index, "cancelword", &[key(&scope, "note")]).await;
+    }
+
+    /// Contract clause 5 (the pre-#310 strand case): a future dropped before
+    /// its first poll. Eager dispatch means the batch has already been handed
+    /// to the blocking pool at call time, so the mutation still converges
+    /// instead of being silently lost after its git write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_async_dropped_unpolled_still_converges() {
+        let scope = Scope::Root;
+        let index = Arc::new(LexicalIndex::new());
+
+        let fut = index.apply_async(vec![LexicalOp::Upsert(ldoc(
+            &scope,
+            "note",
+            "unpolledword content",
+        ))]);
+        drop(fut);
+
+        assert_converges(&index, "unpolledword", &[key(&scope, "note")]).await;
     }
 
     #[test]

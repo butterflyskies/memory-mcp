@@ -43,7 +43,7 @@ use crate::{
     index::VectorStore,
     recall_log::{BatchVerdict, RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
-    search::{hybrid_search, FusedHit, LexicalDoc, LexicalIndex, LexicalOp},
+    search::{hybrid_search, spawn_lexical_repair, FusedHit, LexicalDoc, LexicalIndex, LexicalOp},
     types::{
         parse_qualified_name, AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs,
         ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
@@ -279,14 +279,15 @@ async fn incremental_reindex(
 
     // ---- 3b. Mirror all changes into the lexical index ----------------------
     // One batch: a single commit and reader reload for the whole changed
-    // set, on the blocking pool. Best-effort — a failure degrades the
-    // changed memories to semantic-only until the next startup rebuild.
+    // set, on the blocking pool. Best-effort — a failure flags the index
+    // degraded (semantic-only recall) and repair rebuilds from git truth.
     if let Err(e) = lexical.apply_async(lexical_ops).await {
         warn!(
             error = %e,
-            "incremental_reindex: lexical batch update failed; changed memories \
-             will not be keyword-searchable until restart"
+            "incremental_reindex: lexical batch update failed; keyword search \
+             degraded until repair completes"
         );
+        spawn_lexical_repair(repo, lexical);
     }
 
     if to_embed.is_empty() {
@@ -509,9 +510,20 @@ impl MemoryServer {
                 .add(&scope, &vector, qualified_name.clone())
                 .map_err(ErrorData::from)?;
 
-            // Lexical index is best-effort: a failure here leaves the memory
-            // semantically searchable, and the next startup rebuild heals it.
-            // The commit runs on the blocking pool, not this async worker.
+            let start = Instant::now();
+            state
+                .repo
+                .save_memory(&memory)
+                .await
+                .map_err(ErrorData::from)?;
+            info!(repo_ms = start.elapsed().as_millis(), "saved to repo");
+
+            // Mirror into the lexical index after git truth is durable, so a
+            // save failure never leaves the index ahead of the repo. The
+            // batch is dispatched eagerly (no await point between the save
+            // and the dispatch), so request cancellation cannot strand a
+            // saved memory unmirrored. Best-effort: a failure flags the
+            // index degraded and repair rebuilds it from git truth.
             if let Err(e) = state
                 .lexical
                 .apply_async(vec![LexicalOp::Upsert(LexicalDoc {
@@ -524,18 +536,11 @@ impl MemoryServer {
                 warn!(
                     name = %memory.name,
                     error = %e,
-                    "lexical index update failed during remember; memory will not be \
-                     keyword-searchable until restart"
+                    "lexical index update failed during remember; keyword search \
+                     degraded until repair completes"
                 );
+                spawn_lexical_repair(&state.repo, &state.lexical);
             }
-
-            let start = Instant::now();
-            state
-                .repo
-                .save_memory(&memory)
-                .await
-                .map_err(ErrorData::from)?;
-            info!(repo_ms = start.elapsed().as_millis(), "saved to repo");
 
             Ok(serde_json::json!({
                 "id": memory.id,
@@ -591,6 +596,13 @@ impl MemoryServer {
                 ScopeFilter::parse_or_default(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let limit = args.limit.unwrap_or(5).min(100);
+
+            // Degraded lexical index self-heals on read: kick a background
+            // rebuild from git truth (single-flight). This query — and every
+            // query until the rebuild converges — serves semantic-only.
+            if state.lexical.is_degraded() {
+                spawn_lexical_repair(&state.repo, &state.lexical);
+            }
 
             // Semantic and lexical retrieval run in parallel; ranked lists
             // are merged with reciprocal rank fusion so an exact keyword hit
@@ -739,7 +751,8 @@ impl MemoryServer {
                 .apply_async(vec![LexicalOp::Remove(qualified_name.clone())])
                 .await
             {
-                warn!(name = %name, error = %e, "lexical removal failed during forget; stale entry will be skipped at recall");
+                warn!(name = %name, error = %e, "lexical removal failed during forget; keyword search degraded until repair completes");
+                spawn_lexical_repair(&state.repo, &state.lexical);
             }
 
             info!(
@@ -842,25 +855,6 @@ impl MemoryServer {
                 let index_result = state.index.add(&scope, &vector, qualified_name.clone());
                 timing.index_ms = elapsed_ms(stage_start);
                 index_result.map_err(ErrorData::from)?;
-
-                // Lexical index is best-effort: the next startup rebuild heals it.
-                // The commit runs on the blocking pool, not this async worker.
-                if let Err(e) = state
-                    .lexical
-                    .apply_async(vec![LexicalOp::Upsert(LexicalDoc {
-                        qualified_name: qualified_name.clone(),
-                        name: memory.name.as_str().to_string(),
-                        content: memory.content.clone(),
-                    })])
-                    .await
-                {
-                    warn!(
-                        name = %memory.name,
-                        error = %e,
-                        "lexical index update failed during edit; stale keyword entry \
-                         until restart"
-                    );
-                }
             }
 
             // Persist to repo (last, so partial failures leave recoverable state).
@@ -869,6 +863,32 @@ impl MemoryServer {
             let save_result = state.repo.save_memory(&memory).await;
             timing.repo_save_ms = elapsed_ms(stage_start);
             save_result.map_err(ErrorData::from)?;
+
+            // Mirror into the lexical index after git truth is durable, so a
+            // save failure never leaves the index serving content the repo
+            // does not hold. Eager dispatch: no await point between the save
+            // and the dispatch, so cancellation cannot strand the mirror.
+            // Best-effort: a failure flags the index degraded and repair
+            // rebuilds it from git truth.
+            if content_changed {
+                if let Err(e) = state
+                    .lexical
+                    .apply_async(vec![LexicalOp::Upsert(LexicalDoc {
+                        qualified_name: memory.mem_ref().qualified_path(),
+                        name: memory.name.as_str().to_string(),
+                        content: memory.content.clone(),
+                    })])
+                    .await
+                {
+                    warn!(
+                        name = %memory.name,
+                        error = %e,
+                        "lexical index update failed during edit; keyword search \
+                         degraded until repair completes"
+                    );
+                    spawn_lexical_repair(&state.repo, &state.lexical);
+                }
+            }
 
             info!(
                 ms = elapsed_ms(timing.start),
@@ -1014,10 +1034,10 @@ impl MemoryServer {
                     name = %name,
                     new_name = %new_name,
                     error = %e,
-                    "lexical index update failed during move; destination will not be \
-                     keyword-searchable and the stale source entry will be skipped \
-                     at recall, until restart"
+                    "lexical index update failed during move; keyword search degraded \
+                     until repair completes"
                 );
+                spawn_lexical_repair(&state.repo, &state.lexical);
             }
 
             info!(
@@ -2038,5 +2058,328 @@ mod tests {
 
         assert_eq!(entry["match_type"], "both");
         assert!(entry["distance"].is_number());
+    }
+
+    // -----------------------------------------------------------------------
+    // Lexical failure/repair receipts (#310, ADR-0039)
+    //
+    // Failure injection across the mutation paths that mirror git writes
+    // into the lexical index. Each receipt asserts the contract end to end:
+    // the handler stays best-effort (the git write succeeds), the failed
+    // mirror flags the index degraded, and the repair loop deterministically
+    // converges the index back to git truth.
+    // -----------------------------------------------------------------------
+
+    mod lexical_failure_receipts {
+        use super::*;
+        use crate::auth::AuthProvider;
+        use crate::health::HealthRegistry;
+        use crate::index::InMemoryStore;
+        use crate::repo::MemoryRepo;
+        use crate::search::bm25::FailPoint;
+        use crate::search::rebuild_lexical_from_repo;
+        use async_trait::async_trait;
+
+        struct MockEmbedding;
+
+        #[async_trait]
+        impl crate::embedding::EmbeddingBackend for MockEmbedding {
+            async fn embed(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, crate::error::MemoryError> {
+                Ok(texts.iter().map(|_| vec![0.0, 0.0, 0.0, 1.0]).collect())
+            }
+
+            fn dimensions(&self) -> usize {
+                4
+            }
+        }
+
+        fn parts() -> http::request::Parts {
+            http::Request::builder()
+                .uri("/")
+                .body(())
+                .expect("request")
+                .into_parts()
+                .0
+        }
+
+        fn test_state(tmp: &tempfile::TempDir) -> Arc<AppState> {
+            let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo init");
+            Arc::new(AppState::new(
+                Arc::new(repo),
+                "main".to_string(),
+                Box::new(MockEmbedding),
+                Box::new(InMemoryStore::new(4)),
+                AuthProvider::new(),
+                HealthRegistry::new(),
+                None,
+            ))
+        }
+
+        fn qualified(scope: &Scope, name: &str) -> String {
+            MemoryRef::new(scope.clone(), MemoryName::new(name.to_string()).unwrap())
+                .qualified_path()
+        }
+
+        /// Poll until the lexical index is consistent and `query` returns
+        /// exactly `expected` — the deterministic-convergence receipt. The
+        /// repair task runs in the background, so convergence is eventual
+        /// but bounded.
+        async fn assert_lexical_converges(state: &Arc<AppState>, query: &str, expected: &[String]) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if !state.lexical.is_degraded() {
+                    if let Ok(hits) = state.lexical.search(&ScopeFilter::All, query, 10) {
+                        let names: Vec<String> = hits.into_iter().map(|(n, _)| n).collect();
+                        if names == expected {
+                            return;
+                        }
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "lexical index never converged to git truth for query {query:?} \
+                     (expected {expected:?}, degraded={})",
+                    state.lexical.is_degraded()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn remember(
+            server: &MemoryServer,
+            name: &str,
+            content: &str,
+        ) -> Result<String, ErrorData> {
+            server
+                .remember(
+                    Parameters(RememberArgs {
+                        content: content.to_string(),
+                        name: name.to_string(),
+                        tags: vec![],
+                        scope: None,
+                        source: None,
+                    }),
+                    Extension(parts()),
+                )
+                .await
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remember_mirror_failure_degrades_then_repairs_to_git_truth() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            state.lexical.fail_next(FailPoint::Commit);
+            remember(&server, "note", "rememberword content")
+                .await
+                .expect("remember must stay best-effort despite the lexical failure");
+
+            // Git truth holds the memory even though the mirror failed.
+            state
+                .repo
+                .read_memory(&MemoryName::new("note".to_string()).unwrap(), &Scope::Root)
+                .await
+                .expect("git truth must hold the memory");
+
+            assert_lexical_converges(&state, "rememberword", &[qualified(&Scope::Root, "note")])
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn edit_mirror_failure_degrades_then_repairs_to_git_truth() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            remember(&server, "note", "oldword content")
+                .await
+                .expect("remember");
+
+            state.lexical.fail_next(FailPoint::Commit);
+            server
+                .edit(
+                    Parameters(EditArgs {
+                        name: "note".to_string(),
+                        content: Some("newword content".to_string()),
+                        tags: None,
+                        scope: None,
+                    }),
+                    Extension(parts()),
+                )
+                .await
+                .expect("edit must stay best-effort despite the lexical failure");
+
+            // Post-repair: new content searchable, old content gone.
+            assert_lexical_converges(&state, "newword", &[qualified(&Scope::Root, "note")]).await;
+            let stale = state
+                .lexical
+                .search(&ScopeFilter::All, "oldword", 10)
+                .expect("post-repair search");
+            assert!(stale.is_empty(), "stale content survived repair: {stale:?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn forget_mirror_failure_degrades_then_repairs_to_git_truth() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            remember(&server, "doomed", "doomedword content")
+                .await
+                .expect("remember");
+
+            state.lexical.fail_next(FailPoint::Commit);
+            server
+                .forget(
+                    Parameters(ForgetArgs {
+                        name: "doomed".to_string(),
+                        scope: None,
+                    }),
+                    Extension(parts()),
+                )
+                .await
+                .expect("forget must stay best-effort despite the lexical failure");
+
+            // Post-repair: the deleted memory is not lexically reachable.
+            assert_lexical_converges(&state, "doomedword", &[]).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn move_mirror_failure_degrades_then_repairs_to_git_truth() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            remember(&server, "wanderer", "moveword content")
+                .await
+                .expect("remember");
+
+            state.lexical.fail_next(FailPoint::Commit);
+            server
+                .move_memory(
+                    Parameters(MoveArgs {
+                        name: "wanderer".to_string(),
+                        from_scope: None,
+                        to_scope: "proj".to_string(),
+                        new_name: None,
+                    }),
+                    Extension(parts()),
+                )
+                .await
+                .expect("move must stay best-effort despite the lexical failure");
+
+            // Post-repair: only the destination entry exists.
+            let dest_scope = Scope::parse_or_default(Some("proj")).unwrap();
+            assert_lexical_converges(&state, "moveword", &[qualified(&dest_scope, "wanderer")])
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn incremental_reindex_mirror_failure_degrades_then_repairs() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            // A memory lands in the repo out-of-band (as after a pull).
+            let memory = Memory::from_validated(
+                MemoryName::new("pulled".to_string()).unwrap(),
+                "pulledword content".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&memory).await.expect("save");
+
+            let changes = ChangedMemories {
+                upserted: vec![qualified(&Scope::Root, "pulled")],
+                removed: vec![],
+            };
+
+            state.lexical.fail_next(FailPoint::Commit);
+            let stats = incremental_reindex(
+                &state.repo,
+                state.embedding.as_ref(),
+                state.index.as_ref(),
+                &state.lexical,
+                &changes,
+            )
+            .await;
+            assert_eq!(stats.errors, 0, "vector-side reindex must be unaffected");
+
+            assert_lexical_converges(&state, "pulledword", &[qualified(&Scope::Root, "pulled")])
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn startup_rebuild_failure_degrades_then_retry_converges() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            let memory = Memory::from_validated(
+                MemoryName::new("note".to_string()).unwrap(),
+                "bootword content".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&memory).await.expect("save");
+
+            // Startup rebuild fails mid-way: index must be degraded, not
+            // silently half-built.
+            state.lexical.fail_next(FailPoint::BeforeOp(0));
+            assert!(rebuild_lexical_from_repo(&state.repo, &state.lexical)
+                .await
+                .is_err());
+            assert!(state.lexical.is_degraded());
+            assert!(
+                state
+                    .lexical
+                    .search(&ScopeFilter::All, "bootword", 10)
+                    .is_err(),
+                "degraded index must not serve results"
+            );
+
+            // The retry (same code path as repair) converges.
+            rebuild_lexical_from_repo(&state.repo, &state.lexical)
+                .await
+                .expect("retry rebuild");
+            assert!(!state.lexical.is_degraded());
+            let hits = state
+                .lexical
+                .search(&ScopeFilter::All, "bootword", 10)
+                .expect("post-repair search");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].0, qualified(&Scope::Root, "note"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn recall_on_degraded_index_serves_semantic_only_and_triggers_repair() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            remember(&server, "note", "healme content")
+                .await
+                .expect("remember");
+            state
+                .lexical
+                .mark_rebuild_required("test: forced divergence");
+            assert!(state.lexical.is_degraded());
+
+            // Recall must succeed (semantic-only) while degraded…
+            server
+                .recall(
+                    Parameters(RecallArgs {
+                        query: "healme".to_string(),
+                        scope: None,
+                        limit: Some(5),
+                    }),
+                    Extension(parts()),
+                )
+                .await
+                .expect("recall must serve semantic-only while degraded");
+
+            // …and it kicks a background repair that converges.
+            assert_lexical_converges(&state, "healme", &[qualified(&Scope::Root, "note")]).await;
+        }
     }
 }
