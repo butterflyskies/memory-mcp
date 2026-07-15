@@ -3,6 +3,8 @@
 ### Changed
 
 - Bound `list` responses with cursor pagination (50 summaries by default, 100 maximum), exact field projection, deterministic ordering, and a 24 KiB page ceiling (#281). Existing callers must follow `next_cursor` when `has_more` is true; omitting `fields` retains the prior six-field summary shape.
+- `list.count` now means the total matching memories, while `list.returned` is the number in the current page. Repository enumeration and metadata parsing still scan the selected scope once per page; pushing the seek into a persistent summary index is deferred to #304.
+- Retain the original public Rust `ListArgs { scope }` DTO for semver compatibility; paginated MCP-only request fields use an internal wire type.
 
 ### Added
 

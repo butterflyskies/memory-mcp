@@ -1,9 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
 /// Maximum number of characters included in recall result snippets.
 /// Content longer than this is truncated and flagged with `truncated: true`.
 const SNIPPET_MAX_CHARS: usize = 500;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use rmcp::{
     handler::server::{
@@ -107,6 +108,7 @@ struct ListCursorPayload {
     name: String,
 }
 
+#[derive(Debug)]
 struct DecodedListCursor {
     key: ListSortKey,
 }
@@ -127,11 +129,11 @@ fn validate_list_limit(limit: Option<usize>) -> Result<usize, MemoryError> {
     Ok(limit)
 }
 
-fn list_filter_key(filter: &ScopeFilter) -> String {
+fn list_filter_key(filter: &ScopeFilter) -> Cow<'static, str> {
     match filter {
-        ScopeFilter::RootOnly => "root".to_string(),
-        ScopeFilter::All => "all".to_string(),
-        ScopeFilter::Subtree(path) => format!("subtree:{}", path.as_str()),
+        ScopeFilter::RootOnly => Cow::Borrowed("root"),
+        ScopeFilter::All => Cow::Borrowed("all"),
+        ScopeFilter::Subtree(path) => Cow::Owned(format!("subtree:{}", path.as_str())),
     }
 }
 
@@ -143,16 +145,10 @@ fn encode_list_cursor(filter: &str, key: &ListSortKey) -> Result<String, MemoryE
         name: key.name.clone(),
     })
     .map_err(|error| MemoryError::Internal(format!("serialize list cursor: {error}")))?;
-    let mut encoded = String::with_capacity(4 + payload.len() * 2);
-    encoded.push_str("lc1_");
-    for byte in payload {
-        use std::fmt::Write as _;
-        write!(&mut encoded, "{byte:02x}")
-            .map_err(|error| MemoryError::Internal(format!("encode list cursor: {error}")))?;
-    }
+    let encoded = format!("lc1_{}", URL_SAFE_NO_PAD.encode(payload));
     if encoded.len() > LIST_CURSOR_MAX_CHARS {
         return Err(invalid_list_input(
-            "list cursor exceeds the supported size; use shorter scope and memory names",
+            "encoded list cursor exceeds the supported size",
         ));
     }
     Ok(encoded)
@@ -163,33 +159,31 @@ fn decode_list_cursor(
     expected_filter: &str,
 ) -> Result<DecodedListCursor, MemoryError> {
     if cursor.len() > LIST_CURSOR_MAX_CHARS {
-        return Err(invalid_list_input("list cursor is too large"));
+        return Err(invalid_list_input(
+            "list cursor is too large; omit cursor to start a new page",
+        ));
     }
-    let hex = cursor
-        .strip_prefix("lc1_")
-        .ok_or_else(|| invalid_list_input("invalid list cursor"))?;
-    if hex.is_empty() || hex.len() % 2 != 0 {
-        return Err(invalid_list_input("invalid list cursor"));
+    let encoded = cursor.strip_prefix("lc1_").ok_or_else(|| {
+        invalid_list_input("invalid list cursor; omit cursor to start a new page")
+    })?;
+    if encoded.is_empty() {
+        return Err(invalid_list_input(
+            "invalid list cursor; omit cursor to start a new page",
+        ));
     }
-    let bytes = hex.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let high = (pair[0] as char)
-            .to_digit(16)
-            .ok_or_else(|| invalid_list_input("invalid list cursor"))?;
-        let low = (pair[1] as char)
-            .to_digit(16)
-            .ok_or_else(|| invalid_list_input("invalid list cursor"))?;
-        decoded.push(((high << 4) | low) as u8);
-    }
-    let payload: ListCursorPayload =
-        serde_json::from_slice(&decoded).map_err(|_| invalid_list_input("invalid list cursor"))?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid_list_input("invalid list cursor; omit cursor to start a new page"))?;
+    let payload: ListCursorPayload = serde_json::from_slice(&decoded)
+        .map_err(|_| invalid_list_input("invalid list cursor; omit cursor to start a new page"))?;
     if payload.version != 1 {
-        return Err(invalid_list_input("unsupported list cursor version"));
+        return Err(invalid_list_input(
+            "unsupported list cursor version; omit cursor to start a new page",
+        ));
     }
     if payload.filter != expected_filter {
         return Err(invalid_list_input(
-            "list cursor belongs to a different scope query",
+            "list cursor belongs to a different scope query; omit cursor to start a new page",
         ));
     }
     Ok(DecodedListCursor {
@@ -252,32 +246,6 @@ fn list_page_value(
     })
 }
 
-fn list_page_serialized_len(
-    summaries_bytes: usize,
-    returned: usize,
-    count: usize,
-    limit: usize,
-    next_cursor: Option<&str>,
-) -> Result<usize, MemoryError> {
-    let empty_page = serde_json::json!({
-        "memories": [],
-        "count": count,
-        "returned": returned,
-        "limit": limit,
-        "has_more": next_cursor.is_some(),
-        "next_cursor": next_cursor,
-    });
-    let envelope_len = serde_json::to_vec(&empty_page)
-        .map_err(|error| MemoryError::Internal(format!("serialize list page: {error}")))?
-        .len();
-    let memories_len = if returned == 0 {
-        0
-    } else {
-        summaries_bytes + returned - 1
-    };
-    Ok(envelope_len + memories_len)
-}
-
 fn paginate_list(
     memories: Vec<Memory>,
     filter: &ScopeFilter,
@@ -297,28 +265,30 @@ fn paginate_list(
     });
 
     let mut summaries = Vec::with_capacity(limit.min(count.saturating_sub(start)));
-    let mut summaries_bytes = 0;
+    let mut accepted_page = None;
     for (key, memory) in memories.iter().skip(start).take(limit) {
-        let summary = list_summary(memory, fields);
-        let summary_len = serde_json::to_vec(&summary)
-            .map_err(|error| MemoryError::Internal(format!("serialize list summary: {error}")))?
-            .len();
-        summaries.push(summary);
-        summaries_bytes += summary_len;
+        summaries.push(list_summary(memory, fields));
         let next_index = start + summaries.len();
         let next_cursor = if next_index < count {
-            Some(encode_list_cursor(&filter_key, key)?)
+            Some(
+                encode_list_cursor(filter_key.as_ref(), key).map_err(|error| {
+                    invalid_list_input(format!(
+                        "cannot continue list pagination after memory '{}' in scope '{}': {error}",
+                        key.name, key.scope
+                    ))
+                })?,
+            )
         } else {
             None
         };
-        let candidate_len = list_page_serialized_len(
-            summaries_bytes,
-            summaries.len(),
+        let candidate = serde_json::to_string(&list_page_value(
+            &summaries,
             count,
             limit,
             next_cursor.as_deref(),
-        )?;
-        if candidate_len > LIST_PAGE_MAX_BYTES {
+        ))
+        .map_err(|error| MemoryError::Internal(format!("serialize list page: {error}")))?;
+        if candidate.len() > LIST_PAGE_MAX_BYTES {
             summaries.pop();
             if summaries.is_empty() {
                 return Err(invalid_list_input(format!(
@@ -327,24 +297,14 @@ fn paginate_list(
             }
             break;
         }
+        accepted_page = Some(candidate);
     }
 
-    let next_index = start + summaries.len();
-    let next_cursor = if next_index < count {
-        let last = memories
-            .get(next_index.saturating_sub(1))
-            .ok_or_else(|| MemoryError::Internal("list pagination made no progress".to_string()))?;
-        Some(encode_list_cursor(&filter_key, &last.0)?)
-    } else {
-        None
+    let page = match accepted_page {
+        Some(page) => page,
+        None => serde_json::to_string(&list_page_value(&[], count, limit, None))
+            .map_err(|error| MemoryError::Internal(format!("serialize list page: {error}")))?,
     };
-    let page = serde_json::to_string(&list_page_value(
-        &summaries,
-        count,
-        limit,
-        next_cursor.as_deref(),
-    ))
-    .map_err(|error| MemoryError::Internal(format!("serialize list page: {error}")))?;
     if page.len() > LIST_PAGE_MAX_BYTES {
         return Err(MemoryError::Internal(
             "list page exceeded its serialized byte ceiling".to_string(),
@@ -795,6 +755,7 @@ impl MemoryServer {
         Each result includes `truncated` (bool) and `content_length` (total character count). \
         When `truncated` is true, the snippet is incomplete — use the `read` tool with the memory's name and scope \
         to retrieve the full content before acting on it.\n\n\
+        limit defaults to 5 and values above 100 are clamped to 100. \
         Scope: pass '<basename-of-your-cwd>' or 'org/team' to search that scope + global memories, \
         'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
@@ -1231,11 +1192,13 @@ impl MemoryServer {
         name = "list",
         description = "List stored memories. Pass a bare path like '<basename-of-your-cwd>' for that scope + global memories, \
         'global' for global-only, or 'all' for everything. Omitting scope defaults to global-only. \
-        Pages are sorted by (scope, name); limit defaults to 50 and cannot exceed 100. \
+        Pages are sorted by (scope, name); limit defaults to 50, and values outside 1..=100 are rejected. \
         Continue with the opaque next_cursor returned by the previous page. Concurrent inserts and \
         deletes follow standard keyset semantics. Use fields to request an exact summary \
         projection; omitting fields returns id, name, scope, tags, created_at, and updated_at. \
-        Successful pages are capped at 24 KiB; request fewer fields if one summary is too large."
+        The response envelope reports count as the total matching memories and returned as the number \
+        in this page, plus limit, has_more, and next_cursor. Successful pages are capped at 24 KiB; \
+        request fewer fields if one summary is too large."
     )]
     async fn list(
         &self,
@@ -2161,6 +2124,9 @@ mod tests {
                 repo.save_memory(&list_test_memory("bravo", Scope::Root, vec![]))
                     .await
                     .expect("concurrent insert");
+                repo.delete_memory("alpha", &Scope::Root)
+                    .await
+                    .expect("delete cursor anchor");
             }
             if cursor.is_none() {
                 break;
@@ -2168,6 +2134,39 @@ mod tests {
         }
 
         assert_eq!(walked, ["alpha", "bravo", "charlie", "delta"]);
+    }
+
+    #[tokio::test]
+    async fn list_mcp_handler_applies_default_limit_of_fifty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = Arc::new(MemoryRepo::init_or_open(temp.path(), None).expect("repo"));
+        for index in 0..51 {
+            repo.save_memory(&list_test_memory(
+                &format!("memory-{index:02}"),
+                Scope::Root,
+                vec![],
+            ))
+            .await
+            .expect("seed memory");
+        }
+        let page = list_test_server(repo)
+            .list(
+                Parameters(ListToolArgs {
+                    scope: None,
+                    limit: None,
+                    cursor: None,
+                    fields: Some(vec![ListField::Name]),
+                }),
+                Extension(list_test_parts()),
+            )
+            .await
+            .expect("default-limit page");
+        let page: serde_json::Value = serde_json::from_str(&page).expect("JSON page");
+        assert_eq!(page["count"], 51);
+        assert_eq!(page["returned"], LIST_DEFAULT_LIMIT);
+        assert_eq!(page["limit"], LIST_DEFAULT_LIMIT);
+        assert_eq!(page["has_more"], true);
+        assert!(page["next_cursor"].is_string());
     }
 
     #[test]
@@ -2187,6 +2186,40 @@ mod tests {
             decode_list_cursor(&cursor, "root"),
             Err(MemoryError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn list_cursor_rejects_untrusted_shapes_with_remediation() {
+        let unsupported_version = format!(
+            "lc1_{}",
+            URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 2,
+                    "filter": "all",
+                    "scope": "global",
+                    "name": "alpha",
+                }))
+                .expect("cursor payload"),
+            )
+        );
+        let cases = [
+            "lc1_".to_string(),
+            "lc1_*".to_string(),
+            format!("lc1_{}", URL_SAFE_NO_PAD.encode(b"not JSON")),
+            unsupported_version,
+            "x".repeat(LIST_CURSOR_MAX_CHARS + 1),
+        ];
+
+        for cursor in cases {
+            let error = decode_list_cursor(&cursor, "all").expect_err("cursor must fail");
+            let MemoryError::InvalidInput { reason } = error else {
+                panic!("expected invalid input");
+            };
+            assert!(
+                reason.contains("omit cursor to start a new page"),
+                "missing remediation: {reason}"
+            );
+        }
     }
 
     #[test]
@@ -2210,6 +2243,74 @@ mod tests {
     }
 
     #[test]
+    fn list_cursor_round_trips_generated_keys() {
+        for length in 0..=128 {
+            let key = ListSortKey {
+                scope: format!("scope-{}", "é".repeat(length)),
+                name: format!("name-{}", "界".repeat(length)),
+            };
+            let cursor = encode_list_cursor("subtree:scope", &key).expect("encode cursor");
+            let decoded = decode_list_cursor(&cursor, "subtree:scope").expect("decode cursor");
+            assert_eq!(decoded.key, key);
+        }
+    }
+
+    #[test]
+    fn list_cursor_fits_maximum_filesystem_legal_scope_and_name() {
+        let component = "s".repeat(255);
+        let scope = std::iter::repeat_n(component.as_str(), 10)
+            .collect::<Vec<_>>()
+            .join("/");
+        let name = std::iter::repeat_n("n".repeat(255), 3)
+            .collect::<Vec<_>>()
+            .join("/");
+        let key = ListSortKey {
+            scope: scope.clone(),
+            name,
+        };
+        let filter = format!("subtree:{scope}");
+        let cursor = encode_list_cursor(&filter, &key).expect("legal key must fit cursor bound");
+        assert!(cursor.len() <= LIST_CURSOR_MAX_CHARS);
+        assert_eq!(
+            decode_list_cursor(&cursor, &filter).expect("decode").key,
+            key
+        );
+    }
+
+    #[test]
+    fn list_paginates_past_a_maximum_legal_interior_key() {
+        let component = "s".repeat(255);
+        let scope_path = std::iter::repeat_n(component.as_str(), 10)
+            .collect::<Vec<_>>()
+            .join("/");
+        let scope = list_test_path(&scope_path);
+        let long_name = std::iter::repeat_n("m".repeat(255), 3)
+            .collect::<Vec<_>>()
+            .join("/");
+        let memories = vec![
+            list_test_memory("alpha", scope.clone(), vec![]),
+            list_test_memory(&long_name, scope.clone(), vec![]),
+            list_test_memory("zulu", scope, vec![]),
+        ];
+        let filter = ScopeFilter::Subtree(
+            crate::types::ScopePath::new(scope_path).expect("valid scope path"),
+        );
+
+        let page = paginate_list(memories, &filter, 2, None, &[ListField::Name])
+            .expect("long interior key must remain pageable");
+        let page: serde_json::Value = serde_json::from_str(&page).expect("JSON page");
+        assert_eq!(page["returned"], 2);
+        let cursor = page["next_cursor"].as_str().expect("next cursor");
+        assert_eq!(
+            decode_list_cursor(cursor, list_filter_key(&filter).as_ref())
+                .expect("decode")
+                .key
+                .name,
+            long_name
+        );
+    }
+
+    #[test]
     fn list_cursor_tolerates_concurrent_changes_with_keyset_semantics() {
         let original = vec![
             list_test_memory("alpha", Scope::Root, vec![]),
@@ -2229,16 +2330,12 @@ mod tests {
             .expect("next cursor")
             .to_string();
 
-        let mut changed = vec![
+        let changed = vec![
             original[0].clone(),
             list_test_memory("aardvark", Scope::Root, vec![]),
             list_test_memory("bravo", Scope::Root, vec![]),
             original[1].clone(),
         ];
-        changed[0]
-            .metadata
-            .tags
-            .push("edited-after-return".to_string());
         let page = paginate_list(
             changed,
             &ScopeFilter::RootOnly,
@@ -2251,6 +2348,40 @@ mod tests {
         assert_eq!(
             page["memories"],
             serde_json::json!([{"name": "bravo"}, {"name": "charlie"}])
+        );
+    }
+
+    #[test]
+    fn list_cursor_tolerates_an_observable_edit_after_the_cursor() {
+        let original = vec![
+            list_test_memory("alpha", Scope::Root, vec![]),
+            list_test_memory("charlie", Scope::Root, vec![]),
+        ];
+        let first = paginate_list(
+            original.clone(),
+            &ScopeFilter::RootOnly,
+            1,
+            None,
+            &[ListField::Name],
+        )
+        .expect("first page");
+        let first: serde_json::Value = serde_json::from_str(&first).expect("JSON page");
+        let cursor = first["next_cursor"].as_str().expect("cursor");
+        let mut edited = original;
+        edited[1].metadata.tags.push("edited".to_string());
+
+        let page = paginate_list(
+            edited,
+            &ScopeFilter::RootOnly,
+            10,
+            Some(decode_list_cursor(cursor, "root").expect("cursor")),
+            &[ListField::Name, ListField::Tags],
+        )
+        .expect("edit must not stale cursor");
+        let page: serde_json::Value = serde_json::from_str(&page).expect("JSON page");
+        assert_eq!(
+            page["memories"],
+            serde_json::json!([{"name": "charlie", "tags": ["edited"]}])
         );
     }
 
@@ -2340,22 +2471,55 @@ mod tests {
     }
 
     #[test]
-    fn list_page_size_estimate_matches_exact_serialization() {
-        let summaries = vec![
-            serde_json::json!({"name": "alpha"}),
-            serde_json::json!({"name": "quoted \"value\""}),
-        ];
-        let summaries_bytes = summaries
-            .iter()
-            .map(|summary| serde_json::to_vec(summary).expect("summary JSON").len())
-            .sum();
-        for cursor in [None, Some("lc1_deadbeef")] {
-            let page =
-                serde_json::to_vec(&list_page_value(&summaries, 10, 2, cursor)).expect("page JSON");
-            let estimated =
-                list_page_serialized_len(summaries_bytes, 2, 10, 2, cursor).expect("page size");
-            assert_eq!(estimated, page.len());
-        }
+    fn list_nonfinal_page_has_exact_wire_shape() {
+        let page = paginate_list(
+            vec![
+                list_test_memory("alpha", Scope::Root, vec![]),
+                list_test_memory("bravo", Scope::Root, vec![]),
+            ],
+            &ScopeFilter::RootOnly,
+            1,
+            None,
+            &[ListField::Name],
+        )
+        .expect("nonfinal page");
+        let page: serde_json::Value = serde_json::from_str(&page).expect("JSON page");
+        let cursor = page["next_cursor"].as_str().expect("next cursor");
+        assert!(decode_list_cursor(cursor, "root").is_ok());
+        assert_eq!(
+            page,
+            serde_json::json!({
+                "memories": [{"name": "alpha"}],
+                "count": 2,
+                "returned": 1,
+                "limit": 1,
+                "has_more": true,
+                "next_cursor": cursor,
+            })
+        );
+    }
+
+    #[test]
+    fn list_empty_scope_has_exact_wire_shape() {
+        let page = paginate_list(
+            vec![],
+            &ScopeFilter::RootOnly,
+            LIST_DEFAULT_LIMIT,
+            None,
+            &[ListField::Name],
+        )
+        .expect("empty page");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&page).expect("JSON page"),
+            serde_json::json!({
+                "memories": [],
+                "count": 0,
+                "returned": 0,
+                "limit": 50,
+                "has_more": false,
+                "next_cursor": null,
+            })
+        );
     }
 
     #[test]
@@ -2370,7 +2534,7 @@ mod tests {
             })
             .collect();
         let mut cursor = None;
-        let mut returned = 0;
+        let mut walked = Vec::new();
         let mut pages = 0;
 
         loop {
@@ -2387,7 +2551,10 @@ mod tests {
             .expect("bounded page");
             assert!(page.len() <= LIST_PAGE_MAX_BYTES, "{} bytes", page.len());
             let value: serde_json::Value = serde_json::from_str(&page).expect("JSON page");
-            returned += value["returned"].as_u64().expect("returned") as usize;
+            assert_eq!(value["count"], memories.len());
+            for memory in value["memories"].as_array().expect("memories") {
+                walked.push(memory["name"].as_str().expect("memory name").to_string());
+            }
             pages += 1;
             cursor = value["next_cursor"].as_str().map(str::to_string);
             if cursor.is_none() {
@@ -2395,7 +2562,8 @@ mod tests {
             }
         }
 
-        assert_eq!(returned, memories.len());
+        let expected: Vec<_> = (0..30).map(|index| format!("memory-{index:02}")).collect();
+        assert_eq!(walked, expected);
         assert!(pages > 1);
     }
 

@@ -90,7 +90,6 @@ pub struct MoveArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(inline)]
-#[non_exhaustive]
 pub enum ListField {
     /// Stable memory UUID.
     Id,
@@ -118,7 +117,12 @@ impl ListField {
     ];
 }
 
-/// Arguments for the `list` tool — browse stored memories.
+/// Legacy public Rust DTO for the original, scope-only `list` request.
+///
+/// The MCP handler now uses a crate-private wire type so its additive JSON
+/// fields do not silently break downstream code that constructs this public
+/// struct. This type remains public for semver compatibility even though the
+/// handler itself is not part of the public Rust API.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListArgs {
     /// Scope: 'global', a bare namespace path like 'my-project' or 'org/team', 'all', or omit for global-only. Use 'all' to list everything.
