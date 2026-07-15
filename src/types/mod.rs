@@ -10,7 +10,7 @@ mod validated;
 // re-exported as `pub(crate)`.
 
 pub use args::{
-    AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs, ForgetArgs, ListArgs,
+    AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs, ForgetArgs, ListArgs, ListField,
     MarkAppliedArgs, MoveArgs, PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats,
     RememberArgs, SyncArgs, Verdict, VerdictEntry,
 };

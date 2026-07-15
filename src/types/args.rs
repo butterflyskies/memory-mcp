@@ -84,12 +84,54 @@ pub struct MoveArgs {
     pub new_name: Option<String>,
 }
 
+/// A summary field that can be returned by the `list` tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+#[non_exhaustive]
+pub enum ListField {
+    /// Stable memory UUID.
+    Id,
+    /// Human-readable memory name.
+    Name,
+    /// Fully-qualified memory scope.
+    Scope,
+    /// Free-form memory tags.
+    Tags,
+    /// Memory creation timestamp.
+    CreatedAt,
+    /// Most recent memory update timestamp.
+    UpdatedAt,
+}
+
+impl ListField {
+    /// The compatibility projection used when callers omit `fields`.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Id,
+        Self::Name,
+        Self::Scope,
+        Self::Tags,
+        Self::CreatedAt,
+        Self::UpdatedAt,
+    ];
+}
+
 /// Arguments for the `list` tool — browse stored memories.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListArgs {
     /// Scope: 'global', a bare namespace path like 'my-project' or 'org/team', 'all', or omit for global-only. Use 'all' to list everything.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Maximum number of summaries to return. Defaults to 50; maximum 100.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+    /// Opaque cursor returned by a previous list page. Cursors are bound to the queried scope.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Summary fields to return. Omit to preserve the full six-field legacy summary.
+    #[serde(default)]
+    pub fields: Option<Vec<ListField>>,
 }
 
 /// Arguments for the `read` tool — retrieve a specific memory by name.
@@ -437,5 +479,35 @@ mod tests {
         let json = r#"{ "recall_id": "r_1", "memory": "m1", "verdict": "bogus" }"#;
         let result: Result<VerdictEntry, _> = serde_json::from_str(json);
         assert!(result.is_err(), "invalid verdict variant should fail");
+    }
+
+    #[test]
+    fn list_schema_exposes_pagination_and_projection_inputs() {
+        let schema = schemars::schema_for!(ListArgs);
+        let root = serde_json::to_value(&schema).unwrap();
+        let props = root["properties"].as_object().unwrap();
+
+        for field in ["scope", "limit", "cursor", "fields"] {
+            assert!(
+                props.contains_key(field),
+                "list schema must expose '{field}'"
+            );
+        }
+
+        let limit_schema = serde_json::to_string(&props["limit"]).unwrap();
+        assert!(limit_schema.contains("\"minimum\":1"), "{limit_schema}");
+        assert!(limit_schema.contains("\"maximum\":100"), "{limit_schema}");
+
+        let serialized = serde_json::to_string(&props["fields"]).unwrap();
+        assert!(
+            !serialized.contains("$ref"),
+            "fields schema must be inline for MCP clients: {serialized}"
+        );
+        for field in ["id", "name", "scope", "tags", "created_at", "updated_at"] {
+            assert!(
+                serialized.contains(&format!("\"{field}\"")),
+                "fields schema must advertise '{field}': {serialized}"
+            );
+        }
     }
 }
