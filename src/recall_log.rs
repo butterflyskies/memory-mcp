@@ -323,6 +323,10 @@ pub struct RecallResult {
     /// Zero-based rank in the result set (lower is more relevant).
     pub rank: usize,
     /// Cosine distance from the query vector (lower is more similar).
+    ///
+    /// Hits surfaced only by the lexical (BM25) strategy have no embedding
+    /// distance and use the sentinel `-1.0`, which keeps them out of
+    /// distance-bucketed stats (those filter on `distance >= 0.0`).
     pub distance: f64,
 }
 

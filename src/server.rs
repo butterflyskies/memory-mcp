@@ -43,6 +43,7 @@ use crate::{
     index::VectorStore,
     recall_log::{BatchVerdict, RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
+    search::{hybrid_search, FusedHit, LexicalIndex},
     types::{
         parse_qualified_name, AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs,
         ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
@@ -172,6 +173,7 @@ async fn incremental_reindex(
     repo: &Arc<MemoryRepo>,
     embedding: &dyn EmbeddingBackend,
     index: &dyn VectorStore,
+    lexical: &LexicalIndex,
     changes: &ChangedMemories,
 ) -> ReindexStats {
     let mut stats = ReindexStats::default();
@@ -181,6 +183,14 @@ async fn incremental_reindex(
         match parse_qualified_name(name) {
             Ok(mref) => {
                 let canonical = mref.qualified_path();
+                if let Err(e) = lexical.remove(&canonical) {
+                    warn!(
+                        qualified_name = %canonical,
+                        error = %e,
+                        "incremental_reindex: lexical removal failed; stale entry \
+                         will be skipped at recall"
+                    );
+                }
                 match index.remove(&mref.scope, &canonical) {
                     Ok(()) => {
                         stats.removed += 1;
@@ -263,6 +273,14 @@ async fn incremental_reindex(
                 continue;
             }
         };
+        if let Err(e) = lexical.upsert(&qualified, memory.name.as_str(), &memory.content) {
+            warn!(
+                qualified_name = %qualified,
+                error = %e,
+                "incremental_reindex: lexical upsert failed; memory will not be \
+                 keyword-searchable until restart"
+            );
+        }
         to_embed.push((mref.clone(), memory.content));
     }
 
@@ -483,8 +501,23 @@ impl MemoryServer {
 
             state
                 .index
-                .add(&scope, &vector, qualified_name)
+                .add(&scope, &vector, qualified_name.clone())
                 .map_err(ErrorData::from)?;
+
+            // Lexical index is best-effort: a failure here leaves the memory
+            // semantically searchable, and the next startup rebuild heals it.
+            if let Err(e) =
+                state
+                    .lexical
+                    .upsert(&qualified_name, memory.name.as_str(), &memory.content)
+            {
+                warn!(
+                    name = %memory.name,
+                    error = %e,
+                    "lexical index update failed during remember; memory will not be \
+                     keyword-searchable until restart"
+                );
+            }
 
             let start = Instant::now();
             state
@@ -513,11 +546,14 @@ impl MemoryServer {
     /// Returns a JSON array of matching memories sorted by relevance.
     #[tool(
         name = "recall",
-        description = "Search memories by semantic similarity. Embeds the query and returns the top matching memories as a JSON array \
-        with name, scope, tags, and a content snippet (max 500 chars).\n\n\
+        description = "Search memories with hybrid retrieval: semantic similarity (embeddings) and keyword/BM25 \
+        search run in parallel and are rank-fused, so exact phrases buried in long memories still surface. \
+        Returns the top matching memories as a JSON array with name, scope, tags, and a content snippet (max 500 chars).\n\n\
         Each result includes `truncated` (bool) and `content_length` (total character count). \
         When `truncated` is true, the snippet is incomplete — use the `read` tool with the memory's name and scope \
         to retrieve the full content before acting on it.\n\n\
+        Each result also includes `match_type` ('semantic', 'lexical', or 'both') and `distance` \
+        (cosine distance, lower is more similar; null for lexical-only hits, which have no embedding distance).\n\n\
         Scope: pass '<basename-of-your-cwd>' or 'org/team' to search that scope + global memories, \
         'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
@@ -545,41 +581,42 @@ impl MemoryServer {
 
             let limit = args.limit.unwrap_or(5).min(100);
 
+            // Semantic and lexical retrieval run in parallel; ranked lists
+            // are merged with reciprocal rank fusion so an exact keyword hit
+            // can surface even when its embedding distance is poor.
             let start = Instant::now();
-            let query_vector = state
-                .embedding
-                .embed_one(&args.query)
-                .await
-                .map_err(ErrorData::from)?;
-            info!(embed_ms = start.elapsed().as_millis(), "query embedded");
-
-            let start = Instant::now();
-            let results = state
-                .index
-                .search(&scope_filter, &query_vector, limit)
-                .map_err(ErrorData::from)?;
+            let fused = hybrid_search(
+                state.embedding.as_ref(),
+                state.index.as_ref(),
+                &state.lexical,
+                &scope_filter,
+                &args.query,
+                limit,
+            )
+            .await
+            .map_err(ErrorData::from)?;
             info!(
                 search_ms = start.elapsed().as_millis(),
-                candidates = results.len(),
-                "index searched"
+                candidates = fused.len(),
+                "hybrid search complete"
             );
 
-            let pre_filter_count = results.len();
+            let pre_filter_count = fused.len();
             let mut results_vec = Vec::new();
             let mut log_entries: Vec<RecallResult> = Vec::new();
             let mut skipped_errors: usize = 0;
 
-            for (_key, qualified_name, distance) in results {
-                // The index returns at most `limit` candidates; this guard is a safety
+            for hit in fused {
+                // Fusion returns at most `limit` candidates; this guard is a safety
                 // net that only activates if more candidates arrive than expected.
                 if results_vec.len() >= limit {
                     break;
                 }
-                let mref = match parse_qualified_name(&qualified_name) {
+                let mref = match parse_qualified_name(&hit.qualified_name) {
                     Ok(r) => r,
                     Err(e) => {
                         warn!(
-                            qualified_name = %qualified_name,
+                            qualified_name = %hit.qualified_name,
                             error = %e,
                             "could not parse qualified name from index; skipping"
                         );
@@ -603,25 +640,18 @@ impl MemoryServer {
                 };
 
                 let rank = results_vec.len();
-                let (snippet, content_length, truncated) = build_snippet(&memory.content);
 
                 log_entries.push(RecallResult {
                     memory_name: memory.name.to_string(),
                     scope: memory.metadata.scope.to_string(),
                     rank,
-                    distance: distance as f64,
+                    // Lexical-only hits have no embedding distance; the -1.0
+                    // sentinel keeps them out of distance-bucketed recall
+                    // stats (which filter on distance >= 0.0).
+                    distance: hit.semantic_distance.map_or(-1.0, f64::from),
                 });
 
-                results_vec.push(serde_json::json!({
-                    "id": memory.id,
-                    "name": memory.name,
-                    "scope": memory.metadata.scope.to_string(),
-                    "tags": memory.metadata.tags,
-                    "content": snippet,
-                    "content_length": content_length,
-                    "truncated": truncated,
-                    "distance": distance,
-                }));
+                results_vec.push(recall_entry_json(&memory, &hit));
             }
 
             if let Some(ref log) = state.recall_log {
@@ -690,6 +720,9 @@ impl MemoryServer {
             let qualified_name = MemoryRef::new(scope.clone(), name.clone()).qualified_path();
             if let Err(e) = state.index.remove(&scope, &qualified_name) {
                 warn!(name = %name, error = %e, "vector removal failed during forget; stale entry will be skipped at recall");
+            }
+            if let Err(e) = state.lexical.remove(&qualified_name) {
+                warn!(name = %name, error = %e, "lexical removal failed during forget; stale entry will be skipped at recall");
             }
 
             info!(
@@ -789,9 +822,23 @@ impl MemoryServer {
 
                 timing.stage = "index";
                 let stage_start = Instant::now();
-                let index_result = state.index.add(&scope, &vector, qualified_name);
+                let index_result = state.index.add(&scope, &vector, qualified_name.clone());
                 timing.index_ms = elapsed_ms(stage_start);
                 index_result.map_err(ErrorData::from)?;
+
+                // Lexical index is best-effort: the next startup rebuild heals it.
+                if let Err(e) =
+                    state
+                        .lexical
+                        .upsert(&qualified_name, memory.name.as_str(), &memory.content)
+                {
+                    warn!(
+                        name = %memory.name,
+                        error = %e,
+                        "lexical index update failed during edit; stale keyword entry \
+                         until restart"
+                    );
+                }
             }
 
             // Persist to repo (last, so partial failures leave recoverable state).
@@ -911,7 +958,7 @@ impl MemoryServer {
             // 4. Add destination to the vector index.
             state
                 .index
-                .add(&to_scope, &vector, dest_qualified)
+                .add(&to_scope, &vector, dest_qualified.clone())
                 .map_err(ErrorData::from)?;
 
             // 5. Remove the source from the vector index (best-effort — stale
@@ -923,6 +970,27 @@ impl MemoryServer {
                     name = %name,
                     error = %e,
                     "vector removal failed during move; stale source entry will be skipped at recall"
+                );
+            }
+
+            // 6. Mirror the move in the lexical index (best-effort).
+            if let Err(e) =
+                state
+                    .lexical
+                    .upsert(&dest_qualified, dest.name.as_str(), &dest.content)
+            {
+                warn!(
+                    name = %new_name,
+                    error = %e,
+                    "lexical index update failed during move; destination will not be \
+                     keyword-searchable until restart"
+                );
+            }
+            if let Err(e) = state.lexical.remove(&source_qualified) {
+                warn!(
+                    name = %name,
+                    error = %e,
+                    "lexical removal failed during move; stale source entry will be skipped at recall"
                 );
             }
 
@@ -1163,6 +1231,7 @@ impl MemoryServer {
                             &state.repo,
                             state.embedding.as_ref(),
                             state.index.as_ref(),
+                            &state.lexical,
                             &changes,
                         )
                         .instrument(tracing::info_span!("server.incremental_reindex"))
@@ -1563,6 +1632,26 @@ impl ServerHandler for MemoryServer {
     }
 }
 
+/// Build one recall result entry as seen on the wire.
+///
+/// `distance` is the semantic (cosine) distance and is `null` for hits that
+/// only the lexical strategy returned. `match_type` says which strategies
+/// contributed: `"semantic"`, `"lexical"`, or `"both"`.
+fn recall_entry_json(memory: &Memory, hit: &FusedHit) -> serde_json::Value {
+    let (snippet, content_length, truncated) = build_snippet(&memory.content);
+    serde_json::json!({
+        "id": memory.id,
+        "name": memory.name,
+        "scope": memory.metadata.scope.to_string(),
+        "tags": memory.metadata.tags,
+        "content": snippet,
+        "content_length": content_length,
+        "truncated": truncated,
+        "distance": hit.semantic_distance,
+        "match_type": hit.match_type(),
+    })
+}
+
 /// Truncate content to [`SNIPPET_MAX_CHARS`] and return `(snippet, content_length, truncated)`.
 fn build_snippet(content: &str) -> (String, usize, bool) {
     let content_length = content.chars().count();
@@ -1755,5 +1844,101 @@ mod tests {
         assert_eq!(snippet, "");
         assert_eq!(content_length, 0);
         assert!(!truncated);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wire-contract tests — the recall result entry shape MCP clients see.
+    // -----------------------------------------------------------------------
+
+    fn wire_test_memory() -> Memory {
+        let metadata = MemoryMetadata::new(Scope::Root, vec!["tag-a".to_string()], None);
+        Memory::new("wire-test", "some content".to_string(), metadata).expect("valid memory")
+    }
+
+    fn entry_keys(entry: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = entry
+            .as_object()
+            .expect("entry must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn recall_entry_has_exactly_the_contract_fields() {
+        let hit = FusedHit {
+            qualified_name: "v1:scope=global;name=wire-test".to_string(),
+            semantic_distance: Some(0.25),
+            lexical_score: Some(4.2),
+            score: 0.03,
+        };
+
+        let entry = recall_entry_json(&wire_test_memory(), &hit);
+
+        assert_eq!(
+            entry_keys(&entry),
+            vec![
+                "content",
+                "content_length",
+                "distance",
+                "id",
+                "match_type",
+                "name",
+                "scope",
+                "tags",
+                "truncated",
+            ]
+        );
+    }
+
+    #[test]
+    fn recall_entry_semantic_hit_has_numeric_distance() {
+        let hit = FusedHit {
+            qualified_name: "v1:scope=global;name=wire-test".to_string(),
+            semantic_distance: Some(0.25),
+            lexical_score: None,
+            score: 0.02,
+        };
+
+        let entry = recall_entry_json(&wire_test_memory(), &hit);
+
+        let distance = entry["distance"].as_f64().expect("distance is a number");
+        assert!((distance - 0.25).abs() < 1e-6);
+        assert_eq!(entry["match_type"], "semantic");
+    }
+
+    #[test]
+    fn recall_entry_lexical_only_hit_has_null_distance() {
+        let hit = FusedHit {
+            qualified_name: "v1:scope=global;name=wire-test".to_string(),
+            semantic_distance: None,
+            lexical_score: Some(7.5),
+            score: 0.016,
+        };
+
+        let entry = recall_entry_json(&wire_test_memory(), &hit);
+
+        assert!(
+            entry["distance"].is_null(),
+            "lexical-only hits have no embedding distance"
+        );
+        assert_eq!(entry["match_type"], "lexical");
+    }
+
+    #[test]
+    fn recall_entry_both_hit_keeps_semantic_distance() {
+        let hit = FusedHit {
+            qualified_name: "v1:scope=global;name=wire-test".to_string(),
+            semantic_distance: Some(0.31),
+            lexical_score: Some(2.0),
+            score: 0.033,
+        };
+
+        let entry = recall_entry_json(&wire_test_memory(), &hit);
+
+        assert_eq!(entry["match_type"], "both");
+        assert!(entry["distance"].is_number());
     }
 }

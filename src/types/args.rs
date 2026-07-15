@@ -271,6 +271,8 @@ pub struct AppState {
     pub embedding: Box<dyn EmbeddingBackend>,
     /// In-memory vector index for semantic search (scope-partitioned).
     pub index: Box<dyn VectorStore>,
+    /// In-RAM BM25 index for keyword search (rebuilt from the repo on startup).
+    pub lexical: Arc<crate::search::LexicalIndex>,
     /// Authentication provider for API access control.
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").
@@ -296,6 +298,11 @@ impl AppState {
             repo,
             embedding,
             index,
+            // Constructed here rather than injected: creation is infallible
+            // (a failure yields a disabled instance) and the index starts
+            // empty either way — callers populate it via
+            // `search::rebuild_lexical_from_repo` or the write handlers.
+            lexical: Arc::new(crate::search::LexicalIndex::new()),
             auth,
             branch,
             health,
