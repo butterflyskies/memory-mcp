@@ -123,7 +123,6 @@ pub struct LexicalIndex {
 /// consumers branch on [`LexicalIndex::status`] instead of inferring state
 /// from error strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum LexicalStatus {
     /// Construction failed; keyword search is unavailable for the process
     /// lifetime. Rebuilds cannot recover this state (maps to the lifecycle
