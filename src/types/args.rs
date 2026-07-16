@@ -224,20 +224,28 @@ pub enum PullResult {
 
 /// Memories that changed between two git commits.
 ///
-/// This is the crate's published (0.16.0) change-set surface: qualified-name
-/// strings for added/modified and deleted memories. It is produced by
-/// [`crate::repo::MemoryRepo::diff_changed_memories`].
+/// This is the crate's published (0.16.0) change-set surface: repository-path
+/// strings (without the `.md` suffix, e.g. `"global/foo"`, `"projects/a/b/mem"`)
+/// for added/modified and deleted memories, derived straight from the git
+/// deltas. It is produced by
+/// [`crate::repo::MemoryRepo::diff_changed_memories`], which reports every
+/// changed `.md` file — including ones whose blob is non-UTF-8 or has
+/// unparseable frontmatter — because a path is available even when the content
+/// cannot be resolved to a memory.
 ///
-/// Internally the index-mirror path uses the richer [`ResolvedChanges`]
-/// (structured [`super::MemoryRef`]s plus an `unresolved` count) rather than
-/// re-splitting these strings, because a qualified path cannot be split back
-/// into scope + name unambiguously for hierarchical scopes. The strings here
-/// are still frontmatter-resolved canonical keys, never ad-hoc path splits.
+/// Internally the index-mirror path does NOT consume these strings: it uses the
+/// richer crate-internal [`ResolvedChanges`] (structured [`super::MemoryRef`]s
+/// plus an `unresolved` count, produced by
+/// `MemoryRepo::diff_changed_refs`) so hierarchical scopes are resolved from
+/// frontmatter rather than by splitting a path back into scope + name, which is
+/// ambiguous (`projects/a/b/mem.md` could be scope `a/b`, name `mem` or scope
+/// `a`, name `b/mem`).
 #[derive(Debug, Default)]
 pub struct ChangedMemories {
-    /// Qualified names (e.g. `"v1:scope=global;name=foo"`) that were added or modified.
+    /// Repository-path qualified names without the `.md` suffix (e.g.
+    /// `"global/foo"`) that were added or modified.
     pub upserted: Vec<String>,
-    /// Qualified names that were deleted.
+    /// Repository-path qualified names (e.g. `"global/foo"`) that were deleted.
     pub removed: Vec<String>,
 }
 

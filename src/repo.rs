@@ -13,8 +13,7 @@ use crate::{
     error::MemoryError,
     health::SubsystemReporter,
     types::{
-        ChangedMemories, Memory, MemoryMetadata, MemoryName, MemoryRef, PullResult,
-        ResolvedChanges, Scope,
+        ChangedMemories, Memory, MemoryMetadata, MemoryName, PullResult, ResolvedChanges, Scope,
     },
 };
 
@@ -818,14 +817,22 @@ impl MemoryRepo {
         result
     }
 
-    /// Diff two commits and return the qualified names of memory files that changed.
+    /// Diff two commits and return the memory files that changed.
     ///
-    /// This is the published change-set surface. It delegates to
-    /// [`Self::diff_changed_refs`] and projects each resolved reference to its
-    /// canonical qualified name (`MemoryRef::qualified_path`), so the strings
-    /// are frontmatter-derived and unambiguous. Files that could not be
-    /// resolved are simply absent from the returned lists; callers that need
-    /// complete-or-degraded semantics use `diff_changed_refs` instead.
+    /// Only `.md` files under `global/` or `projects/` (namespace directories) are considered.
+    /// Added/modified files go into `upserted`; deleted files go into `removed`.
+    /// Qualified names are returned without the `.md` suffix (e.g. `"global/foo"`).
+    ///
+    /// This is the published, stable change-set surface: it derives its strings
+    /// straight from the git delta paths and reports **every** changed `.md`
+    /// file — including ones whose blob is non-UTF-8 or has unparseable
+    /// frontmatter — because a path is always available even when the content
+    /// is not. This is deliberately distinct from the crate-internal
+    /// [`Self::diff_changed_refs`], which resolves each file to a canonical
+    /// [`crate::types::MemoryRef`] (and drops/counts the unresolvable ones) for
+    /// the complete-or-degraded index mirror. The public method exists to
+    /// preserve the exact 0.16.0 value contract; the mirror path uses
+    /// `diff_changed_refs`.
     ///
     /// Must be called from within `spawn_blocking` since it uses git2.
     pub fn diff_changed_memories(
@@ -833,19 +840,88 @@ impl MemoryRepo {
         old_oid: [u8; 20],
         new_oid: [u8; 20],
     ) -> Result<ChangedMemories, MemoryError> {
-        let resolved = self.diff_changed_refs(old_oid, new_oid)?;
-        Ok(ChangedMemories {
-            upserted: resolved
-                .upserted
-                .iter()
-                .map(MemoryRef::qualified_path)
-                .collect(),
-            removed: resolved
-                .removed
-                .iter()
-                .map(MemoryRef::qualified_path)
-                .collect(),
-        })
+        let repo = self
+            .inner
+            .lock()
+            .expect("lock poisoned — prior panic corrupted state");
+
+        let new_git_oid = git2::Oid::from_bytes(&new_oid).map_err(MemoryError::Git)?;
+        let new_tree = repo.find_commit(new_git_oid)?.tree()?;
+
+        // A zero OID indicates an unborn branch (no prior commits). In that case,
+        // diff against an empty tree so all files appear as additions.
+        let diff = if old_oid == [0u8; 20] {
+            repo.diff_tree_to_tree(None, Some(&new_tree), None)?
+        } else {
+            let old_git_oid = git2::Oid::from_bytes(&old_oid).map_err(MemoryError::Git)?;
+            let old_tree = repo.find_commit(old_git_oid)?.tree()?;
+            repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)?
+        };
+
+        let mut changes = ChangedMemories::default();
+
+        diff.foreach(
+            &mut |delta, _progress| {
+                use git2::Delta;
+
+                let path = match delta.new_file().path().or_else(|| delta.old_file().path()) {
+                    Some(p) => p,
+                    None => return true,
+                };
+
+                let path_str = match path.to_str() {
+                    Some(s) => s,
+                    None => return true,
+                };
+
+                // Only care about .md files under global/ or projects/ (namespace directories)
+                if !path_str.ends_with(".md") {
+                    return true;
+                }
+                if !path_str.starts_with("global/") && !path_str.starts_with("projects/") {
+                    return true;
+                }
+
+                // Strip the .md suffix to get the qualified name.
+                let qualified = &path_str[..path_str.len() - 3];
+
+                match delta.status() {
+                    Delta::Added | Delta::Modified => {
+                        changes.upserted.push(qualified.to_string());
+                    }
+                    Delta::Renamed | Delta::Copied => {
+                        // For renames, the old path must be removed from the index
+                        // to avoid leaving a ghost vector behind.
+                        if matches!(delta.status(), Delta::Renamed) {
+                            if let Some(old_path) = delta.old_file().path().and_then(|p| p.to_str())
+                            {
+                                if old_path.ends_with(".md")
+                                    && (old_path.starts_with("global/")
+                                        || old_path.starts_with("projects/"))
+                                {
+                                    changes
+                                        .removed
+                                        .push(old_path[..old_path.len() - 3].to_string());
+                                }
+                            }
+                        }
+                        changes.upserted.push(qualified.to_string());
+                    }
+                    Delta::Deleted => {
+                        changes.removed.push(qualified.to_string());
+                    }
+                    _ => {}
+                }
+
+                true
+            },
+            None,
+            None,
+            None,
+        )
+        .map_err(MemoryError::Git)?;
+
+        Ok(changes)
     }
 
     /// Diff two commits and resolve the changed memory files to structured refs.
@@ -1821,6 +1897,42 @@ mod tests {
         buf
     }
 
+    /// Helper: commit raw bytes (which may be non-UTF-8) at `rel_path` and
+    /// return the new HEAD OID bytes. Used to exercise the published
+    /// `diff_changed_memories` path contract against blobs that cannot be
+    /// resolved to a memory.
+    fn commit_bytes(repo: &Arc<MemoryRepo>, rel_path: &str, content: &[u8]) -> [u8; 20] {
+        let inner = repo.inner.lock().expect("lock poisoned");
+        let full_path = repo.root.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, content).unwrap();
+
+        let mut index = inner.index().unwrap();
+        index.add_path(std::path::Path::new(rel_path)).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = inner.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+
+        let oid = match inner.head() {
+            Ok(head) => {
+                let parent = head.peel_to_commit().unwrap();
+                inner
+                    .commit(Some("HEAD"), &sig, &sig, "test commit", &tree, &[&parent])
+                    .unwrap()
+            }
+            Err(_) => inner
+                .commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
+                .unwrap(),
+        };
+
+        let mut buf = [0u8; 20];
+        buf.copy_from_slice(oid.as_bytes());
+        buf
+    }
+
     /// Helper: replace `rel_path` with a symlink pointing at `target` and
     /// commit it. Records a git symlink entry (mode `120000`) so a preceding
     /// regular-file commit at the same path yields a `Delta::Typechange`.
@@ -2114,11 +2226,21 @@ mod tests {
         );
     }
 
-    /// The published `diff_changed_memories` surface projects resolved refs to
-    /// their canonical qualified-name strings (frontmatter-derived, not
-    /// path-split). Guards the 0.16.0-compatible shape.
+    /// Published-contract regression guard for `diff_changed_memories`.
+    ///
+    /// This is the stable 0.16.0 public surface, distinct from the internal
+    /// `diff_changed_refs` mirror path. It must return **repository-path**
+    /// strings without the `.md` suffix (e.g. `projects/a/b/mem`,
+    /// `global/broken`), derived straight from git deltas — NOT canonical
+    /// resolved keys like `v1:scope=a/b;name=mem`. And because a path is
+    /// available even when the blob is not a parseable memory, it must report
+    /// **every** changed `.md` file, including unparseable and non-UTF-8 ones,
+    /// rather than dropping them the way the resolving `diff_changed_refs`
+    /// does. `cargo-semver-checks` cannot see returned-value semantics, so this
+    /// test is the behavior-compat guard: it fails if the public method ever
+    /// again projects canonical keys or drops unresolvable files.
     #[test]
-    fn diff_changed_memories_projects_qualified_name_strings() {
+    fn diff_changed_memories_returns_repo_paths_including_unresolvable_files() {
         let dir = tempfile::tempdir().unwrap();
         let repo = open_repo(&dir, None);
 
@@ -2137,15 +2259,45 @@ mod tests {
             buf
         };
 
+        // A resolvable memory in a hierarchical scope: exercises that the
+        // public method returns the on-disk path, not the canonical key.
         let scope: Scope = "a/b".parse().unwrap();
-        let new_oid = commit_file(
+        let _ = commit_file(
             &repo,
             "projects/a/b/mem.md",
             &memory_markdown("mem", scope.clone(), "hierarchical content"),
         );
 
+        // A `.md` file with no frontmatter — cannot resolve to a memory.
+        let _ = commit_file(&repo, "global/broken.md", "no frontmatter at all");
+
+        // A non-UTF-8 `.md` blob — cannot even be read as a string.
+        let new_oid = commit_bytes(&repo, "global/binary.md", &[0xff, 0xfe, 0x00, 0x9f]);
+
         let changes = repo.diff_changed_memories(old_oid, new_oid).unwrap();
-        assert_eq!(changes.upserted, vec![mref(scope, "mem").qualified_path()]);
+
+        let mut upserted = changes.upserted.clone();
+        upserted.sort();
+        assert_eq!(
+            upserted,
+            vec![
+                "global/binary".to_string(),
+                "global/broken".to_string(),
+                "projects/a/b/mem".to_string(),
+            ],
+            "public method must return repo-path strings (not canonical keys) \
+             and must include unparseable + non-UTF-8 files, not drop them"
+        );
+
+        // Guard the exact contrast the round-five finding is about: the
+        // hierarchical file must NOT appear as a canonical resolved key.
+        assert!(
+            !changes
+                .upserted
+                .contains(&mref(scope, "mem").qualified_path()),
+            "public method must not project canonical resolved keys"
+        );
+
         assert!(changes.removed.is_empty());
     }
 }
