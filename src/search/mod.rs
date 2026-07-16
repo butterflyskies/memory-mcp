@@ -25,7 +25,7 @@ pub mod bm25;
 /// Reciprocal rank fusion for merging result lists.
 pub mod fusion;
 
-pub use bm25::{LexicalDoc, LexicalIndex, LexicalOp};
+pub use bm25::{LexicalDoc, LexicalIndex, LexicalOp, LexicalStatus};
 pub use fusion::{reciprocal_rank_fusion, FusedHit};
 
 /// Run semantic and lexical retrieval in parallel and merge the ranked
@@ -108,11 +108,29 @@ pub async fn hybrid_search(
 /// unlike the vector index, which is persisted because embedding is
 /// expensive. The rebuild is a single Tantivy commit and runs on the
 /// blocking pool. Returns the number of indexed memories.
+///
+/// This is also the repair path for a degraded index (ADR-0039): the
+/// rebuild token is captured *before* the repo listing, so divergence
+/// events or mirrors racing the listing keep the index flagged and a
+/// follow-up rebuild converges instead of silently losing them.
+///
+/// Every failure while obtaining or applying repository truth — including
+/// the repo listing itself, *before* the `rebuild_from` seam — marks the
+/// index rebuild-required. Without that, a listing failure on a fresh
+/// index would leave the epochs at 0/0: healthy-but-empty, with recall
+/// never scheduling repair (the #314 pre-list gap).
 pub async fn rebuild_lexical_from_repo(
     repo: &Arc<MemoryRepo>,
     lexical: &Arc<LexicalIndex>,
 ) -> Result<usize, MemoryError> {
-    let memories = repo.list_memories(None).await?;
+    let token = lexical.begin_rebuild();
+    let memories = match repo.list_memories(None).await {
+        Ok(memories) => memories,
+        Err(e) => {
+            lexical.mark_rebuild_required("repository listing for lexical rebuild failed");
+            return Err(e);
+        }
+    };
     let docs: Vec<LexicalDoc> = memories
         .into_iter()
         .map(|m| LexicalDoc {
@@ -121,8 +139,47 @@ pub async fn rebuild_lexical_from_repo(
             content: m.content,
         })
         .collect();
+    let index = Arc::clone(lexical);
+    match traced_spawn_blocking(move || index.rebuild_from(token, docs)).await {
+        Ok(result) => result,
+        Err(e) => {
+            // The blocking rebuild task died (panic/shutdown); whether the
+            // Tantivy commit landed is unknowable, so stay rebuild-required.
+            lexical.mark_rebuild_required("lexical rebuild task did not run to completion");
+            Err(MemoryError::Join(e.to_string()))
+        }
+    }
+}
+
+/// Spawn a background repair rebuild if the lexical index is degraded and
+/// no repair is already running.
+///
+/// Deterministic repair per ADR-0039: rebuild from git truth on the
+/// blocking pool, single-flight. Recall serves semantic-only for the whole
+/// degraded window (search errors until the rebuild converges). Failures
+/// leave the index degraded; the next trigger retries.
+pub fn spawn_lexical_repair(repo: &Arc<MemoryRepo>, lexical: &Arc<LexicalIndex>) {
+    if !lexical.is_degraded() || !lexical.try_claim_repair() {
+        return;
+    }
+    let repo = Arc::clone(repo);
     let lexical = Arc::clone(lexical);
-    traced_spawn_blocking(move || lexical.rebuild(docs))
-        .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
+    tokio::spawn(async move {
+        let result = rebuild_lexical_from_repo(&repo, &lexical).await;
+        lexical.finish_repair();
+        match result {
+            // `rebuild_from` deliberately returns Ok while re-flagging the
+            // index when a mirror raced its repo listing (or a divergence
+            // event landed mid-rebuild) — a raced outcome is not a repair
+            // receipt, so the log must not claim convergence.
+            Ok(count) if lexical.is_degraded() => info!(
+                count,
+                "lexical rebuild completed but the index was re-flagged during \
+                 the rebuild (raced mirror or new divergence) — still degraded, \
+                 the next trigger repairs again"
+            ),
+            Ok(count) => info!(count, "lexical index repaired from git truth"),
+            Err(e) => warn!(error = %e, "lexical repair failed — index stays degraded"),
+        }
+    });
 }

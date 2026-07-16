@@ -302,6 +302,55 @@ async fn hit_found_by_both_strategies_is_marked_both_and_ranks_first() {
 // Error surface
 // ---------------------------------------------------------------------------
 
+/// Degraded lexical index (ADR-0039): hybrid recall must succeed with
+/// semantic-only results — the lexical strategy errors instead of serving
+/// potentially stale hits, and fusion degrades gracefully.
+#[tokio::test]
+async fn degraded_lexical_index_serves_semantic_only() {
+    let scope = Scope::Root;
+    let (embedding, store, lexical, golden_key) = build_miss_scenario(&scope);
+
+    // Sanity: while healthy, the lexical strategy surfaces the golden hit.
+    let healthy = hybrid_search(
+        &embedding,
+        &store,
+        &lexical,
+        &ScopeFilter::RootOnly,
+        "happy birthday",
+        10,
+    )
+    .await
+    .expect("hybrid search");
+    assert!(healthy.iter().any(|h| h.qualified_name == golden_key));
+
+    // A divergence event flags the index; recall serves semantic-only.
+    lexical.mark_rebuild_required("test: forced divergence");
+
+    let degraded = hybrid_search(
+        &embedding,
+        &store,
+        &lexical,
+        &ScopeFilter::RootOnly,
+        "happy birthday",
+        10,
+    )
+    .await
+    .expect("hybrid search must survive a degraded lexical index");
+
+    assert!(
+        !degraded.is_empty(),
+        "semantic results must still be served"
+    );
+    assert!(
+        degraded.iter().all(|h| h.match_type() == "semantic"),
+        "no lexical hits may be served while degraded"
+    );
+    assert!(
+        !degraded.iter().any(|h| h.qualified_name == golden_key),
+        "the lexical-only golden hit must disappear while degraded"
+    );
+}
+
 #[tokio::test]
 async fn semantic_failure_is_fatal_preserving_recall_error_surface() {
     let store = InMemoryStore::new(DIMS);

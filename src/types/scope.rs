@@ -12,7 +12,7 @@ use super::validated::{deserialize_validated, ValidatedString};
 
 /// A validated scope path for use in [`Scope::Path`].
 ///
-/// Wraps a `String` that has been validated by [`ValidatedString::validate`]. Once
+/// Wraps a `String` that has been validated by `ValidatedString::validate`. Once
 /// you hold a `ScopePath`, you can use it as `&str` without re-validation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ScopePath(String);
@@ -134,7 +134,7 @@ impl<'de> Deserialize<'de> for ScopePath {
 /// - `Root`        → `global/`
 /// - `Path(p)`     → `projects/{p}/`  (p may contain `/` for hierarchy; on-disk directory stays `projects/` until #256)
 ///
-/// Serialisation uses [`ScopeWire`] so the on-disk/network format is a tagged
+/// Serialisation uses `ScopeWire` so the on-disk/network format is a tagged
 /// struct (`{"type":"Root"}` / `{"type":"Path","name":"..."}`) while legacy
 /// variants (`"Global"`, `"Project"`) are accepted on deserialisation for
 /// backward compatibility.
@@ -224,7 +224,7 @@ impl FromStr for Scope {
     ///
     /// The legacy `"project:{name}"` format is no longer accepted. Use bare
     /// namespace paths instead. Existing memory files with `type: Project` in
-    /// YAML frontmatter are still deserialized via [`ScopeWire`].
+    /// YAML frontmatter are still deserialized via `ScopeWire`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s == "global" {
             return Ok(Scope::Root);
