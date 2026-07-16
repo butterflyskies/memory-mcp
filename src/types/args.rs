@@ -234,7 +234,7 @@ pub enum PullResult {
 /// cannot be resolved to a memory.
 ///
 /// Internally the index-mirror path does NOT consume these strings: it uses the
-/// richer crate-internal [`ResolvedChanges`] (structured [`super::MemoryRef`]s
+/// richer crate-internal `ResolvedChanges` (structured [`super::MemoryRef`]s
 /// plus an `unresolved` count, produced by
 /// `MemoryRepo::diff_changed_refs`) so hierarchical scopes are resolved from
 /// frontmatter rather than by splitting a path back into scope + name, which is

@@ -1,6 +1,6 @@
 //! Health reporting infrastructure and HTTP handlers.
 //!
-//! Subsystems report their own operational state via [`SubsystemReporter`].
+//! Subsystems report their own operational state via [`crate::health::SubsystemReporter`].
 //! The `/readyz` handler reads the latest state — no active probing.
 
 use std::sync::{

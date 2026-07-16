@@ -18,7 +18,7 @@ use super::{
 
 /// A validated memory name.
 ///
-/// Wraps a `String` that has been validated by [`ValidatedString::validate`]. Constructing
+/// Wraps a `String` that has been validated by `ValidatedString::validate`. Constructing
 /// a `MemoryName` is the sole path to a valid name — once you hold one, you
 /// can use it as `&str` without re-validation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -331,7 +331,7 @@ impl MemoryRef {
     /// The on-disk file path: `"global/<name>"` or `"projects/<path>/<name>"`.
     ///
     /// Used for file I/O (repo reads/writes). For index/telemetry keys that
-    /// need a stable string, use [`qualified_path`] instead.
+    /// need a stable string, use [`Self::qualified_path`] instead.
     pub fn file_path(&self) -> String {
         format!("{}/{}", self.scope.dir_prefix(), self.name)
     }

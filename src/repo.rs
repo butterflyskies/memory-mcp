@@ -828,7 +828,7 @@ impl MemoryRepo {
     /// file — including ones whose blob is non-UTF-8 or has unparseable
     /// frontmatter — because a path is always available even when the content
     /// is not. This is deliberately distinct from the crate-internal
-    /// [`Self::diff_changed_refs`], which resolves each file to a canonical
+    /// `Self::diff_changed_refs`, which resolves each file to a canonical
     /// [`crate::types::MemoryRef`] (and drops/counts the unresolvable ones) for
     /// the complete-or-degraded index mirror. The public method exists to
     /// preserve the exact 0.16.0 value contract; the mirror path uses

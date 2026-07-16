@@ -534,7 +534,7 @@ impl LexicalIndex {
     /// converging with git truth or failing and flagging the index degraded.
     ///
     /// Panic supervision is owned by the worker itself (#314): a
-    /// [`DegradeOnDrop`] guard inside the blocking closure marks the index
+    /// `DegradeOnDrop` guard inside the blocking closure marks the index
     /// rebuild-required if `apply` unwinds, so a panic at an unknown point
     /// is recorded even when the returned future was already dropped and no
     /// caller survives to observe the `JoinError`. A `JoinError` that *is*
