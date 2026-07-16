@@ -48,10 +48,10 @@ use crate::{
         LexicalIndex, LexicalOp,
     },
     types::{
-        parse_qualified_name, AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs,
-        ForgetArgs, ListArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef,
-        MoveArgs, PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs,
-        Scope, ScopeFilter, SyncArgs,
+        parse_qualified_name, AppState, BatchMarkAppliedArgs, EditArgs, ForgetArgs, ListArgs,
+        MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, MoveArgs, PullResult,
+        ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs, ResolvedChanges, Scope,
+        ScopeFilter, SyncArgs,
     },
 };
 
@@ -228,7 +228,7 @@ where
 /// reader reload on the blocking pool), not one commit per memory.
 ///
 /// Complete-or-degraded (#314): the changed refs arrive pre-resolved from
-/// frontmatter (see `MemoryRepo::diff_changed_memories`) and their canonical
+/// frontmatter (see `MemoryRepo::diff_changed_refs`) and their canonical
 /// keys come from `MemoryRef::qualified_path` — the same function every
 /// index entry was written with — so removals and upserts can never target
 /// an ambiguously derived key. Any preparation gap that would reduce the
@@ -240,7 +240,7 @@ async fn incremental_reindex(
     embedding: &dyn EmbeddingBackend,
     index: &dyn VectorStore,
     lexical: &Arc<LexicalIndex>,
-    changes: &ChangedMemories,
+    changes: &ResolvedChanges,
 ) -> ReindexStats {
     let mut stats = ReindexStats::default();
     let mut lexical_ops: Vec<LexicalOp> = Vec::new();
@@ -389,7 +389,7 @@ async fn mirror_pulled_changes(
 ) -> Result<Option<ReindexStats>, MemoryError> {
     let repo = Arc::clone(&state.repo);
     let changes = match crate::repo::traced_spawn_blocking(move || {
-        repo.diff_changed_memories(old_head, new_head)
+        repo.diff_changed_refs(old_head, new_head)
     })
     .await
     {
@@ -2417,7 +2417,7 @@ mod tests {
             );
             state.repo.save_memory(&memory).await.expect("save");
 
-            let changes = ChangedMemories {
+            let changes = ResolvedChanges {
                 upserted: vec![MemoryRef::new(
                     Scope::Root,
                     MemoryName::new("pulled".to_string()).unwrap(),
