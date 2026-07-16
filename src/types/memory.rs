@@ -378,10 +378,13 @@ impl fmt::Display for MemoryRef {
 /// entries use the canonical form.
 ///
 /// Incremental reindexing never parses on-disk paths: changed memories are
-/// resolved from their frontmatter by `MemoryRepo::diff_changed_memories`
-/// (the same authority `list_memories` uses), so this ambiguity is confined
-/// to legacy index entries from pre-hierarchical-scope builds — a full
-/// reindex resolves any such stale entries.
+/// resolved from their frontmatter by `MemoryRepo::diff_changed_refs`
+/// (returning `ResolvedChanges`, the same authority `list_memories` uses), so
+/// this ambiguity is confined to legacy index entries from
+/// pre-hierarchical-scope builds — a full reindex resolves any such stale
+/// entries. The public `MemoryRepo::diff_changed_memories` is a distinct
+/// surface: it returns raw repo paths to preserve the 0.16.0 value contract
+/// and is not the frontmatter-safe incremental-reindex path.
 pub fn parse_qualified_name(qualified: &str) -> Result<MemoryRef, MemoryError> {
     // Versioned canonical key form: "v1:scope=...;name=..."
     // Unversioned form "scope=...;name=..." is also accepted as v1 for backward compat.
