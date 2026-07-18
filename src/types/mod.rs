@@ -9,6 +9,7 @@ mod validated;
 // Items that were `pub` remain `pub`; items that were `pub(crate)` are
 // re-exported as `pub(crate)`.
 
+pub(crate) use args::ResolvedChanges;
 pub use args::{
     AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs, ForgetArgs, ListArgs, ListField,
     MarkAppliedArgs, MoveArgs, PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats,

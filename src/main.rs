@@ -616,6 +616,31 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         recall_log,
     ));
 
+    // Populate the lexical (BM25) index. It lives in RAM only — indexing
+    // text is cheap, unlike embedding it — so it is rebuilt from the repo on
+    // every startup and never persisted or migrated. Failure degrades recall
+    // to semantic-only; it never blocks startup.
+    match memory_mcp::search::rebuild_lexical_from_repo(&state.repo, &state.lexical)
+        .instrument(tracing::info_span!("startup.lexical_rebuild"))
+        .await
+    {
+        Ok(count) => info!(count, "lexical index built"),
+        Err(e) => {
+            // Every startup-rebuild failure (including a repository-listing
+            // failure before the rebuild seam) marks the index degraded, so
+            // repair is scheduled here and re-triggered by recall until it
+            // converges — the failure can never silently disable keyword
+            // search for the process lifetime.
+            tracing::warn!(
+                error = %e,
+                degraded = state.lexical.is_degraded(),
+                "lexical index startup rebuild failed — keyword search \
+                 degraded until background repair converges"
+            );
+            memory_mcp::search::spawn_lexical_repair(&state.repo, &state.lexical);
+        }
+    }
+
     // Keep a reference for post-shutdown index persistence.
     let state_for_shutdown = Arc::clone(&state);
 

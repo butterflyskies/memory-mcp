@@ -282,17 +282,77 @@ pub enum PullResult {
 // ---------------------------------------------------------------------------
 
 /// Memories that changed between two git commits.
+///
+/// This is the crate's published (0.16.0) change-set surface: repository-path
+/// strings (without the `.md` suffix, e.g. `"global/foo"`, `"projects/a/b/mem"`)
+/// for added/modified and deleted memories, derived straight from the git
+/// deltas. It is produced by
+/// [`crate::repo::MemoryRepo::diff_changed_memories`], which reports every
+/// changed `.md` file — including ones whose blob is non-UTF-8 or has
+/// unparseable frontmatter — because a path is available even when the content
+/// cannot be resolved to a memory.
+///
+/// Internally the index-mirror path does NOT consume these strings: it uses the
+/// richer crate-internal `ResolvedChanges` (structured [`super::MemoryRef`]s
+/// plus an `unresolved` count, produced by
+/// `MemoryRepo::diff_changed_refs`) so hierarchical scopes are resolved from
+/// frontmatter rather than by splitting a path back into scope + name, which is
+/// ambiguous (`projects/a/b/mem.md` could be scope `a/b`, name `mem` or scope
+/// `a`, name `b/mem`).
 #[derive(Debug, Default)]
 pub struct ChangedMemories {
-    /// Qualified names (e.g. `"global/foo"`) that were added or modified.
+    /// Repository-path qualified names without the `.md` suffix (e.g.
+    /// `"global/foo"`) that were added or modified.
     pub upserted: Vec<String>,
-    /// Qualified names that were deleted.
+    /// Repository-path qualified names (e.g. `"global/foo"`) that were deleted.
     pub removed: Vec<String>,
 }
 
 impl ChangedMemories {
     /// Returns `true` if there are no changes.
     pub fn is_empty(&self) -> bool {
+        self.upserted.is_empty() && self.removed.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ResolvedChanges (crate-internal)
+// ---------------------------------------------------------------------------
+
+/// Changed memories resolved to structured references, for the index mirror.
+///
+/// Every changed file is resolved to a [`super::MemoryRef`] by parsing the
+/// blob's YAML frontmatter (the new tree for upserts, the old tree for
+/// removals) — the same authority `list_memories` uses to build the canonical
+/// index keys, so hierarchical scope paths are never split ambiguously
+/// (`projects/a/b/mem.md` is unambiguously scope `a/b`, name `mem`, not scope
+/// `a`, name `b/mem`). Files that cannot be resolved (unparseable frontmatter,
+/// non-UTF-8 content, or a non-memory object such as a symlink) are counted in
+/// `unresolved` so callers degrade derived indexes instead of committing a
+/// silently reduced change set.
+///
+/// Crate-internal on purpose: it carries the structured `scope`/`name` the
+/// mirror needs, and keeping it private preserves the published
+/// [`ChangedMemories`] API without a version bump.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedChanges {
+    /// Memories that were added or modified (resolved from the new tree).
+    pub(crate) upserted: Vec<super::MemoryRef>,
+    /// Memories that were deleted (resolved from the old tree).
+    pub(crate) removed: Vec<super::MemoryRef>,
+    /// Changed memory files whose reference could not be resolved. Any
+    /// non-zero value means the change set is incomplete: derived indexes
+    /// must be marked for rebuild rather than treated as fully mirrored.
+    pub(crate) unresolved: usize,
+}
+
+impl ResolvedChanges {
+    /// Returns `true` if there are no resolved changes to apply.
+    ///
+    /// Deliberately ignores `unresolved` — callers must check that field
+    /// separately, because an all-unresolved change set still requires the
+    /// derived indexes to be degraded and repaired.
+    pub(crate) fn is_empty(&self) -> bool {
         self.upserted.is_empty() && self.removed.is_empty()
     }
 }
@@ -330,6 +390,8 @@ pub struct AppState {
     pub embedding: Box<dyn EmbeddingBackend>,
     /// In-memory vector index for semantic search (scope-partitioned).
     pub index: Box<dyn VectorStore>,
+    /// In-RAM BM25 index for keyword search (rebuilt from the repo on startup).
+    pub lexical: Arc<crate::search::LexicalIndex>,
     /// Authentication provider for API access control.
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").
@@ -355,6 +417,11 @@ impl AppState {
             repo,
             embedding,
             index,
+            // Constructed here rather than injected: creation is infallible
+            // (a failure yields a disabled instance) and the index starts
+            // empty either way — callers populate it via
+            // `search::rebuild_lexical_from_repo` or the write handlers.
+            lexical: Arc::new(crate::search::LexicalIndex::new()),
             auth,
             branch,
             health,
