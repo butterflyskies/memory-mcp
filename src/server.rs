@@ -50,10 +50,10 @@ use crate::{
         LexicalIndex, LexicalOp,
     },
     types::{
-        parse_qualified_name, AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs,
-        ForgetArgs, ListArgs, ListField, ListToolArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName,
-        MemoryRef, MoveArgs, PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats,
-        RememberArgs, Scope, ScopeFilter, SyncArgs, LIST_MAX_LIMIT,
+        parse_qualified_name, AppState, BatchMarkAppliedArgs, EditArgs, ForgetArgs, ListField,
+        ListToolArgs, MarkAppliedArgs, Memory, MemoryMetadata, MemoryName, MemoryRef, MoveArgs,
+        PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats, RememberArgs,
+        ResolvedChanges, Scope, ScopeFilter, SyncArgs, LIST_MAX_LIMIT,
     },
 };
 
@@ -2491,6 +2491,10 @@ mod tests {
             assert!(
                 reason.contains("omit cursor to start a new page"),
                 "missing remediation: {reason}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Wire-contract tests — the recall result entry shape MCP clients see.
     // -----------------------------------------------------------------------
@@ -3008,6 +3012,9 @@ mod tests {
             value["memories"],
             serde_json::json!([{"name": "huge-tags"}])
         );
+    }
+
+    #[test]
     fn recall_entry_both_hit_keeps_semantic_distance() {
         let hit = FusedHit {
             qualified_name: "v1:scope=global;name=wire-test".to_string(),
