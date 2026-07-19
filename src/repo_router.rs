@@ -45,8 +45,15 @@ pub struct RepoRouter {
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct MultiSyncResult {
-    /// Per-repo sync results: `(scope_label, pull_result, push_ok)`.
+    /// Per-repo sync outcomes, one entry per repo (default + each route).
     pub results: Vec<SyncEntry>,
+}
+
+impl MultiSyncResult {
+    /// `true` when every repo's pull and push completed without error.
+    pub fn all_ok(&self) -> bool {
+        self.results.iter().all(SyncEntry::is_ok)
+    }
 }
 
 /// Outcome of syncing a single repo.
@@ -57,16 +64,46 @@ pub struct SyncEntry {
     pub label: String,
     /// The scope used to resolve this repo (for reindex routing).
     pub scope: Scope,
-    /// Pull result, if pull was performed.
+    /// Pull result when the pull was performed and succeeded.
     pub pull: Option<PullResult>,
-    /// Whether push succeeded.
+    /// Error message when the pull was attempted and failed.
+    pub pull_error: Option<String>,
+    /// Whether push succeeded. `true` in local-only mode (no remote means
+    /// nothing to push); `false` when the push failed or was not attempted
+    /// because the pull failed first.
     pub push_ok: bool,
+    /// Error message when the push was attempted and failed.
+    pub push_error: Option<String>,
     /// Memories that changed during pull (for incremental reindex).
     pub changes: Option<ChangedMemories>,
     /// Structured changed memories used by derived-index mirrors.
     pub(crate) resolved_changes: Option<ResolvedChanges>,
     /// Whether post-pull change discovery completed without gaps.
     pub(crate) changes_complete: bool,
+}
+
+impl SyncEntry {
+    /// `true` when neither the pull nor the push recorded an error.
+    pub fn is_ok(&self) -> bool {
+        self.pull_error.is_none() && self.push_error.is_none()
+    }
+
+    /// Describe the recorded pull/push errors, or `None` when the entry
+    /// completed without error.
+    pub fn failure_summary(&self) -> Option<String> {
+        let mut ops = Vec::new();
+        if let Some(e) = &self.pull_error {
+            ops.push(format!("pull failed: {e}"));
+        }
+        if let Some(e) = &self.push_error {
+            ops.push(format!("push failed: {e}"));
+        }
+        if ops.is_empty() {
+            None
+        } else {
+            Some(ops.join("; "))
+        }
+    }
 }
 
 impl RepoRouter {
@@ -290,9 +327,11 @@ impl RepoRouter {
 
     /// Sync all repos: pull then push each one.
     ///
-    /// Errors on individual repos are logged and recorded but do not abort
-    /// the remaining repos — a network blip on one remote must not block
-    /// syncing the others.
+    /// Errors on individual repos do not abort the remaining repos — a
+    /// network blip on one remote must not block syncing the others. Each
+    /// failure is recorded on that repo's [`SyncEntry`] (`pull_error` /
+    /// `push_error`) so callers can surface partial failures instead of
+    /// reporting a clean sync; check [`MultiSyncResult::all_ok`].
     pub async fn sync_all(
         &self,
         auth: &AuthProvider,
@@ -300,7 +339,6 @@ impl RepoRouter {
         pull_first: bool,
     ) -> Result<MultiSyncResult, MemoryError> {
         let mut result = MultiSyncResult::default();
-        let mut errors: Vec<(String, MemoryError)> = Vec::new();
 
         for (label, repo, branch_override, scope) in self.all_repos() {
             let branch = branch_override.unwrap_or(default_branch);
@@ -308,7 +346,9 @@ impl RepoRouter {
                 label: label.to_string(),
                 scope,
                 pull: None,
+                pull_error: None,
                 push_ok: false,
+                push_error: None,
                 changes: None,
                 resolved_changes: None,
                 changes_complete: true,
@@ -377,7 +417,7 @@ impl RepoRouter {
                             error = %e,
                             "sync: pull failed — continuing with remaining repos"
                         );
-                        errors.push((label.to_string(), e));
+                        entry.pull_error = Some(e.to_string());
                         result.results.push(entry);
                         continue;
                     }
@@ -393,7 +433,7 @@ impl RepoRouter {
                             error = %e,
                             "sync: push failed — continuing with remaining repos"
                         );
-                        errors.push((label.to_string(), e));
+                        entry.push_error = Some(e.to_string());
                     }
                 }
             } else {
@@ -403,19 +443,22 @@ impl RepoRouter {
             result.results.push(entry);
         }
 
-        if !errors.is_empty() {
-            let summary = errors
-                .iter()
-                .map(|(label, e)| format!("{label}: {e}"))
-                .collect::<Vec<_>>()
-                .join("; ");
+        let failures: Vec<String> = result
+            .results
+            .iter()
+            .filter_map(|e| {
+                e.failure_summary()
+                    .map(|summary| format!("{}: {summary}", e.label))
+            })
+            .collect();
+        if !failures.is_empty() {
             warn!(
-                failed = errors.len(),
+                failed = failures.len(),
                 total = result.results.len(),
                 "sync: {}/{} repos had errors: {}",
-                errors.len(),
+                failures.len(),
                 result.results.len(),
-                summary
+                failures.join("; ")
             );
         }
 

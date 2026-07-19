@@ -45,6 +45,7 @@ use crate::{
     index::VectorStore,
     recall_log::{BatchVerdict, RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
+    repo_router::MultiSyncResult,
     search::{
         bm25::DegradeOnDrop, hybrid_search, spawn_lexical_repair_for_router, FusedHit, LexicalDoc,
         LexicalIndex, LexicalOp,
@@ -613,6 +614,136 @@ async fn incremental_reindex(
     }
 
     stats
+}
+
+/// Mirror `sync_all` results into the derived indexes and advance the
+/// composite index SHA when — and only when — the mirror is complete.
+///
+/// Runs inside sync's cancellation-shielded unit, after the pulls have moved
+/// git truth. Complete-or-degraded (#314): a repo whose post-pull change
+/// discovery did not complete (`changes_complete == false`) or whose pulled
+/// files could not all be resolved marks the lexical index rebuild-required,
+/// schedules router-wide repair, and refuses to advance the stored composite
+/// SHA — the next startup reindexes from git truth instead of trusting a
+/// partial mirror. The SHA is also held back when every reindex attempt
+/// failed, so the next startup retries.
+async fn mirror_sync_results(
+    state: &Arc<AppState>,
+    sync_result: &MultiSyncResult,
+) -> (ReindexStats, bool) {
+    let mut total_reindex = ReindexStats::default();
+    let mut any_reindex = false;
+    let mut mirror_incomplete = false;
+    for entry in &sync_result.results {
+        if !entry.changes_complete {
+            mirror_incomplete = true;
+            state.lexical.mark_rebuild_required(
+                "post-pull change diff failed — pulled changes not mirrored",
+            );
+            spawn_lexical_repair_for_router(&state.router, &state.lexical);
+        }
+        if let Some(ref changes) = entry.resolved_changes {
+            mirror_incomplete |= changes.unresolved > 0;
+            let repo = state.router.repo(&entry.scope);
+            let stats = incremental_reindex(
+                repo,
+                &state.router,
+                state.embedding.as_ref(),
+                state.index.as_ref(),
+                &state.lexical,
+                changes,
+            )
+            .instrument(tracing::info_span!(
+                "server.incremental_reindex",
+                repo = %entry.label,
+            ))
+            .await;
+            info!(
+                repo = %entry.label,
+                added = stats.added,
+                updated = stats.updated,
+                removed = stats.removed,
+                errors = stats.errors,
+                "incremental reindex complete"
+            );
+            total_reindex.added += stats.added;
+            total_reindex.updated += stats.updated;
+            total_reindex.removed += stats.removed;
+            total_reindex.errors += stats.errors;
+            any_reindex = true;
+        }
+    }
+
+    let reindex_failed_completely = any_reindex
+        && total_reindex.added == 0
+        && total_reindex.updated == 0
+        && total_reindex.errors > 0;
+    if !mirror_incomplete && !reindex_failed_completely {
+        if let Some(sha) = state.router.head_sha().await {
+            state.index.set_commit_sha(Some(&sha));
+        }
+    }
+
+    (total_reindex, any_reindex)
+}
+
+/// Per-repo failure detail carried in the `sync` tool's error payload.
+#[derive(Debug, Serialize)]
+struct SyncRepoFailure {
+    /// Repo label (`"default"` or the scope prefix).
+    label: String,
+    /// Pull error message, when the pull failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pull_error: Option<String>,
+    /// Push error message, when the push failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    push_error: Option<String>,
+}
+
+/// Build the `sync` tool error for a sync where at least one repo's pull or
+/// push failed.
+///
+/// Matches the single-repo contract where pull/push failures surface as MCP
+/// tool errors: the message enumerates every failed repo with its error, and
+/// the structured `data` payload carries the failed entries plus the labels
+/// of repos that synced cleanly, so partial success stays visible.
+fn sync_failure_error(sync_result: &MultiSyncResult, branch: &str) -> ErrorData {
+    let failed: Vec<SyncRepoFailure> = sync_result
+        .results
+        .iter()
+        .filter(|e| !e.is_ok())
+        .map(|e| SyncRepoFailure {
+            label: e.label.clone(),
+            pull_error: e.pull_error.clone(),
+            push_error: e.push_error.clone(),
+        })
+        .collect();
+    let succeeded: Vec<&str> = sync_result
+        .results
+        .iter()
+        .filter(|e| e.is_ok())
+        .map(|e| e.label.as_str())
+        .collect();
+    let summary = sync_result
+        .results
+        .iter()
+        .filter_map(|e| e.failure_summary().map(|s| format!("{}: {s}", e.label)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    ErrorData {
+        code: rmcp::model::ErrorCode::INTERNAL_ERROR,
+        message: Cow::Owned(format!(
+            "sync failed for {}/{} repos: {summary}",
+            failed.len(),
+            sync_result.results.len()
+        )),
+        data: Some(serde_json::json!({
+            "status": "sync failed",
+            "branch": branch,
+            "failed": failed,
+            "succeeded": succeeded,
+        })),
+    }
 }
 
 /// Mirror a pull's git changes into the vector and lexical indexes.
@@ -1644,67 +1775,23 @@ impl MemoryServer {
                         .router
                         .sync_all(&unit_state.auth, &unit_branch, pull_first)
                         .await?;
-
-                    let mut total_reindex = ReindexStats::default();
-                    let mut any_reindex = false;
-                    let mut mirror_incomplete = false;
-                    for entry in &sync_result.results {
-                        if !entry.changes_complete {
-                            mirror_incomplete = true;
-                            unit_state.lexical.mark_rebuild_required(
-                                "post-pull change diff failed — pulled changes not mirrored",
-                            );
-                            spawn_lexical_repair_for_router(
-                                &unit_state.router,
-                                &unit_state.lexical,
-                            );
-                        }
-                        if let Some(ref changes) = entry.resolved_changes {
-                            mirror_incomplete |= changes.unresolved > 0;
-                            let repo = unit_state.router.repo(&entry.scope);
-                            let stats = incremental_reindex(
-                                repo,
-                                &unit_state.router,
-                                unit_state.embedding.as_ref(),
-                                unit_state.index.as_ref(),
-                                &unit_state.lexical,
-                                changes,
-                            )
-                            .instrument(tracing::info_span!(
-                                "server.incremental_reindex",
-                                repo = %entry.label,
-                            ))
-                            .await;
-                            info!(
-                                repo = %entry.label,
-                                added = stats.added,
-                                updated = stats.updated,
-                                removed = stats.removed,
-                                errors = stats.errors,
-                                "incremental reindex complete"
-                            );
-                            total_reindex.added += stats.added;
-                            total_reindex.updated += stats.updated;
-                            total_reindex.removed += stats.removed;
-                            total_reindex.errors += stats.errors;
-                            any_reindex = true;
-                        }
-                    }
-
-                    let reindex_failed_completely = any_reindex
-                        && total_reindex.added == 0
-                        && total_reindex.updated == 0
-                        && total_reindex.errors > 0;
-                    if !mirror_incomplete && !reindex_failed_completely {
-                        if let Some(sha) = unit_state.router.head_sha().await {
-                            unit_state.index.set_commit_sha(Some(&sha));
-                        }
-                    }
-
+                    let (total_reindex, any_reindex) =
+                        mirror_sync_results(&unit_state, &sync_result).await;
                     Ok((sync_result, total_reindex, any_reindex))
                 })
                 .await
                 .map_err(ErrorData::from)?;
+
+            // A failed pull or push on any repo must fail the tool call —
+            // successful repos were still synced and mirrored above, but a
+            // clean "sync complete" here would silently drop the failures.
+            if !sync_result.all_ok() {
+                warn!(
+                    ms = start.elapsed().as_millis(),
+                    pull_first, "sync finished with per-repo failures"
+                );
+                return Err(sync_failure_error(&sync_result, &branch));
+            }
 
             // Build pull status summary.
             let pull_status = if !pull_first {
@@ -3090,9 +3177,11 @@ mod tests {
     mod lexical_failure_receipts {
         use super::*;
         use crate::auth::AuthProvider;
+        use crate::config::RemoteMapping;
         use crate::health::HealthRegistry;
         use crate::index::InMemoryStore;
         use crate::repo::MemoryRepo;
+        use crate::repo_router::{RepoRouter, SyncEntry};
         use crate::search::bm25::FailPoint;
         use crate::search::{rebuild_lexical_from_repo, spawn_lexical_repair};
         use async_trait::async_trait;
@@ -3698,10 +3787,17 @@ mod tests {
         }
 
         async fn run_sync(server: &MemoryServer) -> Result<String, ErrorData> {
+            run_sync_with(server, true).await
+        }
+
+        async fn run_sync_with(
+            server: &MemoryServer,
+            pull_first: bool,
+        ) -> Result<String, ErrorData> {
             server
                 .sync(
                     Parameters(SyncArgs {
-                        pull_first: Some(true),
+                        pull_first: Some(pull_first),
                     }),
                     Extension(parts()),
                 )
@@ -3895,6 +3991,298 @@ mod tests {
             .await;
             assert_lexical_converges(&fx.state, "goodword", &[qualified(&Scope::Root, "good")])
                 .await;
+        }
+
+        // -------------------------------------------------------------------
+        // Sync failure surfacing (#293 review, finding 1)
+        //
+        // A failed pull or push must fail the `sync` tool call — per-repo
+        // resilience (continue syncing the other repos) must not become an
+        // acked-but-lost sync where the caller reads "sync complete" while
+        // every push failed.
+        // -------------------------------------------------------------------
+
+        /// State whose repo has an origin that cannot be reached, so pull and
+        /// push fail at the transport level.
+        fn bad_remote_state(tmp: &tempfile::TempDir) -> Arc<AppState> {
+            let repo = MemoryRepo::init_or_open(
+                tmp.path(),
+                Some("file:///nonexistent/memory-mcp-test-remote.git"),
+            )
+            .expect("repo init");
+            Arc::new(AppState::new(
+                Arc::new(repo),
+                "main".to_string(),
+                Box::new(MockEmbedding),
+                Box::new(InMemoryStore::new(4)),
+                sync_auth(),
+                HealthRegistry::new(),
+                None,
+            ))
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sync_push_failure_surfaces_as_tool_error() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = bad_remote_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            // A real local commit, so the push is genuinely attempted.
+            let memory = Memory::from_validated(
+                MemoryName::new("note".to_string()).unwrap(),
+                "pushfail payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&memory).await.expect("save");
+
+            let err = run_sync_with(&server, false)
+                .await
+                .expect_err("a failed push must fail the sync tool call");
+            assert!(
+                err.message.contains("sync failed for 1/1 repos"),
+                "error must name the failed/total counts: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("default: push failed:"),
+                "error must enumerate the failing repo and operation: {}",
+                err.message
+            );
+            let data = err.data.expect("structured failure payload");
+            assert_eq!(data["failed"][0]["label"], "default");
+            assert!(
+                data["failed"][0]["push_error"].is_string(),
+                "push_error must carry the failure: {data}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sync_pull_failure_reported_failed_not_skipped() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = bad_remote_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            let err = run_sync_with(&server, true)
+                .await
+                .expect_err("a failed pull must fail the sync tool call");
+            assert!(
+                err.message.contains("default: pull failed:"),
+                "a failed pull must be reported as failed: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("skipped"),
+                "a failed pull must not be reported as skipped: {}",
+                err.message
+            );
+            let data = err.data.expect("structured failure payload");
+            assert!(
+                data["failed"][0]["pull_error"].is_string(),
+                "pull_error must carry the failure: {data}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sync_mixed_failure_enumerates_failed_and_succeeded() {
+            // Reachable bare origin for the default repo, seeded by a writer.
+            let remote_dir = tempfile::tempdir().expect("tempdir");
+            git2::Repository::init_bare(remote_dir.path()).expect("bare init");
+            let remote_url = format!("file://{}", remote_dir.path().display());
+            let writer_dir = tempfile::tempdir().expect("tempdir");
+            let writer = Arc::new(
+                MemoryRepo::init_or_open(writer_dir.path(), Some(&remote_url))
+                    .expect("writer repo"),
+            );
+            let seed = Memory::from_validated(
+                MemoryName::new("seed".to_string()).unwrap(),
+                "seedword payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            writer.save_memory(&seed).await.expect("writer save");
+            writer
+                .push(&sync_auth(), "main")
+                .await
+                .expect("writer push");
+
+            let default_dir = tempfile::tempdir().expect("tempdir");
+            let default_repo = Arc::new(
+                MemoryRepo::init_or_open(default_dir.path(), Some(&remote_url))
+                    .expect("default repo"),
+            );
+
+            // Mapped repo whose origin cannot be reached: its pull fails.
+            let work_dir = tempfile::tempdir().expect("tempdir");
+            let health = HealthRegistry::new();
+            let mapping = RemoteMapping {
+                scope: "work".to_string(),
+                url: "file:///nonexistent/memory-mcp-test-remote.git".to_string(),
+                path: Some(work_dir.path().display().to_string()),
+                branch: None,
+            };
+            let router = RepoRouter::from_config(
+                Arc::clone(&default_repo),
+                std::slice::from_ref(&mapping),
+                &health.git,
+                &health.sync,
+            )
+            .expect("router");
+            let state = Arc::new(AppState::with_router(
+                Arc::clone(&default_repo),
+                router,
+                "main".to_string(),
+                Box::new(MockEmbedding),
+                Box::new(InMemoryStore::new(4)),
+                sync_auth(),
+                health,
+                None,
+            ));
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            let err = run_sync(&server)
+                .await
+                .expect_err("one failing repo must fail the sync tool call");
+            assert!(
+                err.message.contains("sync failed for 1/2 repos"),
+                "error must show partial failure counts: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("work: pull failed:"),
+                "error must name the failing repo: {}",
+                err.message
+            );
+            let data = err.data.expect("structured failure payload");
+            assert_eq!(
+                data["succeeded"],
+                serde_json::json!(["default"]),
+                "the repo that synced cleanly must stay visible: {data}"
+            );
+            assert_eq!(data["failed"][0]["label"], "work");
+
+            // Per-repo resilience held: the default repo pulled the seeded
+            // memory despite the mapped repo's failure.
+            state
+                .repo
+                .read_memory("seed", &Scope::Root)
+                .await
+                .expect("default repo must sync despite the mapped repo failing");
+        }
+
+        /// Wire-contract receipt for the sync failure payload: message and
+        /// structured `data` shapes MCP clients parse.
+        #[test]
+        fn sync_failure_error_wire_shape() {
+            let result = MultiSyncResult {
+                results: vec![
+                    SyncEntry {
+                        label: "default".to_string(),
+                        scope: Scope::Root,
+                        pull: Some(PullResult::UpToDate),
+                        pull_error: None,
+                        push_ok: true,
+                        push_error: None,
+                        changes: None,
+                        resolved_changes: None,
+                        changes_complete: true,
+                    },
+                    SyncEntry {
+                        label: "work".to_string(),
+                        scope: Scope::Root,
+                        pull: None,
+                        pull_error: Some("git error: boom".to_string()),
+                        push_ok: false,
+                        push_error: None,
+                        changes: None,
+                        resolved_changes: None,
+                        changes_complete: true,
+                    },
+                ],
+            };
+
+            let err = sync_failure_error(&result, "main");
+            assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                err.message,
+                "sync failed for 1/2 repos: work: pull failed: git error: boom"
+            );
+            assert_eq!(
+                err.data.expect("data"),
+                serde_json::json!({
+                    "status": "sync failed",
+                    "branch": "main",
+                    "failed": [{"label": "work", "pull_error": "git error: boom"}],
+                    "succeeded": ["default"],
+                })
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Composite-SHA advancement refusal (#293 review, finding 2)
+        //
+        // The production mirror seam: an entry whose post-pull change
+        // discovery did not complete must degrade the lexical index and
+        // refuse to advance the stored composite SHA, so the next startup
+        // reindexes from git truth.
+        // -------------------------------------------------------------------
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn incomplete_change_discovery_refuses_composite_sha_advancement() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            // Git truth exists, so head_sha() is Some and advancement is
+            // genuinely possible — the refusal below is the differentiator.
+            let memory = Memory::from_validated(
+                MemoryName::new("note".to_string()).unwrap(),
+                "shaword payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&memory).await.expect("save");
+
+            // Hold the repair slot so the degraded window is observable.
+            assert!(state.lexical.try_claim_repair());
+
+            let entry = |changes_complete: bool| SyncEntry {
+                label: "default".to_string(),
+                scope: Scope::Root,
+                pull: None,
+                pull_error: None,
+                push_ok: true,
+                push_error: None,
+                changes: None,
+                resolved_changes: None,
+                changes_complete,
+            };
+
+            let incomplete = MultiSyncResult {
+                results: vec![entry(false)],
+            };
+            let (_stats, any_reindex) = mirror_sync_results(&state, &incomplete).await;
+            assert!(!any_reindex);
+            assert!(
+                state.lexical.is_degraded(),
+                "incomplete change discovery must mark the index rebuild-required"
+            );
+            assert_eq!(
+                state.index.commit_sha(),
+                None,
+                "incomplete change discovery must refuse composite-SHA advancement"
+            );
+
+            // Contrast: a complete entry advances the SHA, proving the
+            // refusal above came from the incomplete flag, not a missing
+            // head.
+            let complete = MultiSyncResult {
+                results: vec![entry(true)],
+            };
+            let _ = mirror_sync_results(&state, &complete).await;
+            let expected = state.router.head_sha().await;
+            assert!(expected.is_some(), "git truth must yield a head SHA");
+            assert_eq!(
+                state.index.commit_sha(),
+                expected,
+                "a complete mirror must advance the composite SHA"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
