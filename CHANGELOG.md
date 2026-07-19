@@ -1,10 +1,36 @@
-## [0.16.0] - 2026-07-12
+## [0.17.0] - 2026-07-19
+
+### Behavior changes — read before upgrading
+
+- **Repository paths now fail closed on unresolvable components.** `--repo-path`, `MEMORY_MCP_REPO_PATH`, and per-scope config paths are canonicalized at startup; a path component that *exists but cannot resolve* — a dangling symlink, a regular file where a directory is expected, or an untraversable prefix — now aborts startup with an I/O error instead of being silently reclassified as missing and redirecting the repository to a sibling path (#293). **Migration:** if your server previously started with a malformed repo path, it was almost certainly not using the path you intended; fix the path in your config or environment. Genuinely missing path components are still created as before.
+- **Sync failures surface as tool errors.** With per-scope remotes configured, `sync` attempts every repository even when one fails (a network blip on one remote no longer blocks the others), but the tool call itself now fails when any repository's pull or push failed — the error enumerates the failed repositories and the structured payload lists which synced cleanly (#293). Clients that treated a `sync` success response as proof of a clean push should rely on this contract rather than log output.
+- **Index certification is stricter.** The vector-index freshness stamp is written only when a startup reindex or incremental mirror completes with *zero* item-level errors; a partially populated index is never certified as intact. After a partial failure the next startup runs a repairing full reindex instead of skipping it (#293). Expect an extra reindex pass — that is the repair working as intended, not a regression.
+- **Recall results gain a `match_type` field** (`semantic`, `lexical`, or `both`), and lexical-only hits carry a `distance` of `-1.0` as a sentinel (#308). `distance` stays numeric on the wire, so strict clients that model it as a required float keep deserializing — but distance-threshold logic must exclude the `-1.0` sentinel.
+- **`list` responses are now paginated** (50 summaries by default, 100 maximum) with cursor pagination, exact field projection, deterministic ordering, and a 24 KiB page ceiling (#302). Existing callers must follow `next_cursor` when `has_more` is true; omitting `fields` retains the prior six-field summary shape. `list.count` now means the total matching memories, while `list.returned` is the number in the current page. *(These entries previously appeared under 0.16.0 in this file, but the feature merged after the v0.16.0 tag — it ships here.)*
+
+### Added
+
+- **Per-scope remote mapping** (#293, ADR-0038): route different scope subtrees to different git repositories, each with its own remote, via a TOML config file (`--config` / `MEMORY_MCP_CONFIG` with `[[remotes]]` entries). Proprietary memories can sync to a private repo while shared memories stay in the common one. Each repo syncs independently; reads aggregate across repos with strict scope-ownership filtering; cross-repo moves preserve memory identity (`id`, `created_at`). Repo-path collisions (including symlink aliases) are rejected at startup, mapped remote URLs are credential-redacted in logs, and mapped branch names are validated. **With no config file, behavior is identical to the previous single-repo mode.**
+- **Hybrid recall** (#308, ADR-0038): recall now fuses BM25 lexical search (in-RAM Tantivy index over memory names and content, rebuilt from the repo at startup — no persistence, no migrations) with the existing semantic embedding search via reciprocal rank fusion. Exact-phrase matches rank strictly above term-only matches, and the top lexical hit deterministically outranks every semantic-only candidate — literal phrases buried in long multi-topic memories now surface (#55).
+- **Lexical index failure/repair contract** (#314, ADR-0039): git remains authoritative and the lexical index is derived state with no silent divergence — any mirror failure flags the index degraded (recall serves semantic-only, search errors instead of serving stale results) and a background single-flight rebuild repairs it deterministically. Every repository write plus its index mirror runs as a cancellation-shielded unit, so a dropped request can never strand a committed git write unmirrored.
+- **Aggregate health reporting** (#293): multi-repo sync and git health settle once from the complete aggregate outcome instead of last-operation-wins, so a failed repository followed by a clean one no longer reports healthy readiness.
+- Documentation suite for external users: getting started, configuration, client setup, tool reference, architecture, security, and deployment guides under `docs/`, plus `CONTRIBUTING.md` and a reframed README (#315, #316).
 
 ### Changed
 
-- Bound `list` responses with cursor pagination (50 summaries by default, 100 maximum), exact field projection, deterministic ordering, and a 24 KiB page ceiling (#281). Existing callers must follow `next_cursor` when `has_more` is true; omitting `fields` retains the prior six-field summary shape.
-- `list.count` now means the total matching memories, while `list.returned` is the number in the current page. Repository enumeration and metadata parsing still scan the selected scope once per page; pushing the seek into a persistent summary index is deferred to #304.
-- Retain the original public Rust `ListArgs { scope }` DTO for semver compatibility; paginated MCP-only request fields use an internal wire type.
+- Container image now compiles with the `k8s,otlp` feature set (previously `k8s` only). OTLP export stays passive unless activated with `--otlp-required` / `--otlp-optional`.
+- Retain the original public Rust `ListArgs { scope }` DTO for semver compatibility; paginated MCP-only request fields use an internal wire type (#302).
+
+### Known behavior
+
+- `--otlp-required` does not fail startup when the OTLP collector is merely unreachable: the tonic span exporter constructs lazily, so the server starts normally and connection failures surface later as `BatchSpanProcessor.ExportError` log lines on each export attempt. Startup aborts only when exporter *construction* fails (e.g. a malformed endpoint URL). Verified empirically against a dead endpoint; the CLI help text's "crash on startup if the collector is unreachable" overstates the guarantee. Tracked as a known behavior — not changed in this release.
+
+### Dependencies
+
+- Bump the rust-dependencies group with 10 updates — tokio 1.53, usearch 2.26, serde 1.0.229, uuid 1.24, and others (#320)
+- Bump the GitHub Actions group with 8 updates (#317)
+
+## [0.16.0] - 2026-07-12
 
 ### Added
 
