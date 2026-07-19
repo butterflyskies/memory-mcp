@@ -331,8 +331,8 @@ impl Memory {
 /// A reference to a specific memory: scope + validated name.
 ///
 /// Serde support exists for wire shapes that embed a parent reference
-/// (e.g. [`crate::types::FactRecord`]); deserialization stays strict via
-/// the components' own validating `Deserialize` impls.
+/// (e.g. the crate-internal `FactRecord` catalog entry); deserialization
+/// stays strict via the components' own validating `Deserialize` impls.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemoryRef {
     /// Where this memory lives (global or namespace-scoped).

@@ -377,9 +377,18 @@ impl<'de> Deserialize<'de> for FactId {
 /// corrupt derived state and fails closed instead of loading cleanly.
 ///
 /// The catalog is derived, rebuildable state; markdown remains canonical.
+///
+/// Crate-internal until the catalog (slice 3) produces an external
+/// consumer: every `pub` item is a semver commitment, and none exists
+/// yet. ADR-0042's consequences section records the eventual public
+/// shape.
+#[allow(
+    dead_code,
+    reason = "contract for #262 slice 3; exercised by tests until then"
+)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawFactRecord")]
-pub struct FactRecord {
+pub(crate) struct FactRecord {
     /// Deterministic identity (carries parent id, chunker version, span).
     id: FactId,
     /// Scope + name of the parent memory, for resolution and display.
@@ -400,6 +409,10 @@ pub struct FactRecord {
 
 /// Unvalidated wire shape for [`FactRecord`]; conversion enforces id/body
 /// consistency so no inconsistent record can enter through deserialization.
+#[allow(
+    dead_code,
+    reason = "contract for #262 slice 3; exercised by tests until then"
+)]
 #[derive(Deserialize)]
 struct RawFactRecord {
     id: FactId,
@@ -429,6 +442,10 @@ impl TryFrom<RawFactRecord> for FactRecord {
 /// the body at the id's own coordinates must reproduce `id` exactly.
 /// Rejects both a span whose length disagrees with the body (via
 /// [`FactId::derive`]) and a digest that does not match the body's content.
+#[allow(
+    dead_code,
+    reason = "contract for #262 slice 3; exercised by tests until then"
+)]
 fn validate_id_matches_body(id: &FactId, body: &str) -> Result<(), MemoryError> {
     let derived = FactId::derive(id.parent_id(), id.chunker_version(), id.span(), body)?;
     if derived != *id {
@@ -442,11 +459,15 @@ fn validate_id_matches_body(id: &FactId, body: &str) -> Result<(), MemoryError> 
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "contract for #262 slice 3; exercised by tests until then"
+)]
 impl FactRecord {
     /// Create a catalog record, enforcing that `id` is true provenance for
     /// `body`: the id must re-derive exactly from the body at the id's own
     /// parent/version/span coordinates.
-    pub fn new(
+    pub(crate) fn new(
         id: FactId,
         parent: MemoryRef,
         heading_path: Vec<String>,
@@ -466,48 +487,48 @@ impl FactRecord {
     }
 
     /// Deterministic identity (carries parent id, chunker version, span).
-    pub const fn id(&self) -> &FactId {
+    pub(crate) const fn id(&self) -> &FactId {
         &self.id
     }
 
     /// Scope + name of the parent memory.
-    pub const fn parent(&self) -> &MemoryRef {
+    pub(crate) const fn parent(&self) -> &MemoryRef {
         &self.parent
     }
 
     /// Markdown heading trail from the document root to this chunk.
-    pub fn heading_path(&self) -> &[String] {
+    pub(crate) fn heading_path(&self) -> &[String] {
         &self.heading_path
     }
 
     /// The chunk's text — the parent content at the id's span.
-    pub fn body(&self) -> &str {
+    pub(crate) fn body(&self) -> &str {
         &self.body
     }
 
     /// Tags inherited from the parent memory.
-    pub fn tags(&self) -> &[String] {
+    pub(crate) fn tags(&self) -> &[String] {
         &self.tags
     }
 
     /// Raw `[[reference]]` targets extracted from the chunk body.
-    pub fn refs_out(&self) -> &[String] {
+    pub(crate) fn refs_out(&self) -> &[String] {
         &self.refs_out
     }
 
     /// The parent memory's id (UUID string), from [`FactRecord::id`].
-    pub fn parent_id(&self) -> &str {
+    pub(crate) fn parent_id(&self) -> &str {
         self.id.parent_id()
     }
 
     /// The chunker version, from [`FactRecord::id`].
-    pub const fn chunker_version(&self) -> ChunkerVersion {
+    pub(crate) const fn chunker_version(&self) -> ChunkerVersion {
         self.id.chunker_version()
     }
 
     /// The source span within the parent's markdown body, from
     /// [`FactRecord::id`].
-    pub const fn span(&self) -> SourceSpan {
+    pub(crate) const fn span(&self) -> SourceSpan {
         self.id.span()
     }
 }
@@ -526,9 +547,16 @@ impl FactRecord {
 /// Invariant: same true-provenance contract as [`FactRecord`] — `text` is
 /// the matched chunk's body, so the fact id must re-derive exactly from it.
 /// Enforced at construction ([`MatchedChunk::new`]) and on deserialization.
+///
+/// Crate-internal until slice 7 puts it on the recall wire — same
+/// premature-`pub` reasoning as [`FactRecord`].
+#[allow(
+    dead_code,
+    reason = "contract for #262 slice 7; exercised by tests until then"
+)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawMatchedChunk")]
-pub struct MatchedChunk {
+pub(crate) struct MatchedChunk {
     /// Identity of the matched fact (carries parent id and span).
     fact_id: FactId,
     /// Markdown heading trail locating the chunk within its parent.
@@ -539,6 +567,10 @@ pub struct MatchedChunk {
 
 /// Unvalidated wire shape for [`MatchedChunk`]; conversion enforces
 /// id/text consistency.
+#[allow(
+    dead_code,
+    reason = "contract for #262 slice 7; exercised by tests until then"
+)]
 #[derive(Deserialize)]
 struct RawMatchedChunk {
     fact_id: FactId,
@@ -554,11 +586,15 @@ impl TryFrom<RawMatchedChunk> for MatchedChunk {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "contract for #262 slice 7; exercised by tests until then"
+)]
 impl MatchedChunk {
     /// Create matched-chunk provenance, enforcing that `fact_id` is true
     /// provenance for `text` (it must re-derive exactly from the text at
     /// the id's own coordinates).
-    pub fn new(
+    pub(crate) fn new(
         fact_id: FactId,
         heading_path: Vec<String>,
         text: String,
@@ -572,17 +608,17 @@ impl MatchedChunk {
     }
 
     /// Identity of the matched fact (carries parent id and span).
-    pub const fn fact_id(&self) -> &FactId {
+    pub(crate) const fn fact_id(&self) -> &FactId {
         &self.fact_id
     }
 
     /// Markdown heading trail locating the chunk within its parent.
-    pub fn heading_path(&self) -> &[String] {
+    pub(crate) fn heading_path(&self) -> &[String] {
         &self.heading_path
     }
 
     /// The matched chunk's text.
-    pub fn text(&self) -> &str {
+    pub(crate) fn text(&self) -> &str {
         &self.text
     }
 }

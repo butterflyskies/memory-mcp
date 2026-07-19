@@ -324,8 +324,13 @@ example regressions.
 - Deterministic ids make rebuilds idempotent and diffable — the same
   guarantee ADR-0039 relies on for repair convergence.
 - The contract adds public API surface (`FactId`, `SourceSpan`,
-  `ChunkerVersion`, `FactRecord`, `MatchedChunk`, and serde on
-  `MemoryRef`) ahead of the behavior that uses it; until slice 7 wires
-  responses, the types are load-bearing only for downstream slices.
+  `ChunkerVersion`, and serde on `MemoryRef`) ahead of the behavior
+  that uses it; until slice 7 wires responses, the types are
+  load-bearing only for downstream slices. `FactRecord` and
+  `MatchedChunk` stay `pub(crate)` until their owning slices (3 and 7)
+  produce an external consumer — every `pub` item is a semver
+  commitment, so the catalog and recall-wire shapes go public only
+  when the wire actually carries them. This ADR remains the source of
+  truth for that eventual public shape.
 - `sha2` becomes a direct dependency (already present transitively;
   no new crates in the tree).

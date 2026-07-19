@@ -459,6 +459,66 @@ mod properties {
             .prop_map(|(start, len)| SourceSpan::new(start, start + len).expect("start < end"))
     }
 
+    /// Content paired with a span whose endpoints are drawn from the
+    /// content's *real* UTF-8 character boundaries, so every generated
+    /// span must resolve. Boundary pairs come from the generated string
+    /// itself — never from an independent offset domain that would
+    /// almost always miss the content — which is what makes the success
+    /// property below non-vacuous.
+    fn content_with_valid_span_strategy() -> impl Strategy<Value = (String, SourceSpan)> {
+        ".{1,64}".prop_flat_map(|content| {
+            // Non-empty content has at least the two boundaries 0 and
+            // len, so a distinct ascending pair always exists.
+            let boundaries: Vec<usize> = (0..=content.len())
+                .filter(|&i| content.is_char_boundary(i))
+                .collect();
+            (Just(content), proptest::sample::subsequence(boundaries, 2)).prop_map(
+                |(content, pair)| {
+                    let span = SourceSpan::new(pair[0], pair[1])
+                        .expect("distinct boundaries selected in ascending order");
+                    (content, span)
+                },
+            )
+        })
+    }
+
+    /// Content paired with a span `slice_in` must reject: an endpoint
+    /// beyond the content, or an endpoint inside a multi-byte UTF-8
+    /// sequence. Reversed and empty spans are deliberately absent —
+    /// they are unrepresentable as `SourceSpan` values (constructor and
+    /// deserialization reject them; see
+    /// `source_span_rejects_empty_and_inverted` and
+    /// `span_deserializes_iff_valid`), so resolution only has to refuse
+    /// these two corruption shapes. Content mixes 1–4-byte characters
+    /// so non-boundary offsets occur routinely, not incidentally.
+    fn content_with_invalid_span_strategy() -> impl Strategy<Value = (String, SourceSpan)> {
+        let chars = prop_oneof![
+            Just('a'),
+            Just('\u{e9}'),
+            Just('\u{2603}'),
+            Just('\u{1f98b}')
+        ];
+        (proptest::collection::vec(chars, 1..24), 1usize..1000).prop_flat_map(
+            |(chars, overshoot)| {
+                let content: String = chars.into_iter().collect();
+                let len = content.len();
+                let mut invalid = vec![
+                    // Out of range: end past the content, start inside…
+                    SourceSpan::new(0, len + overshoot).expect("end exceeds start 0"),
+                    // …and start at the very edge.
+                    SourceSpan::new(len, len + overshoot).expect("end exceeds start"),
+                ];
+                for i in (1..len).filter(|&i| !content.is_char_boundary(i)) {
+                    // Mid-character start (i < len since i came from 1..len)…
+                    invalid.push(SourceSpan::new(i, len).expect("start below end"));
+                    // …and mid-character end.
+                    invalid.push(SourceSpan::new(0, i).expect("end at least 1"));
+                }
+                (Just(content), proptest::sample::select(invalid))
+            },
+        )
+    }
+
     fn version_strategy() -> impl Strategy<Value = ChunkerVersion> {
         any::<u32>().prop_map(ChunkerVersion::new)
     }
@@ -624,15 +684,49 @@ mod properties {
             prop_assert_eq!(result.is_ok(), start < end);
         }
 
-        /// P1.5 — `slice_in` is total (never panics) and honest: when it
-        /// resolves, the slice has exactly the span's length and matches
-        /// the parent content at those offsets.
+        /// P1.5 success direction — a span built from the content's real
+        /// character boundaries always resolves, and the resolved slice
+        /// is byte-for-byte the content at the span's offsets.
+        /// Non-vacuity: an always-`Err` `slice_in` stub fails this
+        /// property on the first case; an always-`Ok`-of-anything stub
+        /// fails the exactness assertions. Neither degenerate
+        /// implementation passes this and `invalid_spans_never_resolve`
+        /// together.
         #[test]
-        fn slice_in_is_total_and_honest(content in ".{0,64}", span in span_strategy()) {
-            if let Ok(text) = span.slice_in(&content) {
-                prop_assert_eq!(text.len(), span.len());
-                prop_assert_eq!(text, &content[span.start()..span.end()]);
-            }
+        fn boundary_spans_resolve_to_exact_bytes(
+            (content, span) in content_with_valid_span_strategy(),
+        ) {
+            let text = span.slice_in(&content);
+            prop_assert!(
+                text.is_ok(),
+                "char-boundary span {} failed to resolve in {:?}",
+                span,
+                content
+            );
+            let text = text.expect("asserted Ok above");
+            prop_assert_eq!(text.len(), span.len());
+            prop_assert_eq!(
+                text.as_bytes(),
+                &content.as_bytes()[span.start()..span.end()]
+            );
+        }
+
+        /// P1.5 failure direction — a span that leaves the content or
+        /// cuts through a multi-byte UTF-8 sequence never resolves;
+        /// serving text for a corrupt span would be false provenance.
+        /// Non-vacuity: an always-`Ok` `slice_in` stub fails here, an
+        /// always-`Err` stub fails `boundary_spans_resolve_to_exact_bytes`.
+        #[test]
+        fn invalid_spans_never_resolve(
+            (content, span) in content_with_invalid_span_strategy(),
+        ) {
+            prop_assert!(
+                span.slice_in(&content).is_err(),
+                "span {} resolved against {} bytes of content despite being \
+                 out of range or off a character boundary",
+                span,
+                content.len()
+            );
         }
 
         /// P1.5 — the full-body span of any non-empty content always

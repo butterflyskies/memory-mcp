@@ -19,7 +19,12 @@ pub use args::{
 
 pub(crate) use args::{ListToolArgs, LIST_MAX_LIMIT};
 
-pub use chunk::{ChunkerVersion, FactId, FactRecord, MatchedChunk, SourceSpan};
+pub use chunk::{ChunkerVersion, FactId, SourceSpan};
+
+// The catalog and recall-wire shapes (`FactRecord`, `MatchedChunk`) are
+// deliberately not re-exported: they stay internal to `chunk` until
+// their owning slices (#262 slices 3 and 7) produce a consumer
+// (ADR-0042) — every `pub` item is a semver commitment.
 
 pub use memory::{parse_qualified_name, Memory, MemoryMetadata, MemoryName, MemoryRef};
 
