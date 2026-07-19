@@ -26,6 +26,76 @@ pub fn expand_tilde(path: &str) -> Result<PathBuf, MemoryError> {
     }
 }
 
+/// Resolve a path to a canonical absolute form, tolerating missing suffixes.
+///
+/// `std::fs::canonicalize` fails when the path does not exist yet, but repo
+/// paths are frequently created only by the init that follows a collision
+/// check. This canonicalizes the deepest existing ancestor (resolving
+/// symlinks) and appends the remaining components, so two spellings of the
+/// same physical location — via symlinks, `.`/`..` segments, or a
+/// not-yet-created tail — resolve to the same value (#293 review, round 4).
+///
+/// `.` and `..` components are normalized lexically before canonicalization;
+/// this is sound here because the non-existing tail contains no symlinks to
+/// mis-resolve, and a lexical mismatch only ever rejects a config, never
+/// silently merges two repos.
+pub(crate) fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, MemoryError> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                MemoryError::Internal(format!("cannot resolve current working directory: {e}"))
+            })?
+            .join(path)
+    };
+
+    // Lexically normalize `.` and `..` so the ancestor walk below only ever
+    // sees plain named components.
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+
+    // Walk up to the deepest existing ancestor, canonicalize it, then
+    // re-append the missing tail.
+    let mut base = normalized.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let canonical_base = loop {
+        match base.canonicalize() {
+            Ok(resolved) => break resolved,
+            Err(_) => match (base.file_name(), base.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name.to_os_string());
+                    base = parent;
+                }
+                _ => {
+                    return Err(MemoryError::InvalidInput {
+                        reason: format!(
+                            "cannot resolve any existing ancestor of path '{}'",
+                            normalized.display()
+                        ),
+                    });
+                }
+            },
+        }
+    };
+
+    let mut resolved = canonical_base;
+    for component in tail.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
 /// RAII guard that removes a temp file on drop unless defused.
 struct TempGuard<'a> {
     path: &'a Path,
@@ -218,6 +288,53 @@ mod tests {
 
         let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "overwritten file should be 0600, got {mode:o}");
+    }
+
+    // -- canonicalize_allow_missing (#293 review, round 4) -----------------
+    //
+    // Repo-path collision detection depends on distinct spellings of the
+    // same physical location resolving identically, including paths whose
+    // tail does not exist yet.
+
+    #[test]
+    fn canonicalize_allow_missing_resolves_missing_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().canonicalize().unwrap();
+        let missing = dir.path().join("not-yet/created");
+        let resolved = canonicalize_allow_missing(&missing).unwrap();
+        assert_eq!(resolved, existing.join("not-yet/created"));
+    }
+
+    #[test]
+    fn canonicalize_allow_missing_normalizes_dot_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let spelled = dir.path().join("a/../b/./c");
+        let plain = dir.path().join("b/c");
+        assert_eq!(
+            canonicalize_allow_missing(&spelled).unwrap(),
+            canonicalize_allow_missing(&plain).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_allow_missing_resolves_symlink_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        // Both an existing symlink and a missing tail beneath it resolve to
+        // the physical location.
+        assert_eq!(
+            canonicalize_allow_missing(&alias).unwrap(),
+            canonicalize_allow_missing(&real).unwrap()
+        );
+        assert_eq!(
+            canonicalize_allow_missing(&alias.join("sub")).unwrap(),
+            canonicalize_allow_missing(&real.join("sub")).unwrap()
+        );
     }
 
     #[cfg(unix)]

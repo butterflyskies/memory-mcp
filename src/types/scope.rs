@@ -344,17 +344,30 @@ impl Scope {
 
 /// Validate a git branch name to prevent ref injection.
 ///
-/// Rejects names that are empty, contain `..`, start or end with `/` or `.`,
-/// contain consecutive slashes, or include characters that git disallows.
+/// Aligned with `git check-ref-format` (#293 review, round 4): rejects names
+/// that are empty, contain `..` or `@{`, are the single character `@`, start
+/// or end with `/` or `.`, contain consecutive slashes, have a component that
+/// starts with `.` or ends with `.lock`, or include characters that git
+/// disallows.
 pub fn validate_branch_name(branch: &str) -> Result<(), MemoryError> {
     if branch.is_empty() {
         return Err(MemoryError::InvalidInput {
             reason: "branch name cannot be empty".into(),
         });
     }
+    if branch == "@" {
+        return Err(MemoryError::InvalidInput {
+            reason: "branch name cannot be the single character '@'".into(),
+        });
+    }
     if branch.contains("..") {
         return Err(MemoryError::InvalidInput {
             reason: "branch name cannot contain '..'".into(),
+        });
+    }
+    if branch.contains("@{") {
+        return Err(MemoryError::InvalidInput {
+            reason: "branch name cannot contain '@{'".into(),
         });
     }
     let invalid_chars = [' ', '~', '^', ':', '?', '*', '[', '\\'];
@@ -378,6 +391,18 @@ pub fn validate_branch_name(branch: &str) -> Result<(), MemoryError> {
         return Err(MemoryError::InvalidInput {
             reason: "branch name contains consecutive slashes".into(),
         });
+    }
+    for component in branch.split('/') {
+        if component.starts_with('.') {
+            return Err(MemoryError::InvalidInput {
+                reason: format!("branch name component '{component}' cannot start with '.'"),
+            });
+        }
+        if component.ends_with(".lock") {
+            return Err(MemoryError::InvalidInput {
+                reason: format!("branch name component '{component}' cannot end with '.lock'"),
+            });
+        }
     }
     Ok(())
 }

@@ -352,3 +352,27 @@ fn validate_branch_name_rejects_invalid_start_end() {
 fn validate_branch_name_rejects_consecutive_slashes() {
     assert!(validate_branch_name("foo//bar").is_err());
 }
+
+/// Names that passed the validator but fail `git check-ref-format`
+/// (#293 review, round 4): an accepted-but-git-invalid ref surfaces as a
+/// confusing git error at the first push/pull instead of a clean config
+/// rejection.
+#[test]
+fn validate_branch_name_rejects_git_invalid_refs() {
+    // `@{` is reflog syntax.
+    assert!(validate_branch_name("foo@{bar").is_err());
+    // No component may end with `.lock`.
+    assert!(validate_branch_name("foo.lock").is_err());
+    assert!(validate_branch_name("foo/bar.lock").is_err());
+    assert!(validate_branch_name("foo.lock/bar").is_err());
+    // No component may start with `.`.
+    assert!(validate_branch_name("foo/.hidden").is_err());
+    // The single character `@` is reserved.
+    assert!(validate_branch_name("@").is_err());
+
+    // Near-misses stay valid, proving the checks match git's rules rather
+    // than banning the characters outright.
+    assert!(validate_branch_name("foo@bar").is_ok());
+    assert!(validate_branch_name("foo.lockx").is_ok());
+    assert!(validate_branch_name("foo.hidden/bar").is_ok());
+}

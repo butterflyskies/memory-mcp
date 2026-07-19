@@ -31,5 +31,8 @@ pub mod repo_router;
 pub mod search;
 /// MCP server implementation — tool handlers for the memory protocol.
 pub mod server;
+/// Test-only tracing capture helpers shared across unit-test modules.
+#[cfg(test)]
+pub(crate) mod test_log;
 /// Domain types: memories, scopes, metadata, validation, and application state.
 pub mod types;

@@ -47,6 +47,15 @@ pub struct RepoRouter {
     /// aggregate outcome of the completed sync once, so readiness reflects
     /// every repo — not the last iteration.
     sync_reporter: Option<SubsystemReporter>,
+    /// Aggregate git health reporter (#293 review, round 4).
+    ///
+    /// The same last-operation-wins hazard applies to local git health: in
+    /// the skip-and-continue aggregate [`RepoRouter::list_memories`], a
+    /// failed route followed by a clean repo would leave the shared reporter
+    /// healthy while a scope's memories are missing from the aggregate. When
+    /// present, the aggregate list settles the reporter once from the
+    /// complete outcome.
+    git_reporter: Option<SubsystemReporter>,
 }
 
 /// Result of a sync (push/pull) across all repos.
@@ -121,6 +130,7 @@ impl RepoRouter {
             default_repo,
             routes: Vec::new(),
             sync_reporter: None,
+            git_reporter: None,
         }
     }
 
@@ -131,12 +141,26 @@ impl RepoRouter {
     /// name is validated here (#293 review, round 3) — an invalid override
     /// must be rejected at construction, not discovered at the first
     /// push/pull.
+    ///
+    /// Repo paths are canonicalized before init and collisions are rejected
+    /// (#293 review, round 4): two routes — or a route and the default repo —
+    /// resolving to the same physical location would open one repo under
+    /// separate mutexes, and the later init would rewrite `origin`, so
+    /// nominally isolated scopes would share a tree and push to the
+    /// last-configured remote.
     pub fn from_config(
         default_repo: Arc<MemoryRepo>,
         mappings: &[crate::config::RemoteMapping],
         git_reporter: &SubsystemReporter,
         sync_reporter: &SubsystemReporter,
     ) -> Result<Self, MemoryError> {
+        let mut claimed: std::collections::HashMap<std::path::PathBuf, String> =
+            std::collections::HashMap::new();
+        claimed.insert(
+            crate::fs_util::canonicalize_allow_missing(default_repo.root())?,
+            "the default repository".to_string(),
+        );
+
         let mut routes = Vec::with_capacity(mappings.len());
         for mapping in mappings {
             if let Some(branch) = &mapping.branch {
@@ -149,11 +173,22 @@ impl RepoRouter {
                     }
                 })?;
             }
-            let path = mapping.resolved_path()?;
+            let path = crate::fs_util::canonicalize_allow_missing(&mapping.resolved_path()?)?;
+            if let Some(owner) = claimed.get(&path) {
+                return Err(MemoryError::InvalidInput {
+                    reason: format!(
+                        "repo path collision: scope '{}' resolves to '{}', which is already used by {}",
+                        mapping.scope,
+                        path.display(),
+                        owner
+                    ),
+                });
+            }
+            claimed.insert(path.clone(), format!("scope '{}'", mapping.scope));
             info!(
                 scope = %mapping.scope,
                 path = %path.display(),
-                url = %mapping.url,
+                url = %crate::repo::redact_url(&mapping.url),
                 "initialising scope-specific repo"
             );
             let repo = MemoryRepo::init_or_open_with_reporter(
@@ -174,6 +209,7 @@ impl RepoRouter {
             default_repo,
             routes,
             sync_reporter: Some(sync_reporter.clone()),
+            git_reporter: Some(git_reporter.clone()),
         })
     }
 
@@ -332,6 +368,7 @@ impl RepoRouter {
 
         let mut all_memories = self.default_repo.list_memories(scope).await?;
         all_memories.retain(|m| self.owns_scope(&self.default_repo, &m.metadata.scope));
+        let mut failed = 0usize;
         for route in &self.routes {
             match route.repo.list_memories(scope).await {
                 Ok(memories) => all_memories.extend(
@@ -340,12 +377,25 @@ impl RepoRouter {
                         .filter(|m| self.owns_scope(&route.repo, &m.metadata.scope)),
                 ),
                 Err(e) => {
+                    failed += 1;
                     warn!(
                         scope = %route.prefix,
                         error = %e,
                         "list_memories: failed to list from scope-specific repo; skipping"
                     );
                 }
+            }
+        }
+        // Settle aggregate git health once from the complete outcome
+        // (#293 review, round 4). The per-operation reports are
+        // last-operation-wins: a skipped failing route followed by a clean
+        // repo would turn readiness green while a scope's memories are
+        // missing from the aggregate.
+        if let Some(reporter) = &self.git_reporter {
+            if failed == 0 {
+                reporter.report_ok();
+            } else {
+                reporter.report_err("one or more scope-specific repos failed to list");
             }
         }
         Ok(all_memories)
@@ -622,6 +672,7 @@ mod tests {
                 branch: None,
             }],
             sync_reporter: None,
+            git_reporter: None,
         };
 
         // Root goes to default.
@@ -686,6 +737,7 @@ mod tests {
             default_repo: Arc::clone(&default_repo),
             routes,
             sync_reporter: None,
+            git_reporter: None,
         };
 
         // "org/team" matches the longer prefix.
@@ -718,6 +770,7 @@ mod tests {
                 branch: Some("develop".to_string()),
             }],
             sync_reporter: None,
+            git_reporter: None,
         };
 
         assert_eq!(router.branch_for_scope(&Scope::Root, "main"), "main");
@@ -741,6 +794,7 @@ mod tests {
                 branch: None,
             }],
             sync_reporter: None,
+            git_reporter: None,
         };
 
         let root = Memory::from_validated(
@@ -797,6 +851,7 @@ mod tests {
                 branch: None,
             }],
             sync_reporter: None,
+            git_reporter: None,
         };
         (router, default_repo, work_repo)
     }
@@ -1110,6 +1165,231 @@ mod tests {
         assert!(
             health.sync.load().healthy,
             "a fully clean sync must settle the reporter healthy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Repo-path collisions (#293 review, round 4)
+    //
+    // Two routes — or a route and the default repo — resolving to the same
+    // physical location open one repo under separate mutexes, and the later
+    // init rewrites `origin`, so nominally isolated scopes share a tree and
+    // push to the last-configured remote. Construction must reject every
+    // colliding spelling: explicit duplicates, symlink aliases, and paths
+    // aliasing the default repo.
+    // -----------------------------------------------------------------------
+
+    fn mapping_at(scope: &str, path: &std::path::Path) -> crate::config::RemoteMapping {
+        crate::config::RemoteMapping {
+            scope: scope.to_string(),
+            url: format!("https://example.com/{}.git", scope.replace('/', "-")),
+            path: Some(path.display().to_string()),
+            branch: None,
+        }
+    }
+
+    fn expect_collision(result: Result<RepoRouter, MemoryError>, case: &str) {
+        match result {
+            Err(MemoryError::InvalidInput { reason }) => {
+                assert!(
+                    reason.contains("collision"),
+                    "{case}: error must name the collision: {reason}"
+                );
+            }
+            Err(other) => panic!("{case}: must fail as InvalidInput: {other:?}"),
+            Ok(_) => panic!("{case}: colliding repo paths must be rejected at construction"),
+        }
+    }
+
+    #[test]
+    fn from_config_rejects_explicit_path_collision() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo = test_repo(&default_dir);
+        let shared_dir = tempfile::tempdir().unwrap();
+        let health = crate::health::HealthRegistry::new();
+
+        let mappings = vec![
+            mapping_at("work", shared_dir.path()),
+            mapping_at("play", shared_dir.path()),
+        ];
+        expect_collision(
+            RepoRouter::from_config(default_repo, &mappings, &health.git, &health.sync),
+            "two scopes with the same explicit path",
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_mapped_path_aliasing_default_repo() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo = test_repo(&default_dir);
+        let health = crate::health::HealthRegistry::new();
+
+        let mappings = vec![mapping_at("work", default_dir.path())];
+        expect_collision(
+            RepoRouter::from_config(default_repo, &mappings, &health.git, &health.sync),
+            "a mapped path equal to the default repo",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_config_rejects_symlink_alias_collision() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo = test_repo(&default_dir);
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = base.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let health = crate::health::HealthRegistry::new();
+
+        let mappings = vec![mapping_at("work", &real), mapping_at("play", &alias)];
+        expect_collision(
+            RepoRouter::from_config(default_repo, &mappings, &health.git, &health.sync),
+            "a symlink alias of an already-claimed path",
+        );
+    }
+
+    #[test]
+    fn from_config_accepts_distinct_paths() {
+        // Guard against the collision check over-rejecting: distinct
+        // physical locations must still construct.
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo = test_repo(&default_dir);
+        let work_dir = tempfile::tempdir().unwrap();
+        let play_dir = tempfile::tempdir().unwrap();
+        let health = crate::health::HealthRegistry::new();
+
+        let mappings = vec![
+            mapping_at("work", work_dir.path()),
+            mapping_at("play", play_dir.path()),
+        ];
+        RepoRouter::from_config(default_repo, &mappings, &health.git, &health.sync)
+            .expect("distinct repo paths must construct");
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential redaction in router-init logging (#293 review, round 4)
+    //
+    // `from_config` logged the raw mapping URL at INFO, so credential-bearing
+    // HTTPS userinfo bypassed the `redact_url` guard that repo-level logging
+    // already applies.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_config_logs_redact_mapped_credentials() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo = test_repo(&default_dir);
+        let work_dir = tempfile::tempdir().unwrap();
+        let health = crate::health::HealthRegistry::new();
+        let mapping = crate::config::RemoteMapping {
+            scope: "work".to_string(),
+            url: "https://user:ghp_supersecret123@example.com/org/repo.git".to_string(),
+            path: Some(work_dir.path().display().to_string()),
+            branch: None,
+        };
+
+        let logs = crate::test_log::capture_info_logs(|| {
+            RepoRouter::from_config(
+                default_repo,
+                std::slice::from_ref(&mapping),
+                &health.git,
+                &health.sync,
+            )
+            .expect("router must construct");
+        });
+
+        assert!(
+            !logs.contains("ghp_supersecret123"),
+            "the credential must never reach the logs: {logs}"
+        );
+        assert!(
+            logs.contains("[REDACTED]"),
+            "the remote URL must still be logged in redacted form: {logs}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate git health (#293 review, round 4)
+    //
+    // All repos share one git reporter, and each repo reports per operation.
+    // In the skip-and-continue aggregate `list_memories`, a failed route
+    // followed by a clean repo left the shared reporter healthy while a
+    // scope's memories were missing from the aggregate. The router must
+    // settle git health once from the complete outcome, mirroring the
+    // round-3 `sync_all` treatment.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn aggregate_list_git_health_reflects_failed_route_not_last_operation() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let broken_dir = tempfile::tempdir().unwrap();
+        let ok_dir = tempfile::tempdir().unwrap();
+        let health = crate::health::HealthRegistry::new();
+        let shared_repo = |dir: &tempfile::TempDir| {
+            Arc::new(
+                MemoryRepo::init_or_open_with_reporter(
+                    dir.path(),
+                    None,
+                    health.git.clone(),
+                    health.sync.clone(),
+                )
+                .unwrap(),
+            )
+        };
+        let default_repo = shared_repo(&default_dir);
+        let broken_repo = shared_repo(&broken_dir);
+        let ok_repo = shared_repo(&ok_dir);
+
+        // Sabotage the broken repo: a regular file where the `projects`
+        // directory belongs makes the unscoped list fail (read_dir on a
+        // file), independent of filesystem permissions.
+        let sabotage = broken_dir.path().join("projects");
+        std::fs::write(&sabotage, "not a directory").unwrap();
+
+        // Order matters: the broken route lists BEFORE the ok route, so the
+        // last per-operation report is the ok route's clean list.
+        let router = RepoRouter {
+            default_repo,
+            routes: vec![
+                ScopeRoute {
+                    prefix: "broken".to_string(),
+                    repo: broken_repo,
+                    branch: None,
+                },
+                ScopeRoute {
+                    prefix: "okay".to_string(),
+                    repo: ok_repo,
+                    branch: None,
+                },
+            ],
+            sync_reporter: None,
+            git_reporter: Some(health.git.clone()),
+        };
+
+        // The aggregate itself succeeds (skip-and-continue is intentional) …
+        router
+            .list_memories(None)
+            .await
+            .expect("aggregate list skips the failed route");
+        // … but readiness must reflect the skipped repo, not the clean
+        // operation that happened to run last.
+        assert!(
+            !health.git.load().healthy,
+            "git health must reflect the failed route, not the last \
+             repo's clean list"
+        );
+
+        // Once the failed route recovers, the next aggregate settles the
+        // reporter healthy again.
+        std::fs::remove_file(&sabotage).unwrap();
+        router
+            .list_memories(None)
+            .await
+            .expect("repaired aggregate list succeeds");
+        assert!(
+            health.git.load().healthy,
+            "a fully clean aggregate must settle the reporter healthy"
         );
     }
 }

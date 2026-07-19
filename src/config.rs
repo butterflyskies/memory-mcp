@@ -22,7 +22,8 @@ pub struct RemoteMapping {
     /// Git remote URL for this scope's repo.
     pub url: String,
     /// Local path for the git repo. Supports `~` expansion.
-    /// Defaults to `~/.memory-mcp-{scope}` if omitted.
+    /// Defaults to `~/.memory-mcp-{scope}` if omitted, with `/` in the scope
+    /// encoded as `%2F` so distinct scopes always default to distinct paths.
     pub path: Option<String>,
     /// Branch name for push/pull. Defaults to the server-wide branch if omitted.
     pub branch: Option<String>,
@@ -114,7 +115,12 @@ impl RemoteMapping {
                 let home = dirs::home_dir().ok_or_else(|| {
                     MemoryError::Internal("could not determine home directory".into())
                 })?;
-                let dir_name = format!(".memory-mcp-{}", self.scope.replace('/', "-"));
+                // Encode `/` as `%2F`. Scope components cannot contain `%`,
+                // so this is injective: mapping `/` to `-` made the scopes
+                // `org/team` and `org-team` collide on the same default path
+                // — and therefore the same physical repo (#293 review,
+                // round 4).
+                let dir_name = format!(".memory-mcp-{}", self.scope.replace('/', "%2F"));
                 Ok(home.join(dir_name))
             }
         }
@@ -183,7 +189,7 @@ url = "git@github.com:org/team-memories.git"
     }
 
     #[test]
-    fn default_path_replaces_slashes() {
+    fn default_path_encodes_slashes() {
         let mapping = RemoteMapping {
             scope: "org/team".to_string(),
             url: "https://example.com/repo.git".to_string(),
@@ -192,7 +198,26 @@ url = "git@github.com:org/team-memories.git"
         };
         let resolved = mapping.resolved_path().unwrap();
         let home = dirs::home_dir().unwrap();
-        assert_eq!(resolved, home.join(".memory-mcp-org-team"));
+        assert_eq!(resolved, home.join(".memory-mcp-org%2Fteam"));
+    }
+
+    /// Default path encoding must be injective (#293 review, round 4):
+    /// mapping `/` to `-` sent the scopes `org/team` and `org-team` to the
+    /// same default path, so two nominally isolated scopes shared one
+    /// physical repo under separate mutexes.
+    #[test]
+    fn default_paths_distinguish_slash_from_dash_scopes() {
+        let path_for = |scope: &str| {
+            RemoteMapping {
+                scope: scope.to_string(),
+                url: "https://example.com/repo.git".to_string(),
+                path: None,
+                branch: None,
+            }
+            .resolved_path()
+            .unwrap()
+        };
+        assert_ne!(path_for("org/team"), path_for("org-team"));
     }
 
     #[test]

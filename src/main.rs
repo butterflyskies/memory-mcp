@@ -602,12 +602,15 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Mark git as healthy — if we reached this point, git init/open succeeded.
-    health.git.report_ok();
-    // Only mark embedding and vector_index healthy if the reindex succeeded or
-    // was skipped (SHA matched). If the reindex had errors, the subsystems have
-    // already reported their own state via their reporters.
+    // Only mark subsystems healthy if the reindex succeeded or was skipped
+    // (SHA matched). If the reindex had errors, the subsystems have already
+    // reported their own state via their reporters — an unconditional
+    // `health.git.report_ok()` here erased a strict-list/reindex repo
+    // failure recorded during the rebuild (#293 review, round 4). Git
+    // init/open succeeding earlier is not evidence that every repo listed
+    // cleanly.
     if reindex_ok {
+        health.git.report_ok();
         health.embedding.report_ok();
         health.vector_index.report_ok();
     }
