@@ -600,6 +600,11 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let auth = AuthProvider::new();
 
+    // Tracks whether the vector index verifiably mirrors git truth at startup.
+    // A reindex that did not complete cleanly is a gap only the next full
+    // reindex closes, so SHA advancement must stay blocked for this process.
+    let mut startup_mirror_gap = !reindex_ok;
+
     // When --require-remote-sync is set, perform an initial pull so the sync
     // reporter starts with a known state (and the local repo is up-to-date).
     if args.require_remote_sync && remote_url.is_some() {
@@ -607,6 +612,17 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         match repo.pull(&auth, &args.branch).await {
             Ok(result) => {
                 info!(?result, "initial pull completed");
+                if matches!(
+                    result,
+                    memory_mcp::types::PullResult::FastForward { .. }
+                        | memory_mcp::types::PullResult::Merged { .. }
+                ) {
+                    // The pull moved git HEAD past the SHA the index was just
+                    // verified against without mirroring the pulled changes.
+                    // Block SHA advancement so the next startup reindexes them
+                    // instead of a later stamp hiding the gap.
+                    startup_mirror_gap = true;
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "initial pull failed — sync reporter will show degraded");
@@ -649,6 +665,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         health,
         recall_log,
     ));
+    if startup_mirror_gap {
+        state.mark_index_mirror_incomplete();
+    }
 
     // Populate the lexical (BM25) index. It lives in RAM only — indexing
     // text is cheap, unlike embedding it — so it is rebuilt from the repo on
@@ -754,13 +773,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         .await
         .context("server error")?;
 
-    // Persist the scoped vector index so the next startup can skip a full reindex.
-    std::fs::create_dir_all(&index_dir)
-        .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
-    if let Some(sha) = state_for_shutdown.router.head_sha().await {
-        state_for_shutdown.index.set_commit_sha(Some(&sha));
-    }
-    if let Err(e) = state_for_shutdown.index.save(&index_dir) {
+    // Persist the scoped vector index so the next startup can skip a full
+    // reindex. The stored SHA only advances when the in-process mirror is
+    // intact — a recorded mirror gap keeps the last verified SHA so the next
+    // startup rebuilds from git truth.
+    if let Err(e) =
+        memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
+    {
         tracing::warn!("failed to persist vector index on shutdown: {}", e);
     } else {
         info!("vector index saved to {}", index_dir.display());

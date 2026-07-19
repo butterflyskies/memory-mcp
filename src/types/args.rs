@@ -402,6 +402,17 @@ pub struct AppState {
     pub health: HealthRegistry,
     /// Optional append-only recall event log for threshold calibration.
     pub recall_log: Option<Arc<crate::recall_log::RecallLog>>,
+    /// `true` while every git HEAD advance since the vector index's stored
+    /// commit SHA has been fully mirrored into the vector index.
+    ///
+    /// Cleared — sticky for the process lifetime — when a mirror gap opens
+    /// that only a full reindex can close: post-pull change discovery fails,
+    /// pulled files cannot be resolved, an incremental reindex fails
+    /// completely, or the startup reindex did not complete cleanly. While
+    /// cleared, composite-SHA advancement is refused at both sync and
+    /// shutdown, so the next startup detects the SHA mismatch and rebuilds
+    /// the vector index from git truth.
+    index_mirror_intact: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -426,6 +437,7 @@ impl AppState {
             branch,
             health,
             recall_log,
+            index_mirror_intact: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -455,7 +467,23 @@ impl AppState {
             branch,
             health,
             recall_log,
+            index_mirror_intact: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Record that the vector index has a mirror gap only a full reindex can
+    /// close, blocking composite-SHA advancement for the rest of the process
+    /// lifetime (see [`AppState::index_mirror_is_intact`]).
+    pub fn mark_index_mirror_incomplete(&self) {
+        self.index_mirror_intact
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// `true` when the vector index mirror has no known gap and composite-SHA
+    /// advancement is allowed.
+    pub fn index_mirror_is_intact(&self) -> bool {
+        self.index_mirror_intact
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

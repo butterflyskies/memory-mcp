@@ -627,6 +627,12 @@ async fn incremental_reindex(
 /// SHA — the next startup reindexes from git truth instead of trusting a
 /// partial mirror. The SHA is also held back when every reindex attempt
 /// failed, so the next startup retries.
+///
+/// The refusal is sticky (#293 review, round 2): once a mirror gap opens,
+/// [`AppState::mark_index_mirror_incomplete`] blocks SHA advancement for the
+/// rest of the process — including later syncs whose own mirrors complete,
+/// since they cannot backfill an earlier sync's unmirrored range — and the
+/// shutdown persistence path honours the same flag.
 async fn mirror_sync_results(
     state: &Arc<AppState>,
     sync_result: &MultiSyncResult,
@@ -678,7 +684,14 @@ async fn mirror_sync_results(
         && total_reindex.added == 0
         && total_reindex.updated == 0
         && total_reindex.errors > 0;
-    if !mirror_incomplete && !reindex_failed_completely {
+    if mirror_incomplete || reindex_failed_completely {
+        // Sticky for the process lifetime: a later complete sync only
+        // mirrors its own pulled range and cannot backfill this gap, so it
+        // must not advance the SHA either — only a full reindex (next
+        // startup) closes the gap and re-earns advancement.
+        state.mark_index_mirror_incomplete();
+    }
+    if state.index_mirror_is_intact() {
         if let Some(sha) = state.router.head_sha().await {
             state.index.set_commit_sha(Some(&sha));
         }
@@ -924,6 +937,33 @@ pub async fn full_reindex(
     }
 
     Ok(stats)
+}
+
+/// Persist the vector index at graceful shutdown.
+///
+/// Advances the stored composite SHA to the router's current HEAD only when
+/// the in-process mirror is intact ([`AppState::index_mirror_is_intact`]).
+/// When a mirror gap was recorded — e.g. a sync's post-pull change discovery
+/// failed and the sync mirror refused SHA advancement — the index
+/// keeps the SHA it last legitimately verified, so the next startup sees the
+/// mismatch against git HEAD and rebuilds the vector index from git truth
+/// instead of trusting the incomplete mirror (#293 review, round 2).
+pub async fn persist_index_on_shutdown(
+    state: &AppState,
+    index_dir: &std::path::Path,
+) -> Result<(), MemoryError> {
+    std::fs::create_dir_all(index_dir)?;
+    if state.index_mirror_is_intact() {
+        if let Some(sha) = state.router.head_sha().await {
+            state.index.set_commit_sha(Some(&sha));
+        }
+    } else {
+        info!(
+            stored_sha = ?state.index.commit_sha(),
+            "index mirror incomplete — keeping last verified SHA so the next startup reindexes"
+        );
+    }
+    state.index.save(index_dir)
 }
 
 #[tool_router]
@@ -4269,19 +4309,149 @@ mod tests {
                 "incomplete change discovery must refuse composite-SHA advancement"
             );
 
-            // Contrast: a complete entry advances the SHA, proving the
-            // refusal above came from the incomplete flag, not a missing
-            // head.
+            // Sticky refusal (#293 round 2): a later complete mirror only
+            // covers its own pulled range and cannot backfill the gap left
+            // by the incomplete discovery, so it must not advance the SHA
+            // either — only the next startup's full reindex re-earns it.
             let complete = MultiSyncResult {
                 results: vec![entry(true)],
             };
             let _ = mirror_sync_results(&state, &complete).await;
+            assert_eq!(
+                state.index.commit_sha(),
+                None,
+                "a complete mirror after an earlier gap must keep refusing \
+                 composite-SHA advancement"
+            );
+
+            // Contrast on a gap-free state: a complete entry advances the
+            // SHA, proving the refusals above came from the incomplete
+            // discovery, not a missing head.
+            let fresh_tmp = tempfile::tempdir().expect("tempdir");
+            let fresh = test_state(&fresh_tmp);
+            fresh.repo.save_memory(&memory).await.expect("save");
+            let complete = MultiSyncResult {
+                results: vec![entry(true)],
+            };
+            let _ = mirror_sync_results(&fresh, &complete).await;
+            let expected = fresh.router.head_sha().await;
+            assert!(expected.is_some(), "git truth must yield a head SHA");
+            assert_eq!(
+                fresh.index.commit_sha(),
+                expected,
+                "a complete mirror must advance the composite SHA"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Shutdown persistence vs the incomplete-mirror SHA guard
+        // (#293 review, round 2)
+        //
+        // Graceful shutdown persists the vector index. It must never stamp
+        // the router's current HEAD over a SHA the mirror refused to
+        // advance: doing so would make the next startup see index SHA ==
+        // HEAD and skip the reindex that repairs the incomplete mirror.
+        // -------------------------------------------------------------------
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shutdown_persistence_refuses_unverified_head_stamp() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            let entry = |changes_complete: bool| SyncEntry {
+                label: "default".to_string(),
+                scope: Scope::Root,
+                pull: None,
+                pull_error: None,
+                push_ok: true,
+                push_error: None,
+                changes: None,
+                resolved_changes: None,
+                changes_complete,
+            };
+
+            // Verified state at A: git truth exists and a complete mirror
+            // stamps the composite SHA.
+            let note_a = Memory::from_validated(
+                MemoryName::new("note-a".to_string()).unwrap(),
+                "payload a".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&note_a).await.expect("save a");
+            let complete = MultiSyncResult {
+                results: vec![entry(true)],
+            };
+            let _ = mirror_sync_results(&state, &complete).await;
+            let sha_a = state.index.commit_sha().expect("verified SHA at A");
+
+            // Git advances A → B, but post-pull change discovery for that
+            // range fails: the mirror refuses advancement, SHA stays at A.
+            let note_b = Memory::from_validated(
+                MemoryName::new("note-b".to_string()).unwrap(),
+                "payload b".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&note_b).await.expect("save b");
+            let incomplete = MultiSyncResult {
+                results: vec![entry(false)],
+            };
+            let _ = mirror_sync_results(&state, &incomplete).await;
+            assert_eq!(
+                state.index.commit_sha().as_deref(),
+                Some(sha_a.as_str()),
+                "precondition: the refused advancement must leave the SHA at A"
+            );
+            let head_b = state.router.head_sha().await.expect("git HEAD at B");
+            assert_ne!(head_b, sha_a, "git must have advanced past A");
+
+            // The graceful-shutdown persistence path must keep the verified
+            // SHA rather than stamping the current HEAD.
+            let index_dir = tempfile::tempdir().expect("index dir");
+            persist_index_on_shutdown(&state, index_dir.path())
+                .await
+                .expect("persist");
+            assert_eq!(
+                state.index.commit_sha().as_deref(),
+                Some(sha_a.as_str()),
+                "shutdown must persist only the last verified SHA — stamping \
+                 HEAD would make the next startup skip the repairing reindex"
+            );
+            assert_ne!(
+                state.index.commit_sha(),
+                state.router.head_sha().await,
+                "the persisted SHA must mismatch HEAD so the next startup's \
+                 freshness check triggers a full reindex"
+            );
+        }
+
+        /// The stamp still happens when no mirror gap was recorded: ordinary
+        /// writes advance HEAD while mirroring themselves, and shutdown
+        /// stamping is what lets the next startup skip a redundant reindex.
+        /// Regression guard for over-tightening the shutdown fix.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shutdown_persistence_stamps_head_when_mirror_intact() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            let memory = Memory::from_validated(
+                MemoryName::new("note".to_string()).unwrap(),
+                "payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&memory).await.expect("save");
+            assert_eq!(state.index.commit_sha(), None);
+
+            let index_dir = tempfile::tempdir().expect("index dir");
+            persist_index_on_shutdown(&state, index_dir.path())
+                .await
+                .expect("persist");
             let expected = state.router.head_sha().await;
             assert!(expected.is_some(), "git truth must yield a head SHA");
             assert_eq!(
                 state.index.commit_sha(),
                 expected,
-                "a complete mirror must advance the composite SHA"
+                "an intact mirror must stamp HEAD at shutdown so the next \
+                 startup can skip the reindex"
             );
         }
 
