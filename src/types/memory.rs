@@ -18,7 +18,7 @@ use super::{
 
 /// A validated memory name.
 ///
-/// Wraps a `String` that has been validated by [`ValidatedString::validate`]. Constructing
+/// Wraps a `String` that has been validated by `ValidatedString::validate`. Constructing
 /// a `MemoryName` is the sole path to a valid name — once you hold one, you
 /// can use it as `&str` without re-validation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -331,7 +331,7 @@ impl MemoryRef {
     /// The on-disk file path: `"global/<name>"` or `"projects/<path>/<name>"`.
     ///
     /// Used for file I/O (repo reads/writes). For index/telemetry keys that
-    /// need a stable string, use [`qualified_path`] instead.
+    /// need a stable string, use [`Self::qualified_path`] instead.
     pub fn file_path(&self) -> String {
         format!("{}/{}", self.scope.dir_prefix(), self.name)
     }
@@ -377,11 +377,14 @@ impl fmt::Display for MemoryRef {
 /// unambiguous and is what [`MemoryRef::qualified_path`] produces. All new index
 /// entries use the canonical form.
 ///
-/// **Implications for `incremental_reindex` removals:** if the index contains a
-/// legacy on-disk key for a hierarchical scope (e.g. produced by an older build),
-/// the removal path may compute the wrong canonical key and silently skip the
-/// removal. A full reindex resolves any such stale entries. Hierarchical scopes
-/// are new in this release, so no existing data is affected.
+/// Incremental reindexing never parses on-disk paths: changed memories are
+/// resolved from their frontmatter by `MemoryRepo::diff_changed_refs`
+/// (returning `ResolvedChanges`, the same authority `list_memories` uses), so
+/// this ambiguity is confined to legacy index entries from
+/// pre-hierarchical-scope builds — a full reindex resolves any such stale
+/// entries. The public `MemoryRepo::diff_changed_memories` is a distinct
+/// surface: it returns raw repo paths to preserve the 0.16.0 value contract
+/// and is not the frontmatter-safe incremental-reindex path.
 pub fn parse_qualified_name(qualified: &str) -> Result<MemoryRef, MemoryError> {
     // Versioned canonical key form: "v1:scope=...;name=..."
     // Unversioned form "scope=...;name=..." is also accepted as v1 for backward compat.

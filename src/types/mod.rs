@@ -9,11 +9,14 @@ mod validated;
 // Items that were `pub` remain `pub`; items that were `pub(crate)` are
 // re-exported as `pub(crate)`.
 
+pub(crate) use args::ResolvedChanges;
 pub use args::{
-    AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs, ForgetArgs, ListArgs,
+    AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs, ForgetArgs, ListArgs, ListField,
     MarkAppliedArgs, MoveArgs, PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats,
     RememberArgs, SyncArgs, Verdict, VerdictEntry,
 };
+
+pub(crate) use args::{ListToolArgs, LIST_MAX_LIMIT};
 
 pub use memory::{parse_qualified_name, Memory, MemoryMetadata, MemoryName, MemoryRef};
 
