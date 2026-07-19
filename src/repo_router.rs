@@ -287,16 +287,35 @@ impl RepoRouter {
     // Read operations — aggregate across all repos
     // -----------------------------------------------------------------------
 
+    /// `true` when `repo` is the repo that owns `scope` under the point-read
+    /// routing rules (`repo_for_scope`).
+    fn owns_scope(&self, repo: &Arc<MemoryRepo>, scope: &Scope) -> bool {
+        Arc::ptr_eq(self.repo_for_scope(scope), repo)
+    }
+
     /// List memories across all repos, filtered by scope.
+    ///
+    /// Each repo's results are filtered to the scopes that repo owns under
+    /// the same routing rules as point reads: the default repo owns every
+    /// scope not captured by a mapping, and each mapped repo owns exactly its
+    /// subtree. Without this, a memory stranded in the wrong repo (e.g. a
+    /// pre-existing `work/foo` in the default repo after `work` was mapped
+    /// elsewhere) would appear in listings while `read` reports it not found,
+    /// and duplicate `(scope, name)` keys could corrupt keyset pagination.
     pub async fn list_memories(&self, scope: Option<&Scope>) -> Result<Vec<Memory>, MemoryError> {
         if self.routes.is_empty() {
             return self.default_repo.list_memories(scope).await;
         }
 
         let mut all_memories = self.default_repo.list_memories(scope).await?;
+        all_memories.retain(|m| self.owns_scope(&self.default_repo, &m.metadata.scope));
         for route in &self.routes {
             match route.repo.list_memories(scope).await {
-                Ok(memories) => all_memories.extend(memories),
+                Ok(memories) => all_memories.extend(
+                    memories
+                        .into_iter()
+                        .filter(|m| self.owns_scope(&route.repo, &m.metadata.scope)),
+                ),
                 Err(e) => {
                     warn!(
                         scope = %route.prefix,
@@ -313,10 +332,23 @@ impl RepoRouter {
     ///
     /// Rebuilds use this strict form because accepting a partial aggregate as
     /// git truth would silently erase the missing repo from a derived index.
+    /// Ownership filtering applies here too: a memory stranded in a repo that
+    /// does not own its scope is unreachable through point reads, so derived
+    /// indexes must not serve it either.
     pub async fn list_memories_strict(&self) -> Result<Vec<Memory>, MemoryError> {
         let mut all_memories = self.default_repo.list_memories(None).await?;
+        if !self.routes.is_empty() {
+            all_memories.retain(|m| self.owns_scope(&self.default_repo, &m.metadata.scope));
+        }
         for route in &self.routes {
-            all_memories.extend(route.repo.list_memories(None).await?);
+            all_memories.extend(
+                route
+                    .repo
+                    .list_memories(None)
+                    .await?
+                    .into_iter()
+                    .filter(|m| self.owns_scope(&route.repo, &m.metadata.scope)),
+            );
         }
         Ok(all_memories)
     }
@@ -695,5 +727,170 @@ mod tests {
             .search(&ScopeFilter::All, "mappedneedle", 10)
             .unwrap();
         assert_eq!(mapped_hits[0].0, work.mem_ref().qualified_path());
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate-read ownership (#293 review, round 2)
+    //
+    // Point reads route a scope exclusively to its owning repo; the
+    // aggregate list operations must apply the same ownership rules, or a
+    // memory stranded in the wrong repo (e.g. a pre-existing `work/foo` in
+    // the default repo after `work` was mapped elsewhere) stays listed while
+    // `read` reports it not found, and duplicate `(scope, name)` keys can
+    // corrupt keyset pagination.
+    // -----------------------------------------------------------------------
+
+    /// Build a default+work router and return `(router, default_repo, work_repo)`.
+    fn two_repo_router(
+        default_dir: &tempfile::TempDir,
+        work_dir: &tempfile::TempDir,
+    ) -> (RepoRouter, Arc<MemoryRepo>, Arc<MemoryRepo>) {
+        let default_repo = test_repo(default_dir);
+        let work_repo = test_repo(work_dir);
+        let router = RepoRouter {
+            default_repo: Arc::clone(&default_repo),
+            routes: vec![ScopeRoute {
+                prefix: "work".to_string(),
+                repo: Arc::clone(&work_repo),
+                branch: None,
+            }],
+        };
+        (router, default_repo, work_repo)
+    }
+
+    fn memory_at(scope: &str, name: &str) -> Memory {
+        let scope = if scope.is_empty() {
+            Scope::Root
+        } else {
+            Scope::Path(ScopePath::new(scope).unwrap())
+        };
+        Memory::from_validated(
+            MemoryName::new(name).unwrap(),
+            format!("{name} content"),
+            MemoryMetadata::new(scope, vec![], None),
+        )
+    }
+
+    #[tokio::test]
+    async fn list_excludes_memories_a_repo_does_not_own() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let (router, default_repo, work_repo) = two_repo_router(&default_dir, &work_dir);
+
+        // Stranded: lives in the default repo under a scope the work repo
+        // owns — the pre-existing-before-mapping case.
+        let stranded = memory_at("work/foo", "stranded");
+        default_repo.save_memory(&stranded).await.unwrap();
+        // Stranded the other way: lives in the work repo under a scope the
+        // default repo owns.
+        let misplaced = memory_at("personal", "misplaced");
+        work_repo.save_memory(&misplaced).await.unwrap();
+        // Owned memories stay visible.
+        let owned_work = memory_at("work/foo", "owned-work");
+        router.save_memory(&owned_work).await.unwrap();
+        let owned_default = memory_at("personal", "owned-default");
+        router.save_memory(&owned_default).await.unwrap();
+
+        let names = |memories: &[Memory]| {
+            let mut names: Vec<String> = memories
+                .iter()
+                .map(|m| m.name.as_str().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let listed = router.list_memories(None).await.unwrap();
+        assert_eq!(
+            names(&listed),
+            vec!["owned-default", "owned-work"],
+            "aggregate list must exclude memories the holding repo does not own"
+        );
+        let strict = router.list_memories_strict().await.unwrap();
+        assert_eq!(
+            names(&strict),
+            vec!["owned-default", "owned-work"],
+            "strict aggregate must apply the same ownership filter"
+        );
+
+        // Coherence receipt: the excluded entries are exactly the ones point
+        // reads cannot serve.
+        let stranded_read = router
+            .read_memory("stranded", &stranded.metadata.scope)
+            .await;
+        assert!(
+            matches!(stranded_read, Err(MemoryError::NotFound { .. })),
+            "read must not find the stranded memory: {stranded_read:?}"
+        );
+        let misplaced_read = router
+            .read_memory("misplaced", &misplaced.metadata.scope)
+            .await;
+        assert!(
+            matches!(misplaced_read, Err(MemoryError::NotFound { .. })),
+            "read must not find the misplaced memory: {misplaced_read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_yields_unique_scope_name_keys_when_both_repos_hold_the_key() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let (router, default_repo, _work_repo) = two_repo_router(&default_dir, &work_dir);
+
+        // Same (scope, name) in both repos: the owner's copy must win and
+        // the aggregate must not contain duplicate keys that would break
+        // keyset pagination.
+        let shadowed = Memory::from_validated(
+            MemoryName::new("dup").unwrap(),
+            "default copy".to_string(),
+            MemoryMetadata::new(Scope::Path(ScopePath::new("work").unwrap()), vec![], None),
+        );
+        default_repo.save_memory(&shadowed).await.unwrap();
+        let owned = Memory::from_validated(
+            MemoryName::new("dup").unwrap(),
+            "work copy".to_string(),
+            MemoryMetadata::new(Scope::Path(ScopePath::new("work").unwrap()), vec![], None),
+        );
+        router.save_memory(&owned).await.unwrap();
+
+        let listed = router.list_memories(None).await.unwrap();
+        let dups: Vec<&Memory> = listed
+            .iter()
+            .filter(|m| m.mem_ref().qualified_path() == owned.mem_ref().qualified_path())
+            .collect();
+        assert_eq!(
+            dups.len(),
+            1,
+            "aggregate must contain exactly one entry per (scope, name) key"
+        );
+        assert_eq!(
+            dups[0].content, "work copy",
+            "the owning repo's copy must be the one listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_default_scopes_unaffected_by_ownership_filter() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let (router, _default_repo, _work_repo) = two_repo_router(&default_dir, &work_dir);
+
+        let root = memory_at("", "root-note");
+        router.save_memory(&root).await.unwrap();
+        let personal = memory_at("personal", "personal-note");
+        router.save_memory(&personal).await.unwrap();
+        let work = memory_at("work", "work-note");
+        router.save_memory(&work).await.unwrap();
+
+        let all = router.list_memories(None).await.unwrap();
+        assert_eq!(all.len(), 3, "normally-routed memories must all be listed");
+
+        let root_only = router.list_memories(Some(&Scope::Root)).await.unwrap();
+        let names: Vec<&str> = root_only.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["root-note"],
+            "root-scope listing must be unaffected"
+        );
     }
 }
