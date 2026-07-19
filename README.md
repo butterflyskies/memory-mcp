@@ -134,6 +134,8 @@ Significant choices and their trade-offs live in the
 - [Configuration](docs/configuration.md) — server flags, environment variables,
   authentication, and health endpoints
 - [Deployment](docs/deployment.md) — containers and Kubernetes
+- [Security](docs/security.md) — trust boundaries, credential handling,
+  hardened deployment, and supply-chain controls
 - [Architecture](docs/architecture.md) — storage, retrieval, sync, and
   operational boundaries
 - [Documentation map](docs/README.md) — guides, architecture, and contributor

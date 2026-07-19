@@ -43,6 +43,14 @@ content.
 The Markdown repository remains authoritative. Indexes are rebuilt or updated
 from repository state rather than becoming another memory store.
 
+The lexical index is rebuilt from the repository at startup, and later git
+mutations are mirrored into it. Those mirrors follow a complete-or-degraded
+contract. A failed or interrupted mirror is never served as current: recall
+temporarily falls back to semantic-only results while a single-flight
+background repair rebuilds the lexical index from git truth. Repair is also
+retried after startup rebuild failures and when recall observes degradation.
+Lexical degradation does not gate readiness.
+
 ## Scopes
 
 `global` is the root namespace. Bare paths such as `project` and

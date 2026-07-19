@@ -1,6 +1,6 @@
 # MCP tool reference
 
-memory-mcp exposes twelve tools. Tool schemas returned during MCP discovery are
+memory-mcp exposes eleven tools. Tool schemas returned during MCP discovery are
 the authoritative machine-readable contract; this page explains how the tools
 fit together.
 
@@ -17,6 +17,19 @@ fit together.
 
 Memory names may contain up to three path components. Names and scopes are
 validated before they become filesystem paths.
+
+### `list`
+
+`list` returns a bounded page of summaries sorted by scope and name. `limit`
+defaults to 50 and accepts values from 1 through 100. When `has_more` is true,
+pass the opaque `next_cursor` into the next request with the same scope. The
+response distinguishes `count` (all matching memories) from `returned` (this
+page). Cursors use keyset semantics, so concurrent inserts or deletes can change
+later pages without invalidating the cursor.
+
+Use `fields` to request an exact summary projection. Omitting it returns `id`,
+`name`, `scope`, `tags`, `created_at`, and `updated_at`. Each successful page is
+capped at 24 KiB; request fewer fields if a summary is too large.
 
 ## Retrieval
 
@@ -43,6 +56,11 @@ The ranked lists are merged with reciprocal rank fusion. A result includes:
 
 Lower non-negative distances are more similar. Do not interpret `-1.0` as a
 high-confidence semantic match; it means the result had no embedding distance.
+
+If a lexical-index update fails or is interrupted, memory-mcp marks that
+derived index degraded rather than serving stale keyword results. Recall
+continues with semantic-only results while a single-flight background repair
+rebuilds the lexical index from the git-backed source of truth.
 
 ## Scopes
 

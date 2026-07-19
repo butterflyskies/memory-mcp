@@ -1,5 +1,8 @@
 # Deployment
 
+For the deployment trust boundary and hardening controls, see
+[Security](security.md).
+
 ## Quick start (any Kubernetes cluster)
 
 The manifests in `deploy/k8s/` are generic and work on any cluster.

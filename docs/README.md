@@ -14,6 +14,8 @@ first success.
 - [Configuration](configuration.md) — server flags, environment variables,
   authentication, model settings, and health endpoints
 - [Deployment](deployment.md) — run the container image or deploy to Kubernetes
+- [Security](security.md) — trust boundaries, credentials, container hardening,
+  and supply-chain controls
 
 ## Understand and change memory-mcp
 
