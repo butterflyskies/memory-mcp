@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Added
+
+- **Chunk-addressable retrieval contract** (#262 slice 1, ADR-0042): typed identity and wire shapes for fact-level retrieval units — deterministic `FactId` (parent id + chunker version + source span + content digest, canonical `fact:v1:...` string form), validated non-empty UTF-8 `SourceSpan`, `ChunkerVersion`, catalog `FactRecord`, and the additive `MatchedChunk` recall provenance shape. Contract only — no behavioral wiring; the deterministic chunker, derived catalog, chunk indexes, and response wiring land in later slices. `MemoryRef` gains strict `Serialize`/`Deserialize` support for shapes that embed a parent reference. Existing whole-memory retrieval is unchanged. ADR-0042 carries the #262 invariant ledger (each invariant mapped to enforcement, test, and owning slice) and the index-persistence posture; `proptest` lands as a dev-dependency seeding the repository's property-based-testing layer (serde round-trip totality, canonical-form totality, span validity, and collision-resistance evidence over generated inputs).
+
 ## [0.17.0] - 2026-07-19
 
 ### Behavior changes — read before upgrading

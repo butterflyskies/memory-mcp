@@ -1,6 +1,7 @@
 //! Domain types: memories, scopes, metadata, validation, and application state.
 
 mod args;
+mod chunk;
 mod memory;
 mod scope;
 mod validated;
@@ -17,6 +18,8 @@ pub use args::{
 };
 
 pub(crate) use args::{ListToolArgs, LIST_MAX_LIMIT};
+
+pub use chunk::{ChunkerVersion, FactId, FactRecord, MatchedChunk, SourceSpan};
 
 pub use memory::{parse_qualified_name, Memory, MemoryMetadata, MemoryName, MemoryRef};
 
