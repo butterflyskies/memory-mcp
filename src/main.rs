@@ -178,8 +178,10 @@ struct ServeArgs {
     #[command(flatten)]
     embed: EmbedArgs,
 
-    /// Enable OTLP span export. The server will crash on startup if the
-    /// collector is unreachable. Use --otlp-optional for graceful fallback.
+    /// Enable OTLP span export. Startup fails fast if the collector is not
+    /// reachable (TCP probe, 5s timeout); outages after startup are handled
+    /// by the batch exporter as usual. Use --otlp-optional for graceful
+    /// fallback.
     #[cfg(feature = "otlp")]
     #[arg(long, default_value_t = false, env = "MEMORY_MCP_OTLP_REQUIRED")]
     otlp_required: bool,
@@ -268,14 +270,135 @@ fn init_tracing_fmt_only() {
         .init();
 }
 
+/// Timeout for the startup OTLP reachability probe.
+#[cfg(feature = "otlp")]
+const OTLP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Default OTLP gRPC endpoint per the OpenTelemetry specification.
+#[cfg(feature = "otlp")]
+const OTLP_DEFAULT_ENDPOINT: &str = "http://localhost:4317";
+
+/// Default OTLP gRPC port, used when the configured endpoint omits one.
+#[cfg(feature = "otlp")]
+const OTLP_DEFAULT_PORT: u16 = 4317;
+
+/// Resolve the OTLP endpoint the tonic exporter will target, mirroring its
+/// environment lookup: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` takes precedence
+/// over `OTEL_EXPORTER_OTLP_ENDPOINT`; both fall back to the spec default.
+/// Empty values are treated as unset.
+#[cfg(feature = "otlp")]
+fn resolve_otlp_endpoint(traces_endpoint: Option<&str>, general_endpoint: Option<&str>) -> String {
+    traces_endpoint
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| general_endpoint.filter(|s| !s.trim().is_empty()))
+        .unwrap_or(OTLP_DEFAULT_ENDPOINT)
+        .to_owned()
+}
+
+/// Parse an OTLP endpoint URL into a `(host, port)` pair for the TCP probe.
+/// Accepts `http://host:port`, `https://host:port`, and bare `host:port`
+/// forms, with or without a trailing path; the port defaults to 4317.
+#[cfg(feature = "otlp")]
+fn parse_otlp_endpoint(endpoint: &str) -> Result<(String, u16), String> {
+    let rest = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    // Drop any path component.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return Err(format!("endpoint '{endpoint}' has no host"));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let port: u16 = port
+                .parse()
+                .map_err(|_| format!("endpoint '{endpoint}' has an invalid port '{port}'"))?;
+            if host.is_empty() {
+                return Err(format!("endpoint '{endpoint}' has no host"));
+            }
+            Ok((host.to_owned(), port))
+        }
+        None => Ok((authority.to_owned(), OTLP_DEFAULT_PORT)),
+    }
+}
+
+/// Probe the OTLP collector endpoint with a bounded-timeout TCP connect.
+///
+/// Returns `Ok(())` when a TCP connection can be established, `Err` with a
+/// human-readable reason otherwise. This is a reachability check only — it
+/// does not validate that the listener speaks OTLP/gRPC.
+#[cfg(feature = "otlp")]
+fn probe_otlp_endpoint(endpoint: &str, timeout: std::time::Duration) -> Result<(), String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let (host, port) = parse_otlp_endpoint(endpoint)?;
+    let addrs: Vec<_> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("failed to resolve '{host}:{port}': {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("'{host}:{port}' resolved to no addresses"));
+    }
+    let mut last_err = String::new();
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(_) => return Ok(()),
+            Err(e) => last_err = format!("connect to {addr} failed: {e}"),
+        }
+    }
+    Err(last_err)
+}
+
+/// Startup gate for `--otlp-required`: probe the resolved collector endpoint
+/// and fail if it is unreachable. When `otlp_required` is false (including
+/// the `--otlp-optional` path) no probe is performed and the exporter stays
+/// fully lazy.
+///
+/// "Required" means *reachable at startup*, not guaranteed forever: once the
+/// probe passes, later collector outages surface as batch-exporter errors per
+/// normal OTLP semantics and do not stop the server.
+#[cfg(feature = "otlp")]
+fn otlp_startup_probe(
+    otlp_required: bool,
+    traces_endpoint: Option<&str>,
+    general_endpoint: Option<&str>,
+) -> Result<(), String> {
+    if !otlp_required {
+        return Ok(());
+    }
+    let endpoint = resolve_otlp_endpoint(traces_endpoint, general_endpoint);
+    probe_otlp_endpoint(&endpoint, OTLP_PROBE_TIMEOUT)
+        .map_err(|e| format!("OTLP collector unreachable at {endpoint}: {e}"))
+}
+
 /// Initialise tracing for the serve command. If `--otlp-required` or
 /// `--otlp-optional` is set, activates OTLP export. Otherwise uses fmt-only
 /// (passive — the feature is compiled in but not activated).
+///
+/// With `--otlp-required`, the collector endpoint is probed eagerly (TCP
+/// connect, bounded timeout) and the process exits non-zero when it is
+/// unreachable — before the server binds or serves.
 #[cfg(feature = "otlp")]
 fn init_tracing_for_serve(args: &ServeArgs) -> Option<OtlpProvider> {
     if !args.otlp_required && !args.otlp_optional {
         init_tracing_fmt_only();
         return None;
+    }
+
+    if let Err(e) = otlp_startup_probe(
+        args.otlp_required,
+        std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            .ok()
+            .as_deref(),
+        std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().as_deref(),
+    ) {
+        eprintln!(
+            "error: {e}\n\
+             Hint: start the collector, fix OTEL_EXPORTER_OTLP_ENDPOINT, or pass \
+             --otlp-optional to fall back to fmt-only logging."
+        );
+        std::process::exit(1);
     }
 
     use opentelemetry_otlp::SpanExporter;
@@ -1119,6 +1242,109 @@ mod tests {
             Some(Command::Serve(args)) => assert_eq!(args.max_session_lifetime_secs, 86400),
             _ => panic!("expected Serve command"),
         }
+    }
+
+    /// Regression: `--otlp-required` with an unreachable collector must fail
+    /// the startup probe (previously the lazy tonic exporter let the server
+    /// start and errors only surfaced on the first export attempt).
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_required_dead_endpoint_fails_probe() {
+        // Bind an ephemeral port, then drop the listener so the port is closed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let result = otlp_startup_probe(true, None, Some(&endpoint));
+        let err = result.expect_err("probe against a closed port must fail");
+        assert!(
+            err.contains(&endpoint),
+            "error should name the endpoint: {err}"
+        );
+    }
+
+    /// `--otlp-required` with a reachable collector proceeds past the probe.
+    /// A bare TCP listener is enough — the probe checks reachability, not
+    /// OTLP protocol conformance.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_required_live_endpoint_passes_probe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        otlp_startup_probe(true, None, Some(&endpoint))
+            .expect("probe against a live listener must pass");
+    }
+
+    /// Without `--otlp-required` (including the `--otlp-optional` path) no
+    /// probe runs: a dead endpoint must not block startup.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_not_required_skips_probe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        otlp_startup_probe(false, None, Some(&endpoint))
+            .expect("no probe should run when otlp is not required");
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_resolve_otlp_endpoint_default() {
+        assert_eq!(resolve_otlp_endpoint(None, None), OTLP_DEFAULT_ENDPOINT);
+        // Empty values are treated as unset.
+        assert_eq!(
+            resolve_otlp_endpoint(Some(""), Some("  ")),
+            OTLP_DEFAULT_ENDPOINT
+        );
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_resolve_otlp_endpoint_traces_takes_precedence() {
+        assert_eq!(
+            resolve_otlp_endpoint(Some("http://traces:4317"), Some("http://general:4317")),
+            "http://traces:4317"
+        );
+        assert_eq!(
+            resolve_otlp_endpoint(None, Some("http://general:4317")),
+            "http://general:4317"
+        );
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_parse_otlp_endpoint_forms() {
+        assert_eq!(
+            parse_otlp_endpoint("http://localhost:4317").unwrap(),
+            ("localhost".to_owned(), 4317)
+        );
+        assert_eq!(
+            parse_otlp_endpoint("https://collector.example.com:4318/v1/traces").unwrap(),
+            ("collector.example.com".to_owned(), 4318)
+        );
+        assert_eq!(
+            parse_otlp_endpoint("collector:9999").unwrap(),
+            ("collector".to_owned(), 9999)
+        );
+        // Missing port falls back to the OTLP gRPC default.
+        assert_eq!(
+            parse_otlp_endpoint("http://collector").unwrap(),
+            ("collector".to_owned(), OTLP_DEFAULT_PORT)
+        );
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_parse_otlp_endpoint_invalid() {
+        assert!(parse_otlp_endpoint("").is_err());
+        assert!(parse_otlp_endpoint("http://").is_err());
+        assert!(parse_otlp_endpoint("http://host:notaport").is_err());
+        assert!(parse_otlp_endpoint("http://:4317").is_err());
     }
 
     #[cfg(feature = "k8s")]

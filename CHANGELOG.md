@@ -21,9 +21,9 @@
 - Container image now compiles with the `k8s,otlp` feature set (previously `k8s` only). OTLP export stays passive unless activated with `--otlp-required` / `--otlp-optional`.
 - Retain the original public Rust `ListArgs { scope }` DTO for semver compatibility; paginated MCP-only request fields use an internal wire type (#302).
 
-### Known behavior
+### Fixed
 
-- `--otlp-required` does not fail startup when the OTLP collector is merely unreachable: the tonic span exporter constructs lazily, so the server starts normally and connection failures surface later as `BatchSpanProcessor.ExportError` log lines on each export attempt. Startup aborts only when exporter *construction* fails (e.g. a malformed endpoint URL). Verified empirically against a dead endpoint; the CLI help text's "crash on startup if the collector is unreachable" overstates the guarantee. Tracked as a known behavior — not changed in this release.
+- `--otlp-required` now probes collector reachability at startup (TCP connect, 5s timeout) and fails fast with a non-zero exit before serving when the collector is unreachable; previously the lazy tonic exporter let the server start and errors only surfaced on the first export attempt. "Required" means reachable at startup — later outages are handled by the batch exporter per normal OTLP semantics. `--otlp-optional` remains fully lazy.
 
 ### Dependencies
 
