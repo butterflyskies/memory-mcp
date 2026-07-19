@@ -30,6 +30,7 @@ usearch = "2"
 tantivy = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 # Maintained fork of deprecated serde_yaml (dtolnay archived the original).
 serde_yaml_ng = "0.10"
 # Disable default features to trim unused chrono subsystems; clock provides
