@@ -30,16 +30,22 @@ pub fn expand_tilde(path: &str) -> Result<PathBuf, MemoryError> {
 ///
 /// `std::fs::canonicalize` fails when the path does not exist yet, but repo
 /// paths are frequently created only by the init that follows a collision
-/// check. This canonicalizes the deepest existing ancestor (resolving
-/// symlinks) and appends the remaining components, so two spellings of the
-/// same physical location — via symlinks, `.`/`..` segments, or a
-/// not-yet-created tail — resolve to the same value (#293 review, round 4).
+/// check. This canonicalizes the deepest **existing** ancestor of the
+/// unnormalized path — letting the OS resolve symlinks and `..` together —
+/// then appends the genuinely missing components, so two spellings of the
+/// same physical location resolve to the same value (#293 review, rounds
+/// 4–6).
 ///
-/// `.` and `..` components are normalized lexically before canonicalization;
-/// this is sound here because the non-existing tail contains no symlinks to
-/// mis-resolve, and a lexical mismatch only ever rejects a config, never
-/// silently merges two repos.
-pub(crate) fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, MemoryError> {
+/// `..` is never stripped lexically: in `link/../x` where `link` is a
+/// symlink, the `..` resolves against the symlink *target*, so only the
+/// filesystem may interpret a `..` that touches anything existing. A `..`
+/// inside the missing tail has no filesystem meaning yet, so it is rejected
+/// with an error rather than guessed at lexically (#293 review, round 5).
+///
+/// Public because the server binary must canonicalize the default repo path
+/// with the exact same rules *before* opening it, so the opened location and
+/// the router's collision-detection key can never diverge.
+pub fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, MemoryError> {
     use std::path::Component;
 
     let absolute = if path.is_absolute() {
@@ -52,38 +58,40 @@ pub(crate) fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, MemoryE
             .join(path)
     };
 
-    // Lexically normalize `.` and `..` so the ancestor walk below only ever
-    // sees plain named components.
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other),
-        }
-    }
-
-    // Walk up to the deepest existing ancestor, canonicalize it, then
-    // re-append the missing tail.
-    let mut base = normalized.as_path();
+    // Walk up to the deepest existing ancestor of the *unnormalized* path,
+    // canonicalize it, then re-append the missing tail. `..` components in
+    // the existing portion are resolved by `canonicalize` itself; `.` is
+    // identity and is normalized away by `file_name`/`parent`.
+    let mut base = absolute.as_path();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let canonical_base = loop {
         match base.canonicalize() {
             Ok(resolved) => break resolved,
+            // `file_name()` returns `None` when `base` is a bare root or
+            // terminates in `..`. Since `base` failed to canonicalize, a
+            // trailing `..` here sits on top of a non-existent path — there
+            // is no filesystem entry to resolve it against.
             Err(_) => match (base.file_name(), base.parent()) {
                 (Some(name), Some(parent)) => {
                     tail.push(name.to_os_string());
                     base = parent;
                 }
                 _ => {
-                    return Err(MemoryError::InvalidInput {
-                        reason: format!(
-                            "cannot resolve any existing ancestor of path '{}'",
-                            normalized.display()
-                        ),
-                    });
+                    let reason =
+                        if matches!(base.components().next_back(), Some(Component::ParentDir)) {
+                            format!(
+                                "path '{}' uses '..' inside a non-existent segment, which \
+                                 cannot be resolved against the filesystem; spell the path \
+                                 without '..' or create the intermediate directories first",
+                                absolute.display()
+                            )
+                        } else {
+                            format!(
+                                "cannot resolve any existing ancestor of path '{}'",
+                                absolute.display()
+                            )
+                        };
+                    return Err(MemoryError::InvalidInput { reason });
                 }
             },
         }
@@ -306,13 +314,59 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_allow_missing_normalizes_dot_segments() {
+    fn canonicalize_allow_missing_resolves_existing_dot_segments() {
+        // `..` over an *existing* directory is resolved by the filesystem,
+        // and a missing tail may still follow it.
         let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
         let spelled = dir.path().join("a/../b/./c");
         let plain = dir.path().join("b/c");
         assert_eq!(
             canonicalize_allow_missing(&spelled).unwrap(),
             canonicalize_allow_missing(&plain).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonicalize_allow_missing_rejects_dot_dot_in_missing_tail() {
+        // A `..` on top of a non-existent segment has no filesystem meaning;
+        // resolving it lexically would guess. It must be rejected, not
+        // normalized (#293 review, round 5).
+        let dir = tempfile::tempdir().unwrap();
+        let spelled = dir.path().join("missing/../repo");
+        let err = canonicalize_allow_missing(&spelled).unwrap_err();
+        assert!(
+            err.to_string().contains(".."),
+            "error must name the '..' problem: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_allow_missing_resolves_dot_dot_against_symlink_target() {
+        // Syne's round-5 repro: base/link -> else/dir. On a real filesystem
+        // base/link/../repo traverses to else/repo (`..` resolves against
+        // the symlink TARGET); a lexical normalization would answer
+        // base/repo, letting a mapped route at else/repo alias the same
+        // physical repo without tripping collision detection.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let else_dir = tmp.path().join("else");
+        fs::create_dir_all(else_dir.join("dir")).unwrap();
+        fs::create_dir(&base).unwrap();
+        std::os::unix::fs::symlink(else_dir.join("dir"), base.join("link")).unwrap();
+
+        let via_symlink = canonicalize_allow_missing(&base.join("link/../repo")).unwrap();
+        let direct = canonicalize_allow_missing(&else_dir.join("repo")).unwrap();
+        assert_eq!(
+            via_symlink, direct,
+            "`..` after a symlink must resolve against the target"
+        );
+
+        let lexical = canonicalize_allow_missing(&base.join("repo")).unwrap();
+        assert_ne!(
+            via_symlink, lexical,
+            "must not produce the lexical answer base/repo"
         );
     }
 

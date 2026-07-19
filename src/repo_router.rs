@@ -1250,6 +1250,43 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn from_config_rejects_symlink_dot_dot_alias_of_default_repo() {
+        // Syne's round-5 repro: base/link -> else/dir, default repo opened
+        // from the raw spelling base/link/../repo. Real traversal opens
+        // else/repo (`..` resolves against the symlink TARGET), but a
+        // lexical normalization would record base/repo as the collision
+        // key — so a mapped route explicitly targeting else/repo would pass
+        // collision detection, open the same physical repo under a second
+        // mutex, and rewrite its origin. Construction must fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let else_dir = tmp.path().join("else");
+        std::fs::create_dir_all(else_dir.join("dir")).unwrap();
+        std::fs::create_dir(&base).unwrap();
+        std::os::unix::fs::symlink(else_dir.join("dir"), base.join("link")).unwrap();
+
+        // Open the default repo from the raw aliased spelling, as a caller
+        // that skipped canonicalization would.
+        let raw = base.join("link/../repo");
+        let default_repo = Arc::new(MemoryRepo::init_or_open(&raw, None).unwrap());
+        // Precondition for the repro: the raw spelling and the mapped
+        // target are the same physical directory.
+        assert_eq!(
+            std::fs::canonicalize(&raw).unwrap(),
+            std::fs::canonicalize(else_dir.join("repo")).unwrap(),
+            "precondition: raw spelling must traverse to else/repo"
+        );
+        let health = crate::health::HealthRegistry::new();
+
+        let mappings = vec![mapping_at("work", &else_dir.join("repo"))];
+        expect_collision(
+            RepoRouter::from_config(default_repo, &mappings, &health.git, &health.sync),
+            "a symlink+`..` spelling of the default repo",
+        );
+    }
+
     #[test]
     fn from_config_accepts_distinct_paths() {
         // Guard against the collision check over-rejecting: distinct

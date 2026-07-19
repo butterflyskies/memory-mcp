@@ -440,7 +440,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // Expand `~` in repo_path, failing loudly if HOME is not set and the
     // path requires it (i.e. the user did not provide --repo-path explicitly).
+    // Canonicalize BEFORE opening so the location the repo is opened at and
+    // the router's collision-detection key can never diverge (#293 review,
+    // round 5: a symlink-plus-`..` spelling otherwise opens one physical
+    // repo while collision detection records another).
     let repo_path = expand_path(&args.repo_path)?;
+    let repo_path = memory_mcp::fs_util::canonicalize_allow_missing(&repo_path)
+        .context("failed to canonicalize repo path")?;
     info!("repo path: {}", repo_path.display());
 
     // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
