@@ -50,6 +50,9 @@ keyring = { version = "3", features = ["sync-secret-service", "apple-native", "w
 # HTTP TLS stack. json enables reqwest::Response::json() for OAuth device flow.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
+# Deterministic FactId content digests for chunk-addressable retrieval
+# (ADR-0042). Already in the tree transitively; this makes it direct.
+sha2 = "0.10"
 dirs = "6"
 mcp-session = "0.2"
 http = "1"
@@ -98,6 +101,8 @@ libz-sys = { version = "1", features = ["static"] }
 [dev-dependencies]
 git2 = "0.21"
 portpicker = "0.1"
+# Property-based testing for contract invariants (ADR-0042 property ledger).
+proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
