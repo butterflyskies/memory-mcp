@@ -10,6 +10,7 @@ authoritative list.
 |---|---|---|---|
 | `--bind` | `MEMORY_MCP_BIND` | `127.0.0.1:8080` | HTTP listener address |
 | `--repo-path` | `MEMORY_MCP_REPO_PATH` | `~/.memory-mcp` | Git-backed memory repository |
+| `--config` | `MEMORY_MCP_CONFIG` | `~/.config/memory-mcp/config.toml` | TOML config file for per-scope remote mapping; empty string disables config loading |
 | `--mcp-path` | `MEMORY_MCP_PATH` | `/mcp` | Streamable HTTP MCP path |
 | `--remote-url` | `MEMORY_MCP_REMOTE_URL` | unset | Git remote; omit for local-only mode |
 | `--branch` | `MEMORY_MCP_BRANCH` | `main` | Branch used for push and pull |

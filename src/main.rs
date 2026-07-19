@@ -92,6 +92,12 @@ struct ServeArgs {
     #[arg(long, default_value = "~/.memory-mcp", env = "MEMORY_MCP_REPO_PATH")]
     repo_path: String,
 
+    /// Path to the TOML config file for per-scope remote mapping.
+    /// Defaults to `~/.config/memory-mcp/config.toml`. Set to an empty
+    /// string to disable config loading.
+    #[arg(long, env = "MEMORY_MCP_CONFIG")]
+    config: Option<String>,
+
     /// URL path at which the MCP service is mounted.
     #[arg(long, default_value = "/mcp", env = "MEMORY_MCP_PATH")]
     mcp_path: String,
@@ -434,7 +440,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // Expand `~` in repo_path, failing loudly if HOME is not set and the
     // path requires it (i.e. the user did not provide --repo-path explicitly).
+    // Canonicalize BEFORE opening so the location the repo is opened at and
+    // the router's collision-detection key can never diverge (#293 review,
+    // round 5: a symlink-plus-`..` spelling otherwise opens one physical
+    // repo while collision detection records another).
     let repo_path = expand_path(&args.repo_path)?;
+    let repo_path = memory_mcp::fs_util::canonicalize_allow_missing(&repo_path)
+        .context("failed to canonicalize repo path")?;
     info!("repo path: {}", repo_path.display());
 
     // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
@@ -493,6 +505,33 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let repo = Arc::new(repo);
 
+    // Load per-scope remote config and build the repo router.
+    let router = {
+        let config_path = match &args.config {
+            Some(p) if p.is_empty() => None,
+            Some(p) => Some(expand_path(p)?),
+            None => memory_mcp::config::Config::resolve_path().ok(),
+        };
+
+        if let Some(ref path) = config_path {
+            let config = memory_mcp::config::Config::load(path)
+                .with_context(|| format!("failed to load config from {}", path.display()))?;
+            if config.remotes.is_empty() {
+                memory_mcp::repo_router::RepoRouter::single(Arc::clone(&repo))
+            } else {
+                memory_mcp::repo_router::RepoRouter::from_config(
+                    Arc::clone(&repo),
+                    &config.remotes,
+                    &health.git,
+                    &health.sync,
+                )
+                .context("failed to initialise scope-specific repos from config")?
+            }
+        } else {
+            memory_mcp::repo_router::RepoRouter::single(Arc::clone(&repo))
+        }
+    };
+
     // Load the persisted index and check freshness against repo HEAD.
     // If the SHA doesn't match, discard the loaded index entirely and start
     // fresh — this prevents ghost entries from deleted memories lingering.
@@ -505,7 +544,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             }),
     );
 
-    let head_sha = repo.head_sha().await;
+    let head_sha = router.head_sha().await;
     let needs_reindex = head_sha != index.commit_sha();
     // Track whether the reindex (if it ran) completed without errors.
     // Used below to gate startup report_ok for embedding and vector_index.
@@ -521,51 +560,28 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
                 .expect("failed to create index"),
         );
 
-        reindex_ok =
-            match memory_mcp::server::full_reindex(&repo, embedding.as_ref(), index.as_ref())
-                .instrument(tracing::info_span!("startup.full_reindex"))
-                .await
-            {
-                Ok(stats) => {
-                    info!(
-                        added = stats.added,
-                        errors = stats.errors,
-                        "startup reindex complete"
-                    );
-                    if stats.added > 0 || stats.errors == 0 {
-                        if stats.errors > 0 {
-                            tracing::warn!(
-                            added = stats.added,
-                            errors = stats.errors,
-                            "startup reindex partially failed — some memories may not be searchable"
-                        );
-                        }
-                        if let Some(sha) = &head_sha {
-                            index.set_commit_sha(Some(sha));
-                        }
-                        stats.errors == 0
-                    } else {
-                        tracing::warn!(
-                            errors = stats.errors,
-                            "all embeds failed — SHA not stamped, will retry on next startup"
-                        );
-                        false
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "startup reindex failed — SHA not stamped, will retry on next startup"
-                    );
-                    false
-                }
-            };
+        // Certification requires errors == 0 (#293 review, round 3): a
+        // partial rebuild must not stamp the SHA, or the next startup would
+        // see index SHA == HEAD and skip the reindex that repairs the gap.
+        reindex_ok = memory_mcp::server::startup_reindex_and_certify(
+            &router,
+            embedding.as_ref(),
+            index.as_ref(),
+            head_sha.as_deref(),
+        )
+        .instrument(tracing::info_span!("startup.full_reindex"))
+        .await;
     } else {
         tracing::debug!(sha = ?head_sha, "index SHA matches repo HEAD — skipping reindex");
         reindex_ok = true;
     }
 
     let auth = AuthProvider::new();
+
+    // Tracks whether the vector index verifiably mirrors git truth at startup.
+    // A reindex that did not complete cleanly is a gap only the next full
+    // reindex closes, so SHA advancement must stay blocked for this process.
+    let mut startup_mirror_gap = !reindex_ok;
 
     // When --require-remote-sync is set, perform an initial pull so the sync
     // reporter starts with a known state (and the local repo is up-to-date).
@@ -574,6 +590,17 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         match repo.pull(&auth, &args.branch).await {
             Ok(result) => {
                 info!(?result, "initial pull completed");
+                if matches!(
+                    result,
+                    memory_mcp::types::PullResult::FastForward { .. }
+                        | memory_mcp::types::PullResult::Merged { .. }
+                ) {
+                    // The pull moved git HEAD past the SHA the index was just
+                    // verified against without mirroring the pulled changes.
+                    // Block SHA advancement so the next startup reindexes them
+                    // instead of a later stamp hiding the gap.
+                    startup_mirror_gap = true;
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "initial pull failed — sync reporter will show degraded");
@@ -581,12 +608,15 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Mark git as healthy — if we reached this point, git init/open succeeded.
-    health.git.report_ok();
-    // Only mark embedding and vector_index healthy if the reindex succeeded or
-    // was skipped (SHA matched). If the reindex had errors, the subsystems have
-    // already reported their own state via their reporters.
+    // Only mark subsystems healthy if the reindex succeeded or was skipped
+    // (SHA matched). If the reindex had errors, the subsystems have already
+    // reported their own state via their reporters — an unconditional
+    // `health.git.report_ok()` here erased a strict-list/reindex repo
+    // failure recorded during the rebuild (#293 review, round 4). Git
+    // init/open succeeding earlier is not evidence that every repo listed
+    // cleanly.
     if reindex_ok {
+        health.git.report_ok();
         health.embedding.report_ok();
         health.vector_index.report_ok();
     }
@@ -606,8 +636,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     };
 
-    let state = Arc::new(AppState::new(
+    let state = Arc::new(AppState::with_router(
         repo,
+        router,
         args.branch.clone(),
         embedding,
         index,
@@ -615,12 +646,15 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         health,
         recall_log,
     ));
+    if startup_mirror_gap {
+        state.mark_index_mirror_incomplete();
+    }
 
     // Populate the lexical (BM25) index. It lives in RAM only — indexing
     // text is cheap, unlike embedding it — so it is rebuilt from the repo on
     // every startup and never persisted or migrated. Failure degrades recall
     // to semantic-only; it never blocks startup.
-    match memory_mcp::search::rebuild_lexical_from_repo(&state.repo, &state.lexical)
+    match memory_mcp::search::rebuild_lexical_from_router(&state.router, &state.lexical)
         .instrument(tracing::info_span!("startup.lexical_rebuild"))
         .await
     {
@@ -637,7 +671,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
                 "lexical index startup rebuild failed — keyword search \
                  degraded until background repair converges"
             );
-            memory_mcp::search::spawn_lexical_repair(&state.repo, &state.lexical);
+            memory_mcp::search::spawn_lexical_repair_for_router(&state.router, &state.lexical);
         }
     }
 
@@ -720,13 +754,13 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         .await
         .context("server error")?;
 
-    // Persist the scoped vector index so the next startup can skip a full reindex.
-    std::fs::create_dir_all(&index_dir)
-        .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
-    if let Some(sha) = state_for_shutdown.repo.head_sha().await {
-        state_for_shutdown.index.set_commit_sha(Some(&sha));
-    }
-    if let Err(e) = state_for_shutdown.index.save(&index_dir) {
+    // Persist the scoped vector index so the next startup can skip a full
+    // reindex. The stored SHA only advances when the in-process mirror is
+    // intact — a recorded mirror gap keeps the last verified SHA so the next
+    // startup rebuilds from git truth.
+    if let Err(e) =
+        memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
+    {
         tracing::warn!("failed to persist vector index on shutdown: {}", e);
     } else {
         info!("vector index saved to {}", index_dir.display());
@@ -839,22 +873,7 @@ fn parse_nonzero_u64(s: &str) -> Result<u64, String> {
 }
 
 fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
-    match path.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            let home = dirs::home_dir().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "could not expand '~': home directory could not be determined; \
-                     please provide --repo-path explicitly or set HOME"
-                )
-            })?;
-            Ok(home.join(rest.strip_prefix('/').unwrap_or(rest)))
-        }
-        Some(_) => anyhow::bail!(
-            "~user path expansion is not supported; \
-             please use an absolute path or ~/..."
-        ),
-        None => Ok(PathBuf::from(path)),
-    }
+    memory_mcp::fs_util::expand_tilde(path).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 // ---------------------------------------------------------------------------

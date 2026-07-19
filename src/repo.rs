@@ -24,7 +24,7 @@ use crate::{
 /// Strip userinfo (credentials) from a URL before logging.
 ///
 /// `https://user:token@host/path` → `https://[REDACTED]@host/path`
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     if let Some(at_pos) = url.find('@') {
         if let Some(scheme_end) = url.find("://") {
             let scheme = &url[..scheme_end + 3];
@@ -224,6 +224,11 @@ impl MemoryRepo {
             reporter,
             sync_reporter,
         })
+    }
+
+    /// Root directory of the working tree.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Return the current HEAD commit SHA as a hex string, or `None` if the
