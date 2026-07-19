@@ -11,6 +11,13 @@ pub mod auth;
 /// Configuration file parsing for per-scope remote mapping.
 pub mod config;
 
+/// Deterministic Markdown chunker producing fact-level retrieval units
+/// (#262 slice 2, ADR-0042).
+#[allow(
+    dead_code,
+    reason = "chunking is wired by #262 slice 3 (derived catalog); exercised by tests until then"
+)]
+pub(crate) mod chunker;
 /// Embedding backends for computing vector representations of text.
 pub mod embedding;
 /// Error types used throughout the crate.

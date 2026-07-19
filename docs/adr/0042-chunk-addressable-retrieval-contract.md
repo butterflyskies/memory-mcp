@@ -84,6 +84,20 @@ invalidates every derived `FactId` and forces a full catalog rebuild —
 there are no chunk migrations, only rebuilds from git truth. Catalog
 staleness detection (schema/model/commit) is slice 3.
 
+*Amended with slice 2:* the chunker is tokenizer- and budget-parametric.
+It consumes a `TokenCounter` (tokenizer handle plus stable identity) and
+a token budget taken from the embedding model's configuration
+(`max_position_embeddings`), never a hard-coded constant — BGE-small at
+512 tokens is the current instantiation, and the anticipated successor
+is **ModernBERT**, whose ~8192-token context radically changes chunk
+economics (larger budget, far fewer splits). The chunker exposes a
+*fingerprint* — algorithm revision, tokenizer identity, and budget —
+for the slice-3 staleness stamp: an embedding-model or budget swap
+changes the fingerprint and forces a full rebuild instead of silently
+mixing chunk vintages. This extends the "stale schema/model"
+detectability row of the ledger to the tokenizer/budget pair;
+`ChunkerVersion` itself stays reserved for algorithm revisions.
+
 ### Ranking and collapse
 Semantic and lexical retrieval both rank facts; fusion (RRF, per
 ADR-0038) happens at `FactId`. After fusion, results **collapse to the
