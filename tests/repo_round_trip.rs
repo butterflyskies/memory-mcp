@@ -357,3 +357,28 @@ async fn repo_move_memory_atomic_commit() {
         "move should produce exactly one git commit"
     );
 }
+
+/// ADR-0038 compatibility (#293 review, round 6): a repo path spelled with
+/// `..` over a not-yet-existing component — `existing/missing/../repo` —
+/// worked before startup canonicalization was introduced, so the startup
+/// pipeline (canonicalize, then init at the resolved path) must still accept
+/// it and land the repo at `existing/repo`.
+#[tokio::test]
+async fn init_accepts_dot_dot_over_missing_component_in_repo_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let existing = tmp.path().canonicalize().unwrap();
+    let spelled = tmp.path().join("missing/../repo");
+
+    // Mirrors `run_serve`: canonicalize before opening.
+    let resolved = memory_mcp::fs_util::canonicalize_allow_missing(&spelled)
+        .expect("previously valid spelling must canonicalize");
+    assert_eq!(resolved, existing.join("repo"));
+
+    // Repo init at the resolved path succeeds and creates the directory.
+    let repo = MemoryRepo::init_or_open(&resolved, None).expect("repo init should succeed");
+    assert!(
+        existing.join("repo/.git").exists(),
+        "repo should be created"
+    );
+    drop(repo);
+}

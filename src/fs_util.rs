@@ -36,17 +36,36 @@ pub fn expand_tilde(path: &str) -> Result<PathBuf, MemoryError> {
 /// same physical location resolve to the same value (#293 review, rounds
 /// 4–6).
 ///
-/// `..` is never stripped lexically: in `link/../x` where `link` is a
-/// symlink, the `..` resolves against the symlink *target*, so only the
-/// filesystem may interpret a `..` that touches anything existing. A `..`
-/// inside the missing tail has no filesystem meaning yet, so it is rejected
-/// with an error rather than guessed at lexically (#293 review, round 5).
+/// A `..` that touches anything *existing* is never stripped lexically: in
+/// `link/../x` where `link` is a symlink, the `..` resolves against the
+/// symlink target, so only the filesystem may interpret it (#293 review,
+/// round 5). A `..` inside the proven-missing suffix, however, *is*
+/// normalized lexically: nothing in that suffix exists, so it cannot
+/// contain a symlink, and the `..` can only cancel the missing component
+/// spelled before it — exactly what `create_dir_all` followed by kernel
+/// path resolution would have produced once the components existed. This
+/// keeps previously valid spellings like `existing/missing/../repo`
+/// working (#293 review, round 6; ADR-0038 compatibility).
+///
+/// A `..` that leads the missing suffix climbs into the canonicalized
+/// ancestor instead. That is also resolved lexically — safe because the
+/// ancestor is already fully resolved, so its lexical parent is its
+/// physical parent. A `..` that would climb above the filesystem root is
+/// an error.
 ///
 /// Public because the server binary must canonicalize the default repo path
 /// with the exact same rules *before* opening it, so the opened location and
 /// the router's collision-detection key can never diverge.
 pub fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, MemoryError> {
-    use std::path::Component;
+    /// One component of the not-yet-existing suffix, recorded during the
+    /// upward walk and replayed onto the canonicalized ancestor.
+    enum Tail {
+        /// A named component to re-append.
+        Normal(std::ffi::OsString),
+        /// A `..` proven to sit on a non-existent prefix; cancels one
+        /// component lexically during rebuild.
+        Parent,
+    }
 
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -63,43 +82,58 @@ pub fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, MemoryError> {
     // the existing portion are resolved by `canonicalize` itself; `.` is
     // identity and is normalized away by `file_name`/`parent`.
     let mut base = absolute.as_path();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut tail: Vec<Tail> = Vec::new();
     let canonical_base = loop {
         match base.canonicalize() {
             Ok(resolved) => break resolved,
-            // `file_name()` returns `None` when `base` is a bare root or
-            // terminates in `..`. Since `base` failed to canonicalize, a
-            // trailing `..` here sits on top of a non-existent path — there
-            // is no filesystem entry to resolve it against.
             Err(_) => match (base.file_name(), base.parent()) {
                 (Some(name), Some(parent)) => {
-                    tail.push(name.to_os_string());
+                    tail.push(Tail::Normal(name.to_os_string()));
+                    base = parent;
+                }
+                // `file_name()` returns `None` when `base` terminates in
+                // `..` (a bare root always canonicalizes, so it cannot
+                // reach the `Err` arm). Had the prefix before this `..`
+                // existed as a directory, `canonicalize` would have
+                // resolved the pair through the filesystem; since it
+                // failed, the `..` sits on a non-existent (or
+                // non-directory) prefix with no symlink to reinterpret
+                // it, so it is safe to cancel lexically during rebuild.
+                (None, Some(parent)) => {
+                    tail.push(Tail::Parent);
                     base = parent;
                 }
                 _ => {
-                    let reason =
-                        if matches!(base.components().next_back(), Some(Component::ParentDir)) {
-                            format!(
-                                "path '{}' uses '..' inside a non-existent segment, which \
-                                 cannot be resolved against the filesystem; spell the path \
-                                 without '..' or create the intermediate directories first",
-                                absolute.display()
-                            )
-                        } else {
-                            format!(
-                                "cannot resolve any existing ancestor of path '{}'",
-                                absolute.display()
-                            )
-                        };
-                    return Err(MemoryError::InvalidInput { reason });
+                    return Err(MemoryError::InvalidInput {
+                        reason: format!(
+                            "cannot resolve any existing ancestor of path '{}'",
+                            absolute.display()
+                        ),
+                    });
                 }
             },
         }
     };
 
+    // Replay the missing suffix onto the canonicalized ancestor. `Parent`
+    // cancels either the missing component pushed just before it or — when
+    // the `..` leads the suffix — one component of the canonicalized
+    // ancestor, whose lexical parent is its physical parent.
     let mut resolved = canonical_base;
     for component in tail.iter().rev() {
-        resolved.push(component);
+        match component {
+            Tail::Normal(name) => resolved.push(name),
+            Tail::Parent => {
+                if !resolved.pop() {
+                    return Err(MemoryError::InvalidInput {
+                        reason: format!(
+                            "path '{}' uses '..' to climb above the filesystem root",
+                            absolute.display()
+                        ),
+                    });
+                }
+            }
+        }
     }
     Ok(resolved)
 }
@@ -328,16 +362,46 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_allow_missing_rejects_dot_dot_in_missing_tail() {
-        // A `..` on top of a non-existent segment has no filesystem meaning;
-        // resolving it lexically would guess. It must be rejected, not
-        // normalized (#293 review, round 5).
+    fn canonicalize_allow_missing_normalizes_dot_dot_in_missing_tail() {
+        // ADR-0038 compatibility (#293 review, round 6): before
+        // canonicalization was applied at startup, `existing/missing/../repo`
+        // worked — `create_dir_all` created `missing`, the kernel walked the
+        // `..` back out, and the repo landed at `existing/repo`. The missing
+        // suffix contains no symlinks (nothing in it exists), so the `..`
+        // cancels its preceding missing component lexically instead of
+        // aborting.
         let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().canonicalize().unwrap();
         let spelled = dir.path().join("missing/../repo");
+        assert_eq!(
+            canonicalize_allow_missing(&spelled).unwrap(),
+            existing.join("repo")
+        );
+    }
+
+    #[test]
+    fn canonicalize_allow_missing_resolves_leading_dot_dot_against_ancestor() {
+        // A `..` that leads the missing suffix climbs into the canonicalized
+        // ancestor. The ancestor is fully resolved, so its lexical parent is
+        // its physical parent — `dir/missing/../../repo` → parent-of-dir/repo.
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().canonicalize().unwrap();
+        let spelled = dir.path().join("missing/../../repo");
+        assert_eq!(
+            canonicalize_allow_missing(&spelled).unwrap(),
+            existing.parent().unwrap().join("repo")
+        );
+    }
+
+    #[test]
+    fn canonicalize_allow_missing_rejects_dot_dot_above_root() {
+        // Enough `..` in a missing suffix to climb above `/` cannot name any
+        // location; it must error, not wrap around or silently clamp.
+        let spelled = PathBuf::from("/memory-mcp-test-nonexistent-4f2a9c/../../still-missing/repo");
         let err = canonicalize_allow_missing(&spelled).unwrap_err();
         assert!(
-            err.to_string().contains(".."),
-            "error must name the '..' problem: {err}"
+            err.to_string().contains("root"),
+            "error must name the climb above root: {err}"
         );
     }
 
