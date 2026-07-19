@@ -20,8 +20,8 @@ that context into a durable system instead of another prompt appendix.
   concept search and a buried exact phrase can both succeed.
 - **Keep inference local.** Embeddings run on your machine with Candle and
   BGE-small-en-v1.5; no embedding API key is required.
-- **Move between machines.** The memory repository can sync through any git
-  remote supported by libgit2.
+- **Move between machines.** The memory repository can sync to a GitHub remote
+  using built-in token-backed authentication.
 - **Learn whether recall works.** Recall IDs and feedback tools turn retrieval
   quality into something you can measure.
 
