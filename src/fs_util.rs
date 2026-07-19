@@ -47,6 +47,16 @@ pub fn expand_tilde(path: &str) -> Result<PathBuf, MemoryError> {
 /// keeps previously valid spellings like `existing/missing/../repo`
 /// working (#293 review, round 6; ADR-0038 compatibility).
 ///
+/// "Missing" means **proven absent**: at each step of the upward walk a
+/// component joins the missing suffix only if `symlink_metadata` fails
+/// with `NotFound`. A component that *exists* but cannot be resolved — a
+/// regular file where a directory is needed, a dangling symlink, a
+/// permission-denied directory — is an error preserving the underlying
+/// [`std::io::ErrorKind`], never silently reclassified as missing (#293
+/// review, round 7: `file/../repo` used to fail with `ENOTDIR` at
+/// `create_dir_all`; treating the unresolvable prefix as missing would
+/// lexically cancel the `..` and silently redirect to sibling `repo`).
+///
 /// A `..` that leads the missing suffix climbs into the canonicalized
 /// ancestor instead. That is also resolved lexically — safe because the
 /// ancestor is already fully resolved, so its lexical parent is its
@@ -86,32 +96,79 @@ pub fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, MemoryError> {
     let canonical_base = loop {
         match base.canonicalize() {
             Ok(resolved) => break resolved,
-            Err(_) => match (base.file_name(), base.parent()) {
-                (Some(name), Some(parent)) => {
-                    tail.push(Tail::Normal(name.to_os_string()));
-                    base = parent;
+            Err(canonicalize_err) => {
+                // `canonicalize` failing does NOT prove `base` is missing
+                // (#293 review, round 7): it also fails when the path
+                // *exists* but cannot resolve — a regular file in
+                // directory position, a dangling symlink, a
+                // permission-denied directory. Classifying those as
+                // missing would lexically cancel a later `..` against a
+                // component the filesystem would have interpreted
+                // differently (or refused), silently redirecting to a
+                // sibling path. Only a `NotFound` from `symlink_metadata`
+                // proves absence; anything else fails closed, preserving
+                // the underlying error kind.
+                match std::fs::symlink_metadata(base) {
+                    Ok(_) => {
+                        // The component itself exists (lstat succeeded)
+                        // yet cannot be canonicalized — e.g. a dangling
+                        // symlink whose target is gone.
+                        return Err(MemoryError::Io(std::io::Error::new(
+                            canonicalize_err.kind(),
+                            format!(
+                                "path component '{}' exists but cannot be resolved \
+                                 (while canonicalizing '{}'): {canonicalize_err}",
+                                base.display(),
+                                absolute.display(),
+                            ),
+                        )));
+                    }
+                    Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => {
+                        // Proven absent — record the component below and
+                        // keep walking upward.
+                    }
+                    Err(meta_err) => {
+                        // Exists-but-untraversable prefix: a regular file
+                        // where a directory is needed (`NotADirectory`),
+                        // permission denied, etc.
+                        return Err(MemoryError::Io(std::io::Error::new(
+                            meta_err.kind(),
+                            format!(
+                                "cannot access path component '{}' \
+                                 (while canonicalizing '{}'): {meta_err}",
+                                base.display(),
+                                absolute.display(),
+                            ),
+                        )));
+                    }
                 }
-                // `file_name()` returns `None` when `base` terminates in
-                // `..` (a bare root always canonicalizes, so it cannot
-                // reach the `Err` arm). Had the prefix before this `..`
-                // existed as a directory, `canonicalize` would have
-                // resolved the pair through the filesystem; since it
-                // failed, the `..` sits on a non-existent (or
-                // non-directory) prefix with no symlink to reinterpret
-                // it, so it is safe to cancel lexically during rebuild.
-                (None, Some(parent)) => {
-                    tail.push(Tail::Parent);
-                    base = parent;
+                match (base.file_name(), base.parent()) {
+                    (Some(name), Some(parent)) => {
+                        tail.push(Tail::Normal(name.to_os_string()));
+                        base = parent;
+                    }
+                    // `file_name()` returns `None` when `base` terminates
+                    // in `..` (a bare root always canonicalizes, so it
+                    // cannot reach the `Err` arm). The metadata check
+                    // above proved this `..`-terminated path names
+                    // nothing: its prefix is absent (a file or dangling
+                    // symlink in the prefix errors out instead), so
+                    // there is no symlink to reinterpret the `..` and it
+                    // is safe to cancel lexically during rebuild.
+                    (None, Some(parent)) => {
+                        tail.push(Tail::Parent);
+                        base = parent;
+                    }
+                    _ => {
+                        return Err(MemoryError::InvalidInput {
+                            reason: format!(
+                                "cannot resolve any existing ancestor of path '{}'",
+                                absolute.display()
+                            ),
+                        });
+                    }
                 }
-                _ => {
-                    return Err(MemoryError::InvalidInput {
-                        reason: format!(
-                            "cannot resolve any existing ancestor of path '{}'",
-                            absolute.display()
-                        ),
-                    });
-                }
-            },
+            }
         }
     };
 
@@ -452,6 +509,62 @@ mod tests {
         assert_eq!(
             canonicalize_allow_missing(&alias.join("sub")).unwrap(),
             canonicalize_allow_missing(&real.join("sub")).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_file_in_prefix_fails_closed_not_redirected() {
+        // Syne's round-7 repro: `file/../repo1` where `file` is an existing
+        // regular file. Before startup canonicalization, `create_dir_all`
+        // failed with ENOTDIR; classifying the unresolvable prefix as
+        // "missing" would lexically cancel the `..` and silently redirect
+        // to sibling `repo1`. The helper must fail closed instead,
+        // preserving the underlying error kind.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("file"), b"plain file").unwrap();
+
+        let spelled = dir.path().join("file/../repo1");
+        let err = canonicalize_allow_missing(&spelled).unwrap_err();
+        match &err {
+            MemoryError::Io(io_err) => assert_eq!(
+                io_err.kind(),
+                std::io::ErrorKind::NotADirectory,
+                "must preserve the underlying error kind: {io_err}"
+            ),
+            other => panic!("expected MemoryError::Io, got: {other}"),
+        }
+        assert!(
+            err.to_string().contains("cannot access path component"),
+            "error must name the unresolvable component: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_in_prefix_fails_closed_not_redirected() {
+        // Syne's round-7 repro: `broken/../repo2` where `broken` is a
+        // dangling symlink. Traversal used to fail at open time; treating
+        // the existing-but-unresolvable symlink as missing would return
+        // sibling `repo2` — a silent redirect that startup would then open
+        // as a different (possibly empty) repo. The helper must fail
+        // closed on the existing symlink instead.
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("broken")).unwrap();
+
+        let spelled = dir.path().join("broken/../repo2");
+        let err = canonicalize_allow_missing(&spelled).unwrap_err();
+        match &err {
+            MemoryError::Io(io_err) => assert_eq!(
+                io_err.kind(),
+                std::io::ErrorKind::NotFound,
+                "canonicalize of a dangling symlink fails NotFound: {io_err}"
+            ),
+            other => panic!("expected MemoryError::Io, got: {other}"),
+        }
+        assert!(
+            err.to_string().contains("exists but cannot be resolved"),
+            "error must state the component exists but is unresolvable: {err}"
         );
     }
 
