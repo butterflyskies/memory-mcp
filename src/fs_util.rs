@@ -45,7 +45,7 @@ pub fn expand_tilde(path: &str) -> Result<PathBuf, MemoryError> {
 /// spelled before it — exactly what `create_dir_all` followed by kernel
 /// path resolution would have produced once the components existed. This
 /// keeps previously valid spellings like `existing/missing/../repo`
-/// working (#293 review, round 6; ADR-0038 compatibility).
+/// working (#293 review, round 6; ADR-0041 compatibility).
 ///
 /// "Missing" means **proven absent**: at each step of the upward walk a
 /// component joins the missing suffix only if `symlink_metadata` fails
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn canonicalize_allow_missing_normalizes_dot_dot_in_missing_tail() {
-        // ADR-0038 compatibility (#293 review, round 6): before
+        // ADR-0041 compatibility (#293 review, round 6): before
         // canonicalization was applied at startup, `existing/missing/../repo`
         // worked — `create_dir_all` created `missing`, the kernel walked the
         // `..` back out, and the repo landed at `existing/repo`. The missing

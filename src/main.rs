@@ -178,8 +178,10 @@ struct ServeArgs {
     #[command(flatten)]
     embed: EmbedArgs,
 
-    /// Enable OTLP span export. The server will crash on startup if the
-    /// collector is unreachable. Use --otlp-optional for graceful fallback.
+    /// Enable OTLP span export. Startup fails fast if the collector is not
+    /// reachable (TCP probe, 5s total); outages after startup are handled
+    /// by the batch exporter as usual. Use --otlp-optional for graceful
+    /// fallback.
     #[cfg(feature = "otlp")]
     #[arg(long, default_value_t = false, env = "MEMORY_MCP_OTLP_REQUIRED")]
     otlp_required: bool,
@@ -268,14 +270,275 @@ fn init_tracing_fmt_only() {
         .init();
 }
 
+/// Total timeout for the startup OTLP reachability probe. This bounds the
+/// entire probe — DNS resolution plus every connect attempt combined — not
+/// each address individually.
+#[cfg(feature = "otlp")]
+const OTLP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Default OTLP gRPC endpoint per the OpenTelemetry specification. This is
+/// the only place the OTLP default port 4317 enters the probe: an explicitly
+/// configured endpoint that omits a port gets its scheme default (80/443),
+/// exactly as the tonic exporter resolves it.
+#[cfg(feature = "otlp")]
+const OTLP_DEFAULT_ENDPOINT: &str = "http://localhost:4317";
+
+/// Resolve the OTLP endpoint the tonic exporter will target, mirroring its
+/// environment lookup: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` takes precedence
+/// over `OTEL_EXPORTER_OTLP_ENDPOINT`; both fall back to the spec default.
+/// Empty values are treated as unset.
+///
+/// Returns the endpoint plus the name of the environment variable that
+/// supplied it (or `"default"`), so error paths can name the source without
+/// echoing the — possibly credential-bearing — value itself.
+#[cfg(feature = "otlp")]
+fn resolve_otlp_endpoint(
+    traces_endpoint: Option<&str>,
+    general_endpoint: Option<&str>,
+) -> (String, &'static str) {
+    if let Some(e) = traces_endpoint.filter(|s| !s.trim().is_empty()) {
+        return (e.to_owned(), "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+    }
+    if let Some(e) = general_endpoint.filter(|s| !s.trim().is_empty()) {
+        return (e.to_owned(), "OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+    (OTLP_DEFAULT_ENDPOINT.to_owned(), "default")
+}
+
+/// Parsed probe target: connect coordinates plus a credential-free display
+/// form (`scheme://host:port`) that is safe to include in error messages.
+#[cfg(feature = "otlp")]
+#[derive(Debug)]
+struct OtlpProbeTarget {
+    /// Hostname or IP literal, without IPv6 brackets.
+    host: String,
+    /// Port — explicit, or the scheme default (80/443).
+    port: u16,
+    /// Sanitized `scheme://host:port` for error messages. Never contains the
+    /// raw endpoint's path, query string, or userinfo.
+    display: String,
+}
+
+/// Parse an OTLP endpoint into a probe target using [`http::Uri`] — the same
+/// URI type the tonic exporter parses the endpoint with.
+///
+/// Invariant: the probe must agree with what the exporter will do with the
+/// same endpoint string. tonic requires a schemed HTTP(S) URI, so schemeless
+/// endpoints are rejected here instead of probed on guessed semantics, and a
+/// missing port defaults to the scheme port (80 for http, 443 for https) —
+/// never to 4317, which applies only through the spec-default endpoint
+/// [`OTLP_DEFAULT_ENDPOINT`].
+///
+/// Error messages never echo the raw endpoint, which may carry credentials
+/// in its query string or userinfo.
+#[cfg(feature = "otlp")]
+fn parse_otlp_endpoint(endpoint: &str) -> Result<OtlpProbeTarget, String> {
+    let uri: http::Uri = endpoint
+        .parse()
+        .map_err(|e| format!("endpoint is not a valid URI: {e}"))?;
+    let scheme = uri.scheme_str().ok_or_else(|| {
+        "endpoint has no scheme; the tonic exporter requires a full HTTP URI \
+         like http://collector:4317"
+            .to_owned()
+    })?;
+    let default_port: u16 = match scheme {
+        "http" => 80,
+        "https" => 443,
+        other => {
+            return Err(format!(
+                "endpoint has unsupported scheme '{other}' (expected http or https)"
+            ));
+        }
+    };
+    // `Uri::host()` keeps the square brackets on IPv6 literals; strip them
+    // so the literal is usable for socket-address resolution (previously the
+    // bracketed form was sent to DNS verbatim and always failed).
+    let host = match uri.host() {
+        Some(h) if !h.is_empty() => h
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(h)
+            .to_owned(),
+        _ => return Err("endpoint has no host".to_owned()),
+    };
+    let port = uri.port_u16().unwrap_or(default_port);
+    let display = if host.contains(':') {
+        format!("{scheme}://[{host}]:{port}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    };
+    Ok(OtlpProbeTarget {
+        host,
+        port,
+        display,
+    })
+}
+
+/// Split the remaining probe budget evenly across the connect attempts that
+/// have not run yet, flooring at 1ms because `TcpStream::connect_timeout`
+/// rejects a zero duration.
+#[cfg(feature = "otlp")]
+fn per_attempt_budget(remaining: std::time::Duration, attempts_left: usize) -> std::time::Duration {
+    let attempts = attempts_left.max(1).min(u32::MAX as usize) as u32;
+    (remaining / attempts).max(std::time::Duration::from_millis(1))
+}
+
+/// Probe the OTLP collector endpoint with a deadline-bounded TCP connect.
+///
+/// `timeout` bounds the whole probe, not each address: DNS resolution (a
+/// blocking OS call with no timeout parameter, so it runs on a helper thread
+/// that is abandoned if the deadline passes) and all connect attempts share
+/// one budget, with the remainder split evenly across the addresses not yet
+/// tried.
+///
+/// Returns `Ok(())` when a TCP connection can be established, `Err` with a
+/// human-readable, credential-free reason otherwise. This is a reachability
+/// check only — it does not validate that the listener speaks OTLP/gRPC.
+#[cfg(feature = "otlp")]
+fn probe_otlp_endpoint(endpoint: &str, timeout: std::time::Duration) -> Result<(), String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let target = parse_otlp_endpoint(endpoint)?;
+    let deadline = std::time::Instant::now() + timeout;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let host = target.host.clone();
+        let port = target.port;
+        std::thread::spawn(move || {
+            let result = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addrs| addrs.collect::<Vec<_>>());
+            // The receiver may have given up at the deadline — ignore send
+            // failure.
+            let _ = tx.send(result);
+        });
+    }
+    let addrs = match rx.recv_timeout(timeout) {
+        Ok(Ok(addrs)) => addrs,
+        Ok(Err(e)) => return Err(format!("failed to resolve {}: {e}", target.display)),
+        Err(_) => {
+            return Err(format!(
+                "DNS resolution for {} did not complete within {timeout:?}",
+                target.display
+            ));
+        }
+    };
+    if addrs.is_empty() {
+        return Err(format!("{} resolved to no addresses", target.display));
+    }
+
+    let mut last_err = String::new();
+    let total = addrs.len();
+    for (i, addr) in addrs.into_iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            if last_err.is_empty() {
+                last_err = "no connect attempt was made".to_owned();
+            }
+            return Err(format!(
+                "probe deadline ({timeout:?} total) exhausted probing {}; last error: {last_err}",
+                target.display
+            ));
+        }
+        match TcpStream::connect_timeout(&addr, per_attempt_budget(remaining, total - i)) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = format!("connect to {addr} (for {}) failed: {e}", target.display);
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Startup gate for `--otlp-required`: probe the resolved collector endpoint
+/// and fail if it is unreachable. When `otlp_required` is false (including
+/// the `--otlp-optional` path) no probe is performed and the exporter stays
+/// fully lazy.
+///
+/// "Required" means *reachable at startup*, not guaranteed forever: once the
+/// probe passes, later collector outages surface as batch-exporter errors per
+/// normal OTLP semantics and do not stop the server.
+#[cfg(feature = "otlp")]
+fn otlp_startup_probe(
+    otlp_required: bool,
+    traces_endpoint: Option<&str>,
+    general_endpoint: Option<&str>,
+) -> Result<(), String> {
+    if !otlp_required {
+        return Ok(());
+    }
+    let (endpoint, source) = resolve_otlp_endpoint(traces_endpoint, general_endpoint);
+    // Never echo the raw endpoint here — it may carry credentials in its
+    // query string. The probe error already names the sanitized
+    // scheme://host:port; we add only which source supplied the endpoint.
+    probe_otlp_endpoint(&endpoint, OTLP_PROBE_TIMEOUT)
+        .map_err(|e| format!("OTLP collector unreachable: {e} (endpoint supplied by {source})"))
+}
+
+/// Name the variant of an exporter build error without echoing its message.
+///
+/// The SDK error's `Display` output can embed the raw endpoint — tonic's
+/// HTTPS-without-TLS `InvalidConfig` repeats the full URL, query string and
+/// all — so construction-failure paths must never print the SDK message.
+/// Of the two sanitization options (classify the error vs. scrub the endpoint
+/// out of the SDK text), we classify: printing only this variant name plus
+/// the sanitized `scheme://host:port` is simpler and structurally cannot
+/// leak, at the cost of some diagnostic detail.
+#[cfg(feature = "otlp")]
+fn exporter_build_error_kind(e: &opentelemetry_otlp::ExporterBuildError) -> &'static str {
+    use opentelemetry_otlp::ExporterBuildError as E;
+    match e {
+        E::ThreadSpawnFailed => "ThreadSpawnFailed",
+        E::NoHttpClient => "NoHttpClient",
+        E::UnsupportedCompressionAlgorithm(_) => "UnsupportedCompressionAlgorithm",
+        E::InvalidUri(..) => "InvalidUri",
+        E::InvalidConfig { .. } => "InvalidConfig",
+        E::InternalFailure(_) => "InternalFailure",
+        // `ExporterBuildError` is #[non_exhaustive], and some variants are
+        // cfg-gated on SDK features, so anything unmatched lands here.
+        _ => "Other",
+    }
+}
+
 /// Initialise tracing for the serve command. If `--otlp-required` or
 /// `--otlp-optional` is set, activates OTLP export. Otherwise uses fmt-only
 /// (passive — the feature is compiled in but not activated).
+///
+/// With `--otlp-required`, the collector endpoint is probed eagerly (TCP
+/// connect, bounded timeout) and the process exits non-zero when it is
+/// unreachable — before the server binds or serves.
+///
+/// Like the probe errors, exporter construction-failure messages never echo
+/// the raw endpoint or the SDK error text (which can embed the endpoint):
+/// they name only the error kind, the sanitized `scheme://host:port`, and
+/// the environment source — see [`exporter_build_error_kind`].
 #[cfg(feature = "otlp")]
 fn init_tracing_for_serve(args: &ServeArgs) -> Option<OtlpProvider> {
     if !args.otlp_required && !args.otlp_optional {
         init_tracing_fmt_only();
         return None;
+    }
+
+    let traces_env = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok();
+    let general_env = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    // Resolved exactly as the probe (and the tonic exporter) resolves it, so
+    // the construction-failure paths below can reuse the probe's sanitized
+    // display form instead of deriving anything from the SDK error.
+    let (endpoint, endpoint_source) =
+        resolve_otlp_endpoint(traces_env.as_deref(), general_env.as_deref());
+
+    if let Err(e) = otlp_startup_probe(
+        args.otlp_required,
+        traces_env.as_deref(),
+        general_env.as_deref(),
+    ) {
+        eprintln!(
+            "error: {e}\n\
+             Hint: start the collector, fix OTEL_EXPORTER_OTLP_ENDPOINT, or pass \
+             --otlp-optional to fall back to fmt-only logging."
+        );
+        std::process::exit(1);
     }
 
     use opentelemetry_otlp::SpanExporter;
@@ -309,19 +572,28 @@ fn init_tracing_for_serve(args: &ServeArgs) -> Option<OtlpProvider> {
             Some(provider)
         }
         Err(e) => {
+            // Never print `e` itself: its text can embed the raw endpoint,
+            // credentials included. Kind + sanitized endpoint + source only.
+            let error_kind = exporter_build_error_kind(&e);
+            let sanitized_endpoint = parse_otlp_endpoint(&endpoint)
+                .map(|t| t.display)
+                .unwrap_or_else(|_| "<unparseable endpoint>".to_owned());
             if args.otlp_optional {
                 tracing_subscriber::registry()
                     .with(filter)
                     .with(fmt_layer)
                     .init();
                 tracing::warn!(
-                    error = %e,
+                    error_kind,
+                    endpoint = %sanitized_endpoint,
+                    endpoint_source,
                     "OTLP exporter init failed — continuing with fmt-only tracing (--otlp-optional is set)"
                 );
                 None
             } else {
                 eprintln!(
-                    "error: OTLP exporter init failed: {e}\n\
+                    "error: OTLP exporter init failed ({error_kind}) for {sanitized_endpoint} \
+                     (endpoint supplied by {endpoint_source})\n\
                      Hint: pass --otlp-optional to fall back to fmt-only logging."
                 );
                 std::process::exit(1);
@@ -1119,6 +1391,236 @@ mod tests {
             Some(Command::Serve(args)) => assert_eq!(args.max_session_lifetime_secs, 86400),
             _ => panic!("expected Serve command"),
         }
+    }
+
+    /// Regression: `--otlp-required` with an unreachable collector must fail
+    /// the startup probe (previously the lazy tonic exporter let the server
+    /// start and errors only surfaced on the first export attempt).
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_required_dead_endpoint_fails_probe() {
+        // Bind an ephemeral port, then drop the listener so the port is closed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let result = otlp_startup_probe(true, None, Some(&endpoint));
+        let err = result.expect_err("probe against a closed port must fail");
+        assert!(
+            err.contains(&endpoint),
+            "error should name the endpoint: {err}"
+        );
+    }
+
+    /// `--otlp-required` with a reachable collector proceeds past the probe.
+    /// A bare TCP listener is enough — the probe checks reachability, not
+    /// OTLP protocol conformance.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_required_live_endpoint_passes_probe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        otlp_startup_probe(true, None, Some(&endpoint))
+            .expect("probe against a live listener must pass");
+    }
+
+    /// Without `--otlp-required` (including the `--otlp-optional` path) no
+    /// probe runs: a dead endpoint must not block startup.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_not_required_skips_probe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        otlp_startup_probe(false, None, Some(&endpoint))
+            .expect("no probe should run when otlp is not required");
+    }
+
+    /// Regression: an IPv6 literal endpoint like `http://[::1]:PORT` must
+    /// probe the IPv6 listener. Previously the bracketed literal was passed
+    /// to DNS resolution verbatim, so a live IPv6 collector failed the probe
+    /// with a bogus lookup error.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_probe_ipv6_literal_live_listener() {
+        let listener = match std::net::TcpListener::bind("[::1]:0") {
+            Ok(l) => l,
+            Err(e) => {
+                // Environment without IPv6 loopback — nothing to assert.
+                eprintln!("skipping: IPv6 loopback unavailable: {e}");
+                return;
+            }
+        };
+        let port = listener.local_addr().expect("local addr").port();
+
+        let endpoint = format!("http://[::1]:{port}");
+        otlp_startup_probe(true, None, Some(&endpoint))
+            .expect("probe against a live IPv6 listener must pass");
+    }
+
+    /// The probe budget is split across remaining connect attempts so the
+    /// probe is bounded by ~OTLP_PROBE_TIMEOUT total, not per address.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_per_attempt_budget_splits_remaining() {
+        use std::time::Duration;
+        assert_eq!(
+            per_attempt_budget(Duration::from_secs(4), 4),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            per_attempt_budget(Duration::from_secs(3), 1),
+            Duration::from_secs(3)
+        );
+        // Floored at 1ms: connect_timeout rejects a zero duration.
+        assert_eq!(
+            per_attempt_budget(Duration::from_micros(10), 4),
+            Duration::from_millis(1)
+        );
+        // Defensive: zero attempts must not divide by zero.
+        assert_eq!(
+            per_attempt_budget(Duration::from_secs(1), 0),
+            Duration::from_secs(1)
+        );
+    }
+
+    /// The deadline covers DNS resolution too: with a zero budget the probe
+    /// fails at the deadline instead of blocking on the resolver or
+    /// proceeding to connect attempts.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_probe_total_deadline_bounds_dns() {
+        let err = probe_otlp_endpoint("http://localhost:4317", std::time::Duration::ZERO)
+            .expect_err("a zero total budget must fail the probe");
+        assert!(
+            err.contains("did not complete") || err.contains("deadline"),
+            "error should attribute the failure to the total deadline: {err}"
+        );
+    }
+
+    /// Regression: a credential-bearing endpoint must never be echoed in
+    /// probe error text — only the sanitized `scheme://host:port` plus the
+    /// name of the env var that supplied the endpoint appear.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_probe_error_sanitizes_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1/traces?api_key=super-secret");
+        let err = otlp_startup_probe(true, None, Some(&endpoint))
+            .expect_err("probe against a closed port must fail");
+        assert!(
+            !err.contains("super-secret") && !err.contains("api_key"),
+            "credential leaked into error text: {err}"
+        );
+        assert!(
+            err.contains(&format!("http://127.0.0.1:{port}")),
+            "sanitized endpoint should appear: {err}"
+        );
+        assert!(
+            err.contains("OTEL_EXPORTER_OTLP_ENDPOINT"),
+            "error should name the supplying env var: {err}"
+        );
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_resolve_otlp_endpoint_default() {
+        assert_eq!(
+            resolve_otlp_endpoint(None, None),
+            (OTLP_DEFAULT_ENDPOINT.to_owned(), "default")
+        );
+        // Empty values are treated as unset.
+        assert_eq!(
+            resolve_otlp_endpoint(Some(""), Some("  ")),
+            (OTLP_DEFAULT_ENDPOINT.to_owned(), "default")
+        );
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_resolve_otlp_endpoint_traces_takes_precedence() {
+        assert_eq!(
+            resolve_otlp_endpoint(Some("http://traces:4317"), Some("http://general:4317")),
+            (
+                "http://traces:4317".to_owned(),
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+            )
+        );
+        assert_eq!(
+            resolve_otlp_endpoint(None, Some("http://general:4317")),
+            (
+                "http://general:4317".to_owned(),
+                "OTEL_EXPORTER_OTLP_ENDPOINT"
+            )
+        );
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_parse_otlp_endpoint_forms() {
+        let t = parse_otlp_endpoint("http://localhost:4317").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("localhost", 4317));
+        assert_eq!(t.display, "http://localhost:4317");
+
+        // Paths and query strings are dropped from the probe target.
+        let t = parse_otlp_endpoint("https://collector.example.com:4318/v1/traces").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("collector.example.com", 4318));
+        assert_eq!(t.display, "https://collector.example.com:4318");
+
+        // IPv6 literals: `Uri::host()` strips the brackets, so the host is
+        // resolvable; the display form re-adds them.
+        let t = parse_otlp_endpoint("http://[::1]:4317").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("::1", 4317));
+        assert_eq!(t.display, "http://[::1]:4317");
+    }
+
+    /// A missing port defaults to the scheme port (80/443), matching what
+    /// the tonic exporter will connect to — never the OTLP default 4317,
+    /// which only applies through the spec-default endpoint string.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_parse_otlp_endpoint_scheme_default_ports() {
+        let t = parse_otlp_endpoint("http://collector").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("collector", 80));
+        let t = parse_otlp_endpoint("https://collector").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("collector", 443));
+        // `http::Uri` accepts a non-numeric port (`port_u16()` returns
+        // `None`) and hyper/tonic then connect to the scheme default, so the
+        // probe must mirror that rather than reject.
+        let t = parse_otlp_endpoint("http://host:notaport").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("host", 80));
+    }
+
+    /// tonic rejects endpoints without an http/https scheme, so the probe
+    /// must reject them too instead of probing guessed semantics.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_parse_otlp_endpoint_rejects_schemeless() {
+        for endpoint in ["collector:9999", "localhost", "127.0.0.1:4317"] {
+            let err =
+                parse_otlp_endpoint(endpoint).expect_err("schemeless endpoint must be rejected");
+            assert!(
+                err.contains("scheme"),
+                "error for '{endpoint}' should mention the scheme requirement: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_parse_otlp_endpoint_invalid() {
+        assert!(parse_otlp_endpoint("").is_err());
+        assert!(parse_otlp_endpoint("http://").is_err());
+        assert!(parse_otlp_endpoint("http://:4317").is_err());
+        assert!(parse_otlp_endpoint("ftp://collector:4317").is_err());
     }
 
     #[cfg(feature = "k8s")]

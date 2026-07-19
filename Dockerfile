@@ -8,7 +8,7 @@ COPY . .
 # part of the image — they persist on the builder between runs.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --features k8s && \
+    cargo build --release --features k8s,otlp && \
     cp target/release/memory-mcp /usr/local/bin/memory-mcp
 
 # Stage 2: Model download
