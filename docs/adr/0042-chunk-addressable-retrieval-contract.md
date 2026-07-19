@@ -94,7 +94,12 @@ economics (larger budget, far fewer splits). The chunker exposes a
 *fingerprint* — algorithm revision, tokenizer identity, and budget —
 for the slice-3 staleness stamp: an embedding-model or budget swap
 changes the fingerprint and forces a full rebuild instead of silently
-mixing chunk vintages. This extends the "stale schema/model"
+mixing chunk vintages. The tokenizer identity is bound to tokenizer
+*content*, not a label: it embeds a SHA-256 digest of the tokenizer's
+canonical serialization as configured for counting, so an upstream
+re-release of `tokenizer.json` under the same model id (a mutable HF
+revision) is a visible fingerprint change, never a shared stamp
+between artifacts that count differently. This extends the "stale schema/model"
 detectability row of the ledger to the tokenizer/budget pair;
 `ChunkerVersion` itself stays reserved for algorithm revisions.
 

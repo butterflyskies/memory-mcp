@@ -454,6 +454,54 @@ fn fingerprint_incorporates_version_tokenizer_and_budget() {
     );
 }
 
+/// Rebuild detectability, artifact edition — red if the fingerprint
+/// trusts the human-readable label instead of the tokenizer's actual
+/// content: two tokenizer artifacts that count differently but carry
+/// the same model id (e.g. an upstream re-release of `tokenizer.json`
+/// under a mutable HF revision) must never share a fingerprint, or the
+/// slice-3 stamp would retain stale chunk vintages — the exact failure
+/// the fingerprint exists to prevent. Also red if the digest stops
+/// being deterministic for identical tokenizer content.
+#[test]
+fn fingerprint_binds_tokenizer_content_not_just_label() {
+    let a = HfTokenCounter::new(bge_tokenizer().clone(), MODEL_ID).expect("wrap");
+    let b = HfTokenCounter::new(bge_tokenizer().clone(), MODEL_ID).expect("wrap");
+    assert_eq!(
+        a.identity(),
+        b.identity(),
+        "identical tokenizer content must digest identically"
+    );
+    assert!(
+        a.identity().starts_with(&format!("{MODEL_ID}@sha256:")),
+        "identity must carry the label and a content digest, got {:?}",
+        a.identity()
+    );
+
+    // A behaviorally different artifact under the *same label*: one
+    // extra token in the vocabulary changes both counting and bytes.
+    let mut altered = bge_tokenizer().clone();
+    altered
+        .add_tokens([tokenizers::AddedToken::from("[[chunk-vintage]]", false)])
+        .expect("add token");
+    let altered = HfTokenCounter::new(altered, MODEL_ID).expect("wrap");
+    assert_ne!(
+        a.identity(),
+        altered.identity(),
+        "same label, different tokenizer bytes must not share an identity"
+    );
+
+    let fp_a = ChunkerConfig::new(Box::new(a), 512)
+        .expect("config")
+        .fingerprint();
+    let fp_altered = ChunkerConfig::new(Box::new(altered), 512)
+        .expect("config")
+        .fingerprint();
+    assert_ne!(
+        fp_a, fp_altered,
+        "same label, different tokenizer bytes must not share a fingerprint"
+    );
+}
+
 /// Config validation — red if a zero budget is accepted; it admits
 /// nothing (not even special tokens) and would degenerate every body
 /// into per-character fallback chunks by construction.
@@ -461,6 +509,102 @@ fn fingerprint_incorporates_version_tokenizer_and_budget() {
 fn zero_budget_is_rejected() {
     let counter = Box::new(StubCounter("stub"));
     assert!(ChunkerConfig::new(counter, 0).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Operation budget (rebuild-DoS regression)
+// ---------------------------------------------------------------------------
+
+/// Real BGE counter that also counts how many times it is invoked, so
+/// tests can bound the chunker's tokenization work, not just its
+/// output.
+struct CountingCounter {
+    inner: HfTokenCounter,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TokenCounter for CountingCounter {
+    fn identity(&self) -> &str {
+        self.inner.identity()
+    }
+    fn count(&self, text: &str) -> Result<usize, MemoryError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.count(text)
+    }
+}
+
+fn counting_config(
+    max_tokens: usize,
+) -> (
+    ChunkerConfig,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = CountingCounter {
+        inner: HfTokenCounter::new(bge_tokenizer().clone(), MODEL_ID).expect("wrap tokenizer"),
+        calls: std::sync::Arc::clone(&calls),
+    };
+    (
+        ChunkerConfig::new(Box::new(counter), max_tokens).expect("non-zero budget"),
+        calls,
+    )
+}
+
+/// Finding-2 regression (Syne, PR #326 review) — red if splitting
+/// regresses to a full tokenization per candidate over a growing
+/// substring: a valid maximum-size one-line memory then costs on the
+/// order of one `Tokenizer::encode` per character (~10⁵–10⁶ calls),
+/// turning catalog rebuild/startup into a stored-input DoS once slice
+/// 3 wires the chunker in. The bounded doubling+bisection probe needs
+/// O(log piece) calls per emitted chunk; the asserted ceilings leave
+/// generous headroom over the measured counts while sitting orders of
+/// magnitude below the per-character cost.
+#[test]
+fn pathological_inputs_stay_within_operation_budget() {
+    // One 100_000-character line (~50k tokens): exercises char_split.
+    // The per-character scan needed >100_000 encodes here.
+    let content = "a ".repeat(50_000);
+    let (cfg, calls) = counting_config(512);
+    let chunks = chunks_of(&content, &cfg);
+    assert!(chunks.len() > 1, "pathological line must split");
+    assert_eq!(reconstruct(&content, &chunks), content);
+    let single_line_calls = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        single_line_calls <= 64 * chunks.len() + 64,
+        "single-line split made {single_line_calls} tokenizer calls for {} chunks",
+        chunks.len()
+    );
+
+    // 50_000 two-character lines in one paragraph (blank-line-free):
+    // exercises whole-line packing. The per-line growing-substring
+    // scan needed one encode per line (50_000+).
+    let content = "b\n".repeat(50_000);
+    let (cfg, calls) = counting_config(512);
+    let chunks = chunks_of(&content, &cfg);
+    assert!(chunks.len() > 1, "pathological paragraph must split");
+    assert_eq!(reconstruct(&content, &chunks), content);
+    let multi_line_calls = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        multi_line_calls <= 64 * chunks.len() + 64,
+        "line packing made {multi_line_calls} tokenizer calls for {} chunks",
+        chunks.len()
+    );
+
+    // 25_000 tiny structural units (list items): exercises unit
+    // coalescing, which previously re-encoded the growing group once
+    // per unit.
+    let content = "- c\n".repeat(25_000);
+    let (cfg, calls) = counting_config(512);
+    let chunks = chunks_of(&content, &cfg);
+    assert!(chunks.len() > 1, "pathological list must split");
+    assert_eq!(reconstruct(&content, &chunks), content);
+    let unit_calls = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        unit_calls <= 64 * chunks.len() + 64,
+        "coalescing made {unit_calls} tokenizer calls for {} chunks",
+        chunks.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -808,6 +952,149 @@ mod properties {
                 rebuilt.push_str(record.body());
             }
             prop_assert_eq!(rebuilt, content);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Budget-scaled properties (finding 4, Syne's PR #326 review)
+    // -----------------------------------------------------------------------
+    //
+    // `any_doc` tops out around 300 characters, so at the 512 and 8192
+    // budgets the properties above exercise almost entirely the
+    // one-chunk path — an implementation that secretly clamped to 512
+    // would survive them. The generators here scale document size
+    // *around each budget* (below, at, and beyond it), so the
+    // multi-chunk paths — coalescing boundaries, oversized-block
+    // splitting — run under the real large budgets too. Case counts
+    // are small because each case tokenizes tens of kilobytes; the
+    // sizing knob (`quarters`) shrinks toward the budget threshold on
+    // failure.
+
+    /// Words the scaled filler draws from: prose-ish ASCII plus
+    /// multi-byte characters, so scaling is not ASCII-only.
+    fn filler_word() -> impl Strategy<Value = &'static str> {
+        proptest::sample::select(
+            &[
+                "alpha",
+                "budget",
+                "chunk",
+                "memory",
+                "retrieval",
+                "span",
+                "tokens",
+                "détente",
+                "雪山",
+                "🦋",
+            ][..],
+        )
+    }
+
+    /// A document sized relative to `budget`: `quarters` blocks of
+    /// filler prose totalling roughly `budget × quarters / 4` tokens
+    /// (the filler vocabulary measures ~5–6 chars/token, and the char
+    /// target uses 6, so high `quarters` values reliably overshoot the
+    /// budget). Paragraph blocks close every ~2 000 characters so
+    /// large documents contain many structural units, exercising
+    /// coalescing rather than a single oversized block.
+    fn scaled_doc(
+        budget: usize,
+        quarters: std::ops::RangeInclusive<usize>,
+    ) -> impl Strategy<Value = String> {
+        (
+            quarters,
+            proptest::collection::vec(filler_word(), 6..12),
+            1usize..=6,
+        )
+            .prop_map(move |(quarters, words, level)| {
+                let sentence = words.join(" ");
+                let target_chars = budget * 6 * quarters / 4;
+                let mut doc = format!("{} scaled fixture\n\n", "#".repeat(level));
+                let mut para_chars = 0usize;
+                while doc.len() < target_chars {
+                    doc.push_str(&sentence);
+                    doc.push('\n');
+                    para_chars += sentence.len() + 1;
+                    if para_chars > 2_000 {
+                        doc.push('\n');
+                        para_chars = 0;
+                    }
+                }
+                doc
+            })
+    }
+
+    /// The large budgets paired with a document scaled to them.
+    /// `quarters` picks the size range in budget-quarters: `1..=10`
+    /// spans below/at/beyond the budget; `6..=10` lands beyond it
+    /// (used where a case under the budget would just be discarded).
+    fn scaled_budget_and_doc(
+        quarters: std::ops::RangeInclusive<usize>,
+    ) -> impl Strategy<Value = (usize, String)> {
+        proptest::sample::select(&[512usize, 8192][..]).prop_flat_map(move |budget| {
+            scaled_doc(budget, quarters.clone()).prop_map(move |doc| (budget, doc))
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 8, ..ProptestConfig::default() })]
+
+        /// P2.4/P2.5/P2.6 at scale — red if the chunker misbehaves on
+        /// documents that genuinely cross the 512/8192 budgets: a
+        /// document measuring over the budget must span multiple
+        /// chunks (an implementation secretly clamping to 512 tokens,
+        /// or one whose 8192 path was never exercised, fails here),
+        /// every chunk must fit the budget, and tiling/reconstruction
+        /// must stay exact at tens-of-kilobytes scale.
+        #[test]
+        fn scaled_docs_cross_their_budgets((budget, content) in scaled_budget_and_doc(1..=10)) {
+            let cfg = shared_config(budget);
+            let chunks = chunks_of(&content, cfg);
+            let total = cfg.count(&content).expect("count");
+            if total > cfg.max_tokens() {
+                prop_assert!(
+                    chunks.len() >= 2,
+                    "{total} tokens at budget {} must span multiple chunks",
+                    cfg.max_tokens()
+                );
+            } else {
+                prop_assert_eq!(chunks.len(), 1);
+            }
+            prop_assert_eq!(chunks.first().map(|c| c.span.start()), Some(0));
+            prop_assert_eq!(chunks.last().map(|c| c.span.end()), Some(content.len()));
+            for pair in chunks.windows(2) {
+                prop_assert_eq!(pair[0].span.end(), pair[1].span.start());
+            }
+            for chunk in &chunks {
+                let body = chunk.span.slice_in(&content).expect("span resolves");
+                prop_assert!(cfg.count(body).expect("count") <= cfg.max_tokens());
+            }
+            prop_assert_eq!(reconstruct(&content, &chunks), content);
+        }
+
+        /// P2.7 at scale — red if appending closed blocks after a
+        /// *multi-chunk* document disturbs any chunk but the last;
+        /// the small-document property above rarely has more than one
+        /// chunk at 512/8192, so this is the append-stability check
+        /// that actually exercises interior chunk boundaries at the
+        /// real budgets.
+        #[test]
+        fn scaled_docs_preserve_prefix_chunks_on_append(
+            (budget, base) in scaled_budget_and_doc(6..=10),
+            suffix in paragraph_block(true),
+        ) {
+            let cfg = shared_config(budget);
+            let base_chunks = chunks_of(&base, cfg);
+            prop_assume!(base_chunks.len() >= 2);
+            let stable = base_chunks.len() - 1;
+
+            let grown = format!("{base}\n{suffix}");
+            let grown_chunks = chunks_of(&grown, cfg);
+            prop_assert!(grown_chunks.len() >= stable);
+            prop_assert_eq!(&grown_chunks[..stable], &base_chunks[..stable]);
+
+            let base_ids = fact_ids(&base, cfg);
+            let grown_ids = fact_ids(&grown, cfg);
+            prop_assert_eq!(&grown_ids[..stable], &base_ids[..stable]);
         }
     }
 }

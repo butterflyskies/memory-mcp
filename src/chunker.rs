@@ -63,10 +63,18 @@
 //! # Oversized indivisible blocks
 //!
 //! A single unit over budget is split deterministically: first at line
-//! boundaries (greedy longest run of whole lines that fits), then — for
-//! a single line over budget — at character boundaries (greedy longest
-//! run of characters that fits). Pieces never re-merge across a split.
-//! Documented fallback: if even a single character exceeds the budget
+//! boundaries (packing whole lines under the budget), then — for a
+//! single line over budget — at character boundaries (packing
+//! characters under the budget). Piece boundaries come from a bounded
+//! doubling-then-bisection probe (see `packed_len`), never a
+//! per-character scan over a growing substring, so the number of
+//! tokenizer calls is logarithmic per piece — a maximum-size one-line
+//! memory cannot turn catalog rebuild into ~10⁶ full tokenizations.
+//! Every emitted piece is verified against the budget; because real
+//! WordPiece counts are not monotone over prefixes, the probed
+//! boundary is *a* deterministic fitting one (identical to a greedy
+//! scan whenever counts are monotone). Pieces never re-merge across a
+//! split. Documented fallback: if even a single character exceeds the budget
 //! (only possible when the budget is smaller than the special-token
 //! overhead plus one), that character is emitted alone as an over-budget
 //! chunk — deterministic, and the only case ADR-0042 P2.6 permits over
@@ -83,6 +91,7 @@
 //! budgets are never silently mixed (ADR-0042 "stale schema/model"
 //! ledger row).
 
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 use crate::error::MemoryError;
@@ -107,12 +116,19 @@ pub(crate) const CHUNKER_VERSION: ChunkerVersion = ChunkerVersion::new(1);
 /// Implementations must be deterministic (same text, same count) and
 /// must count with the same settings the embedding path encodes with —
 /// including special tokens — so "fits the budget" here means "will not
-/// be truncated there". `identity` names the tokenizer (e.g. the
-/// HuggingFace model id) and participates in the chunker fingerprint:
-/// swapping the embedding model (BGE today, ModernBERT anticipated)
-/// changes the fingerprint and invalidates derived chunk state.
+/// be truncated there". `identity` participates in the chunker
+/// fingerprint and MUST be bound to the tokenizer's actual behavior,
+/// not just a human-readable label: two tokenizer artifacts that count
+/// differently must never share an identity, or the slice-3 staleness
+/// stamp would retain stale chunk vintages across an upstream tokenizer
+/// revision. [`HfTokenCounter`] satisfies this by including a digest of
+/// the tokenizer's canonical serialization. Swapping the embedding
+/// model (BGE today, ModernBERT anticipated) — or silently receiving a
+/// re-released tokenizer under the same model id — changes the
+/// fingerprint and invalidates derived chunk state.
 pub(crate) trait TokenCounter: Send + Sync {
-    /// Stable identity of the tokenizer (e.g. `BAAI/bge-small-en-v1.5`).
+    /// Stable identity of the tokenizer, bound to its actual content
+    /// (e.g. `BAAI/bge-small-en-v1.5@sha256:<digest16>`).
     fn identity(&self) -> &str;
 
     /// Number of tokens `text` encodes to, including special tokens.
@@ -131,17 +147,39 @@ impl HfTokenCounter {
     /// Wrap a tokenizer for counting. Truncation and padding are
     /// cleared so counts are true sequence lengths, not clipped or
     /// padded ones.
+    ///
+    /// `label` is the human-readable name (e.g. the HuggingFace model
+    /// id); the counter's [`TokenCounter::identity`] combines it with a
+    /// SHA-256 digest of the tokenizer's canonical serialization *as
+    /// configured for counting* (truncation/padding cleared). The
+    /// digest covers the whole pipeline — vocab, normalizer,
+    /// pre-tokenizer, post-processor, added/special tokens — so two
+    /// different tokenizer artifacts can never share an identity even
+    /// under the same label, and a mutable HF revision resolving to new
+    /// `tokenizer.json` bytes is a visible fingerprint change (a
+    /// staleness signal for the slice-3 catalog), not a silent mix of
+    /// chunk vintages.
     pub(crate) fn new(
         mut tokenizer: Tokenizer,
-        identity: impl Into<String>,
+        label: impl Into<String>,
     ) -> Result<Self, MemoryError> {
         tokenizer.with_truncation(None).map_err(|e| {
             MemoryError::Embedding(format!("failed to clear tokenizer truncation: {e}"))
         })?;
         tokenizer.with_padding(None);
+        let canonical = tokenizer
+            .to_string(false)
+            .map_err(|e| MemoryError::Embedding(format!("failed to serialize tokenizer: {e}")))?;
+        let digest = Sha256::digest(canonical.as_bytes());
+        let mut identity = label.into();
+        identity.push_str("@sha256:");
+        for byte in &digest[..8] {
+            use std::fmt::Write;
+            write!(identity, "{byte:02x}").expect("writing hex to a String cannot fail");
+        }
         Ok(Self {
             tokenizer,
-            identity: identity.into(),
+            identity,
         })
     }
 }
@@ -205,10 +243,12 @@ impl ChunkerConfig {
     }
 
     /// Full identity of a chunking run: algorithm revision, tokenizer
-    /// identity, and token budget.
+    /// identity (content-bound — see [`TokenCounter::identity`]), and
+    /// token budget.
     ///
     /// The slice-3 catalog stamps this string; a mismatch on load —
-    /// algorithm change, embedding-model swap (BGE → ModernBERT), or
+    /// algorithm change, embedding-model swap (BGE → ModernBERT), an
+    /// upstream tokenizer revision under the same model id, or a
     /// budget change — is detectable staleness and forces a full
     /// rebuild rather than mixing chunk vintages (ADR-0042).
     pub(crate) fn fingerprint(&self) -> String {
@@ -272,34 +312,34 @@ pub(crate) fn chunk_markdown(
     tile(&mut units, content.len());
 
     let mut chunks: Vec<Chunk> = Vec::new();
-    // Open group: (start, end, heading path of its first unit).
-    let mut group: Option<(usize, usize, Vec<String>)> = None;
-
-    for unit in units {
-        if let Some((g_start, g_end, path)) = group.take() {
-            // Greedy coalescing: extend the open group while the
-            // *exact final body* (tiled slice, whitespace included)
-            // stays within budget.
-            if config.fits(&content[g_start..unit.end])? {
-                group = Some((g_start, unit.end, path));
-                continue;
-            }
-            push_chunk(&mut chunks, g_start, g_end, &path)?;
-        }
-        if config.fits(&content[unit.start..unit.end])? {
-            group = Some((unit.start, unit.end, unit.heading_path));
-        } else {
+    let mut i = 0usize;
+    while i < units.len() {
+        // Coalescing: pack as many whole units as the budget admits,
+        // measuring the *exact final body* (tiled slice, whitespace
+        // included). The boundary comes from a bounded probe, not a
+        // per-unit scan over a growing substring (see [`packed_len`]).
+        let take = packed_len(units.len() - i, |n| {
+            config.fits(&content[units[i].start..units[i + n - 1].end])
+        })?;
+        if take == 0 {
+            // A single unit over budget on its own: split it.
             split_oversized(
-                &content[unit.start..unit.end],
-                unit.start,
-                &unit.heading_path,
+                &content[units[i].start..units[i].end],
+                units[i].start,
+                &units[i].heading_path,
                 config,
                 &mut chunks,
             )?;
+            i += 1;
+        } else {
+            push_chunk(
+                &mut chunks,
+                units[i].start,
+                units[i + take - 1].end,
+                &units[i].heading_path,
+            )?;
+            i += take;
         }
-    }
-    if let Some((g_start, g_end, path)) = group {
-        push_chunk(&mut chunks, g_start, g_end, &path)?;
     }
     Ok(chunks)
 }
@@ -349,13 +389,67 @@ fn push_chunk(
 }
 
 // ---------------------------------------------------------------------------
+// Bounded packing search
+// ---------------------------------------------------------------------------
+
+/// Deterministic bounded search for a packing boundary: how many of the
+/// `total` leading candidates (structural units, lines, or characters)
+/// the next piece takes.
+///
+/// `fits(n)` reports whether the piece formed by the first `n`
+/// candidates fits the token budget. The probe doubles `n` until a
+/// non-fitting count brackets the boundary, then bisects the bracket,
+/// so `fits` runs O(log total) times per piece instead of once per
+/// candidate over a growing substring — the previous per-candidate
+/// scan made a maximum-size single-line memory cost ~10⁶ full
+/// tokenizations, a rebuild/startup DoS once the chunker is wired into
+/// the catalog (see the operation-budget regression test).
+///
+/// Returns the chosen count; `0` means even the first candidate alone
+/// is over budget (the caller applies its indivisible-fallback
+/// policy). Real WordPiece token counts are not monotone over prefixes
+/// (BGE collapses >100-char words to `[UNK]`), so the result is *a*
+/// deterministic fitting boundary — identical to the greedy
+/// stop-at-first-overflow scan whenever counts are monotone — and
+/// every returned `n > 0` was verified by `fits` before being chosen.
+fn packed_len(
+    total: usize,
+    mut fits: impl FnMut(usize) -> Result<bool, MemoryError>,
+) -> Result<usize, MemoryError> {
+    debug_assert!(total > 0, "packing an empty candidate list");
+    let mut lo = 0usize; // largest count known to fit
+    let mut hi = loop {
+        // Doubling probe: 1, 2, 4, … until over budget or exhausted.
+        let n = lo.saturating_mul(2).max(1).min(total);
+        if !fits(n)? {
+            break n;
+        }
+        lo = n;
+        if n == total {
+            return Ok(total);
+        }
+    };
+    // Bisect the (fits, does-not-fit] bracket.
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+// ---------------------------------------------------------------------------
 // Oversized-unit splitting
 // ---------------------------------------------------------------------------
 
 /// Split one over-budget unit (`text`, at absolute offset `base`) into
-/// deterministic pieces: greedy whole-line packing first, then
-/// character-boundary packing for any single line over budget. Pieces
-/// tile `text` exactly and never re-merge across a split boundary.
+/// deterministic pieces: whole-line packing first, then
+/// character-boundary packing for any single line over budget. Piece
+/// boundaries come from [`packed_len`]'s bounded probe. Pieces tile
+/// `text` exactly and never re-merge across a split boundary.
 fn split_oversized(
     text: &str,
     base: usize,
@@ -363,40 +457,49 @@ fn split_oversized(
     config: &ChunkerConfig,
     chunks: &mut Vec<Chunk>,
 ) -> Result<(), MemoryError> {
-    let mut piece_start = 0usize;
+    // bounds[k] is the byte offset after the first k lines.
+    let mut bounds = vec![0usize];
     let mut offset = 0usize;
     for line in text.split_inclusive('\n') {
-        let line_start = offset;
         offset += line.len();
-        let line_end = offset;
-
-        if config.fits(&text[piece_start..line_end])? {
-            continue;
-        }
-        if piece_start < line_start {
-            // Close the packed lines so far; retry this line alone.
-            push_chunk(chunks, base + piece_start, base + line_start, heading_path)?;
-            piece_start = line_start;
-            if config.fits(&text[piece_start..line_end])? {
-                continue;
-            }
-        }
-        // A single line over budget: split at character boundaries.
-        char_split(line, base + line_start, heading_path, config, chunks)?;
-        piece_start = line_end;
+        bounds.push(offset);
     }
-    if piece_start < text.len() {
-        // The trailing piece passed every incremental fit check above.
-        push_chunk(chunks, base + piece_start, base + text.len(), heading_path)?;
+    let lines = bounds.len() - 1;
+
+    let mut start = 0usize; // index into `bounds`
+    while start < lines {
+        let take = packed_len(lines - start, |n| {
+            config.fits(&text[bounds[start]..bounds[start + n]])
+        })?;
+        if take == 0 {
+            // A single line over budget: split at character boundaries.
+            char_split(
+                &text[bounds[start]..bounds[start + 1]],
+                base + bounds[start],
+                heading_path,
+                config,
+                chunks,
+            )?;
+            start += 1;
+        } else {
+            push_chunk(
+                chunks,
+                base + bounds[start],
+                base + bounds[start + take],
+                heading_path,
+            )?;
+            start += take;
+        }
     }
     Ok(())
 }
 
 /// Split a single over-budget line (`seg`, at absolute offset `base`)
-/// at UTF-8 character boundaries: greedy longest prefix that fits, then
-/// repeat. Documented fallback: a single character that alone exceeds
-/// the budget is emitted alone, over budget — the only over-budget
-/// chunk shape this chunker produces (ADR-0042 P2.6).
+/// at UTF-8 character boundaries, each piece a [`packed_len`]-probed
+/// run of characters that fits. Documented fallback: a single
+/// character that alone exceeds the budget is emitted alone, over
+/// budget — the only over-budget chunk shape this chunker produces
+/// (ADR-0042 P2.6).
 fn char_split(
     seg: &str,
     base: usize,
@@ -404,25 +507,25 @@ fn char_split(
     config: &ChunkerConfig,
     chunks: &mut Vec<Chunk>,
 ) -> Result<(), MemoryError> {
-    let mut piece_start = 0usize;
-    for (idx, ch) in seg.char_indices() {
-        let next = idx + ch.len_utf8();
-        if config.fits(&seg[piece_start..next])? {
-            continue;
-        }
-        if piece_start < idx {
-            push_chunk(chunks, base + piece_start, base + idx, heading_path)?;
-            piece_start = idx;
-            if config.fits(&seg[piece_start..next])? {
-                continue;
-            }
-        }
+    // bounds[k] is the byte offset after the first k characters.
+    let mut bounds: Vec<usize> = seg.char_indices().map(|(i, _)| i).collect();
+    bounds.push(seg.len());
+    let chars = bounds.len() - 1;
+
+    let mut start = 0usize; // index into `bounds`
+    while start < chars {
+        let take = packed_len(chars - start, |n| {
+            config.fits(&seg[bounds[start]..bounds[start + n]])
+        })?
         // Indivisible fallback: one character over budget on its own.
-        push_chunk(chunks, base + piece_start, base + next, heading_path)?;
-        piece_start = next;
-    }
-    if piece_start < seg.len() {
-        push_chunk(chunks, base + piece_start, base + seg.len(), heading_path)?;
+        .max(1);
+        push_chunk(
+            chunks,
+            base + bounds[start],
+            base + bounds[start + take],
+            heading_path,
+        )?;
+        start += take;
     }
     Ok(())
 }
