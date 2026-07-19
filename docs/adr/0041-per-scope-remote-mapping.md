@@ -1,4 +1,4 @@
-# ADR-0038: Per-scope remote mapping for sync
+# ADR-0041: Per-scope remote mapping for sync
 
 ## Status
 Accepted

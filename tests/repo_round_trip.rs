@@ -358,7 +358,7 @@ async fn repo_move_memory_atomic_commit() {
     );
 }
 
-/// ADR-0038 compatibility (#293 review, round 6): a repo path spelled with
+/// ADR-0041 compatibility (#293 review, round 6): a repo path spelled with
 /// `..` over a not-yet-existing component — `existing/missing/../repo` —
 /// worked before startup canonicalization was introduced, so the startup
 /// pipeline (canonicalize, then init at the resolved path) must still accept
