@@ -476,6 +476,31 @@ fn otlp_startup_probe(
         .map_err(|e| format!("OTLP collector unreachable: {e} (endpoint supplied by {source})"))
 }
 
+/// Name the variant of an exporter build error without echoing its message.
+///
+/// The SDK error's `Display` output can embed the raw endpoint — tonic's
+/// HTTPS-without-TLS `InvalidConfig` repeats the full URL, query string and
+/// all — so construction-failure paths must never print the SDK message.
+/// Of the two sanitization options (classify the error vs. scrub the endpoint
+/// out of the SDK text), we classify: printing only this variant name plus
+/// the sanitized `scheme://host:port` is simpler and structurally cannot
+/// leak, at the cost of some diagnostic detail.
+#[cfg(feature = "otlp")]
+fn exporter_build_error_kind(e: &opentelemetry_otlp::ExporterBuildError) -> &'static str {
+    use opentelemetry_otlp::ExporterBuildError as E;
+    match e {
+        E::ThreadSpawnFailed => "ThreadSpawnFailed",
+        E::NoHttpClient => "NoHttpClient",
+        E::UnsupportedCompressionAlgorithm(_) => "UnsupportedCompressionAlgorithm",
+        E::InvalidUri(..) => "InvalidUri",
+        E::InvalidConfig { .. } => "InvalidConfig",
+        E::InternalFailure(_) => "InternalFailure",
+        // `ExporterBuildError` is #[non_exhaustive], and some variants are
+        // cfg-gated on SDK features, so anything unmatched lands here.
+        _ => "Other",
+    }
+}
+
 /// Initialise tracing for the serve command. If `--otlp-required` or
 /// `--otlp-optional` is set, activates OTLP export. Otherwise uses fmt-only
 /// (passive — the feature is compiled in but not activated).
@@ -483,6 +508,11 @@ fn otlp_startup_probe(
 /// With `--otlp-required`, the collector endpoint is probed eagerly (TCP
 /// connect, bounded timeout) and the process exits non-zero when it is
 /// unreachable — before the server binds or serves.
+///
+/// Like the probe errors, exporter construction-failure messages never echo
+/// the raw endpoint or the SDK error text (which can embed the endpoint):
+/// they name only the error kind, the sanitized `scheme://host:port`, and
+/// the environment source — see [`exporter_build_error_kind`].
 #[cfg(feature = "otlp")]
 fn init_tracing_for_serve(args: &ServeArgs) -> Option<OtlpProvider> {
     if !args.otlp_required && !args.otlp_optional {
@@ -490,12 +520,18 @@ fn init_tracing_for_serve(args: &ServeArgs) -> Option<OtlpProvider> {
         return None;
     }
 
+    let traces_env = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok();
+    let general_env = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    // Resolved exactly as the probe (and the tonic exporter) resolves it, so
+    // the construction-failure paths below can reuse the probe's sanitized
+    // display form instead of deriving anything from the SDK error.
+    let (endpoint, endpoint_source) =
+        resolve_otlp_endpoint(traces_env.as_deref(), general_env.as_deref());
+
     if let Err(e) = otlp_startup_probe(
         args.otlp_required,
-        std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-            .ok()
-            .as_deref(),
-        std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().as_deref(),
+        traces_env.as_deref(),
+        general_env.as_deref(),
     ) {
         eprintln!(
             "error: {e}\n\
@@ -536,19 +572,28 @@ fn init_tracing_for_serve(args: &ServeArgs) -> Option<OtlpProvider> {
             Some(provider)
         }
         Err(e) => {
+            // Never print `e` itself: its text can embed the raw endpoint,
+            // credentials included. Kind + sanitized endpoint + source only.
+            let error_kind = exporter_build_error_kind(&e);
+            let sanitized_endpoint = parse_otlp_endpoint(&endpoint)
+                .map(|t| t.display)
+                .unwrap_or_else(|_| "<unparseable endpoint>".to_owned());
             if args.otlp_optional {
                 tracing_subscriber::registry()
                     .with(filter)
                     .with(fmt_layer)
                     .init();
                 tracing::warn!(
-                    error = %e,
+                    error_kind,
+                    endpoint = %sanitized_endpoint,
+                    endpoint_source,
                     "OTLP exporter init failed — continuing with fmt-only tracing (--otlp-optional is set)"
                 );
                 None
             } else {
                 eprintln!(
-                    "error: OTLP exporter init failed: {e}\n\
+                    "error: OTLP exporter init failed ({error_kind}) for {sanitized_endpoint} \
+                     (endpoint supplied by {endpoint_source})\n\
                      Hint: pass --otlp-optional to fall back to fmt-only logging."
                 );
                 std::process::exit(1);
