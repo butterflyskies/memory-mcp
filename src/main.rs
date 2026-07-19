@@ -554,45 +554,17 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
                 .expect("failed to create index"),
         );
 
-        reindex_ok =
-            match memory_mcp::server::full_reindex(&router, embedding.as_ref(), index.as_ref())
-                .instrument(tracing::info_span!("startup.full_reindex"))
-                .await
-            {
-                Ok(stats) => {
-                    info!(
-                        added = stats.added,
-                        errors = stats.errors,
-                        "startup reindex complete"
-                    );
-                    if stats.added > 0 || stats.errors == 0 {
-                        if stats.errors > 0 {
-                            tracing::warn!(
-                            added = stats.added,
-                            errors = stats.errors,
-                            "startup reindex partially failed — some memories may not be searchable"
-                        );
-                        }
-                        if let Some(sha) = &head_sha {
-                            index.set_commit_sha(Some(sha));
-                        }
-                        stats.errors == 0
-                    } else {
-                        tracing::warn!(
-                            errors = stats.errors,
-                            "all embeds failed — SHA not stamped, will retry on next startup"
-                        );
-                        false
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "startup reindex failed — SHA not stamped, will retry on next startup"
-                    );
-                    false
-                }
-            };
+        // Certification requires errors == 0 (#293 review, round 3): a
+        // partial rebuild must not stamp the SHA, or the next startup would
+        // see index SHA == HEAD and skip the reindex that repairs the gap.
+        reindex_ok = memory_mcp::server::startup_reindex_and_certify(
+            &router,
+            embedding.as_ref(),
+            index.as_ref(),
+            head_sha.as_deref(),
+        )
+        .instrument(tracing::info_span!("startup.full_reindex"))
+        .await;
     } else {
         tracing::debug!(sha = ?head_sha, "index SHA matches repo HEAD — skipping reindex");
         reindex_ok = true;

@@ -39,6 +39,14 @@ pub struct RepoRouter {
     /// Scope-specific repos, ordered by prefix length descending so longest
     /// prefix matches first.
     routes: Vec<ScopeRoute>,
+    /// Aggregate sync health reporter (#293 review, round 3).
+    ///
+    /// Each repo's pull/push reports per operation to a shared reporter, so
+    /// with multiple repos the last operation's outcome would overwrite
+    /// earlier failures. When present, [`RepoRouter::sync_all`] reports the
+    /// aggregate outcome of the completed sync once, so readiness reflects
+    /// every repo — not the last iteration.
+    sync_reporter: Option<SubsystemReporter>,
 }
 
 /// Result of a sync (push/pull) across all repos.
@@ -112,13 +120,17 @@ impl RepoRouter {
         Self {
             default_repo,
             routes: Vec::new(),
+            sync_reporter: None,
         }
     }
 
     /// Create a router from config, initialising scope-specific repos.
     ///
     /// Each `RemoteMapping` in the config produces a new `MemoryRepo` at the
-    /// resolved path with the mapping's URL as origin.
+    /// resolved path with the mapping's URL as origin. Every mapped branch
+    /// name is validated here (#293 review, round 3) — an invalid override
+    /// must be rejected at construction, not discovered at the first
+    /// push/pull.
     pub fn from_config(
         default_repo: Arc<MemoryRepo>,
         mappings: &[crate::config::RemoteMapping],
@@ -127,6 +139,16 @@ impl RepoRouter {
     ) -> Result<Self, MemoryError> {
         let mut routes = Vec::with_capacity(mappings.len());
         for mapping in mappings {
+            if let Some(branch) = &mapping.branch {
+                crate::types::validate_branch_name(branch).map_err(|_| {
+                    MemoryError::InvalidInput {
+                        reason: format!(
+                            "invalid branch '{}' for scope '{}'",
+                            branch, mapping.scope
+                        ),
+                    }
+                })?;
+            }
             let path = mapping.resolved_path()?;
             info!(
                 scope = %mapping.scope,
@@ -151,6 +173,7 @@ impl RepoRouter {
         Ok(Self {
             default_repo,
             routes,
+            sync_reporter: Some(sync_reporter.clone()),
         })
     }
 
@@ -363,7 +386,9 @@ impl RepoRouter {
     /// network blip on one remote must not block syncing the others. Each
     /// failure is recorded on that repo's [`SyncEntry`] (`pull_error` /
     /// `push_error`) so callers can surface partial failures instead of
-    /// reporting a clean sync; check [`MultiSyncResult::all_ok`].
+    /// reporting a clean sync; check [`MultiSyncResult::all_ok`]. When the
+    /// router carries a sync reporter, the aggregate outcome is reported
+    /// once after all repos complete.
     pub async fn sync_all(
         &self,
         auth: &AuthProvider,
@@ -494,6 +519,19 @@ impl RepoRouter {
             );
         }
 
+        // Aggregate sync health, reported once from the completed result
+        // (#293 review, round 3). The per-operation reports above are
+        // last-operation-wins: a failed repo followed by a clean one would
+        // leave the shared reporter healthy. The settled state must reflect
+        // every repo's pull/push outcome.
+        if let Some(reporter) = &self.sync_reporter {
+            if result.all_ok() {
+                reporter.report_ok();
+            } else {
+                reporter.report_err("one or more repos failed to sync");
+            }
+        }
+
         Ok(result)
     }
 
@@ -583,6 +621,7 @@ mod tests {
                 repo: Arc::clone(&work_repo),
                 branch: None,
             }],
+            sync_reporter: None,
         };
 
         // Root goes to default.
@@ -646,6 +685,7 @@ mod tests {
         let router = RepoRouter {
             default_repo: Arc::clone(&default_repo),
             routes,
+            sync_reporter: None,
         };
 
         // "org/team" matches the longer prefix.
@@ -677,6 +717,7 @@ mod tests {
                 repo: Arc::clone(&work_repo),
                 branch: Some("develop".to_string()),
             }],
+            sync_reporter: None,
         };
 
         assert_eq!(router.branch_for_scope(&Scope::Root, "main"), "main");
@@ -699,6 +740,7 @@ mod tests {
                 repo: work_repo,
                 branch: None,
             }],
+            sync_reporter: None,
         };
 
         let root = Memory::from_validated(
@@ -754,6 +796,7 @@ mod tests {
                 repo: Arc::clone(&work_repo),
                 branch: None,
             }],
+            sync_reporter: None,
         };
         (router, default_repo, work_repo)
     }
@@ -891,6 +934,182 @@ mod tests {
             names,
             vec!["root-note"],
             "root-scope listing must be unaffected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mapped-branch validation (#293 review, round 3)
+    //
+    // Every configured branch override goes through `validate_branch_name`
+    // at router construction — not just the server-wide default branch that
+    // `--branch` validates in main.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_config_rejects_invalid_mapped_branch() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo = test_repo(&default_dir);
+        let work_dir = tempfile::tempdir().unwrap();
+        let health = crate::health::HealthRegistry::new();
+
+        for bad in [
+            "bad..branch",
+            "",
+            "branch with space",
+            "/leading",
+            "trailing/",
+        ] {
+            let mapping = crate::config::RemoteMapping {
+                scope: "work".to_string(),
+                url: "file:///nonexistent/remote.git".to_string(),
+                path: Some(work_dir.path().display().to_string()),
+                branch: Some(bad.to_string()),
+            };
+            let result = RepoRouter::from_config(
+                Arc::clone(&default_repo),
+                std::slice::from_ref(&mapping),
+                &health.git,
+                &health.sync,
+            );
+            match result {
+                Err(MemoryError::InvalidInput { .. }) => {}
+                Err(other) => panic!("branch {bad:?} must fail as InvalidInput: {other:?}"),
+                Ok(_) => panic!("branch {bad:?} must be rejected at construction"),
+            }
+        }
+
+        // A valid override still constructs, proving the gate rejects the
+        // name, not the presence of an override.
+        let mapping = crate::config::RemoteMapping {
+            scope: "work".to_string(),
+            url: "file:///nonexistent/remote.git".to_string(),
+            path: Some(work_dir.path().display().to_string()),
+            branch: Some("release/1.0".to_string()),
+        };
+        RepoRouter::from_config(
+            default_repo,
+            std::slice::from_ref(&mapping),
+            &health.git,
+            &health.sync,
+        )
+        .expect("a valid mapped branch must construct");
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate sync health (#293 review, round 3)
+    //
+    // Each repo's pull/push reports per operation to the shared sync
+    // reporter, so multi-repo readiness was last-operation-wins: a failed
+    // repo followed by a clean one left the reporter healthy. `sync_all`
+    // must settle the reporter once from the completed `MultiSyncResult`.
+    // -----------------------------------------------------------------------
+
+    fn sync_test_auth() -> AuthProvider {
+        AuthProvider::with_token("ghp_fake_token")
+    }
+
+    /// Create a bare origin seeded with one root-scope memory via a writer
+    /// clone, so a fresh repo can pull and push it cleanly.
+    async fn seeded_remote(seed_name: &str) -> (tempfile::TempDir, String) {
+        let remote_dir = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(remote_dir.path()).unwrap();
+        let url = format!("file://{}", remote_dir.path().display());
+        let writer_dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(MemoryRepo::init_or_open(writer_dir.path(), Some(&url)).unwrap());
+        writer.save_memory(&memory_at("", seed_name)).await.unwrap();
+        writer.push(&sync_test_auth(), "main").await.unwrap();
+        (remote_dir, url)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_health_reflects_aggregate_not_last_repo() {
+        // The default repo — FIRST in sync order — has an unreachable
+        // origin, so its pull fails. The mapped repo — LAST — syncs
+        // cleanly, so per-operation reporting alone would leave the shared
+        // reporter healthy.
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo = Arc::new(
+            MemoryRepo::init_or_open(
+                default_dir.path(),
+                Some("file:///nonexistent/memory-mcp-test-remote.git"),
+            )
+            .unwrap(),
+        );
+
+        let (_remote_dir, url) = seeded_remote("seed").await;
+        let work_dir = tempfile::tempdir().unwrap();
+        let health = crate::health::HealthRegistry::new();
+        let mapping = crate::config::RemoteMapping {
+            scope: "work".to_string(),
+            url,
+            path: Some(work_dir.path().display().to_string()),
+            branch: None,
+        };
+        let router = RepoRouter::from_config(
+            default_repo,
+            std::slice::from_ref(&mapping),
+            &health.git,
+            &health.sync,
+        )
+        .unwrap();
+
+        let result = router
+            .sync_all(&sync_test_auth(), "main", true)
+            .await
+            .unwrap();
+        assert!(!result.all_ok());
+        assert!(
+            result.results[0].pull_error.is_some(),
+            "precondition: the first repo's pull must fail"
+        );
+        assert!(
+            result.results[1].is_ok(),
+            "precondition: the last repo must sync cleanly"
+        );
+
+        let sync = health.sync.load();
+        assert!(
+            !sync.healthy,
+            "aggregate sync health must reflect the failed repo, not the \
+             last repo's clean operations"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_health_ok_when_every_repo_syncs() {
+        let (_default_remote, default_url) = seeded_remote("seed-default").await;
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo =
+            Arc::new(MemoryRepo::init_or_open(default_dir.path(), Some(&default_url)).unwrap());
+
+        let (_work_remote, work_url) = seeded_remote("seed-work").await;
+        let work_dir = tempfile::tempdir().unwrap();
+        let health = crate::health::HealthRegistry::new();
+        let mapping = crate::config::RemoteMapping {
+            scope: "work".to_string(),
+            url: work_url,
+            path: Some(work_dir.path().display().to_string()),
+            branch: None,
+        };
+        let router = RepoRouter::from_config(
+            default_repo,
+            std::slice::from_ref(&mapping),
+            &health.git,
+            &health.sync,
+        )
+        .unwrap();
+
+        let result = router
+            .sync_all(&sync_test_auth(), "main", true)
+            .await
+            .unwrap();
+        assert!(
+            result.all_ok(),
+            "precondition: every repo must sync cleanly"
+        );
+        assert!(
+            health.sync.load().healthy,
+            "a fully clean sync must settle the reporter healthy"
         );
     }
 }

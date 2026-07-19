@@ -625,8 +625,9 @@ async fn incremental_reindex(
 /// files could not all be resolved marks the lexical index rebuild-required,
 /// schedules router-wide repair, and refuses to advance the stored composite
 /// SHA — the next startup reindexes from git truth instead of trusting a
-/// partial mirror. The SHA is also held back when every reindex attempt
-/// failed, so the next startup retries.
+/// partial mirror. The SHA is also held back when the reindex recorded *any*
+/// item-level error (#293 review, round 3): a mirror that skipped even one
+/// memory is not verified, so partial success must not certify it.
 ///
 /// The refusal is sticky (#293 review, round 2): once a mirror gap opens,
 /// [`AppState::mark_index_mirror_incomplete`] blocks SHA advancement for the
@@ -680,11 +681,11 @@ async fn mirror_sync_results(
         }
     }
 
-    let reindex_failed_completely = any_reindex
-        && total_reindex.added == 0
-        && total_reindex.updated == 0
-        && total_reindex.errors > 0;
-    if mirror_incomplete || reindex_failed_completely {
+    // Any item-level error means the mirror skipped something (#293 review,
+    // round 3): certification requires errors == 0, not merely "some items
+    // succeeded".
+    let reindex_had_errors = total_reindex.errors > 0;
+    if mirror_incomplete || reindex_had_errors {
         // Sticky for the process lifetime: a later complete sync only
         // mirrors its own pulled range and cannot backfill this gap, so it
         // must not advance the SHA either — only a full reindex (next
@@ -813,7 +814,7 @@ async fn mirror_pulled_changes(
     }
 
     let mut reindex_stats = None;
-    let mut reindex_failed_completely = false;
+    let mut reindex_had_errors = false;
     if !changes.is_empty() {
         let stats = incremental_reindex(
             &state.repo,
@@ -832,7 +833,7 @@ async fn mirror_pulled_changes(
             errors = stats.errors,
             "incremental reindex complete"
         );
-        reindex_failed_completely = stats.added == 0 && stats.updated == 0 && stats.errors > 0;
+        reindex_had_errors = stats.errors > 0;
         reindex_stats = Some(stats);
     }
 
@@ -841,9 +842,10 @@ async fn mirror_pulled_changes(
     }
 
     // Advance the stored SHA so the next startup doesn't trigger a full
-    // reindex for changes already processed. Skip when every embed failed
-    // so the next startup retries.
-    if !reindex_failed_completely {
+    // reindex for changes already processed. Skip when any item-level error
+    // occurred or the change set was incomplete, so the next startup
+    // retries (#293 review, round 3).
+    if !reindex_had_errors && changes.unresolved == 0 {
         if let Some(sha) = state.repo.head_sha().await {
             state.index.set_commit_sha(Some(&sha));
         }
@@ -937,6 +939,53 @@ pub async fn full_reindex(
     }
 
     Ok(stats)
+}
+
+/// Run the startup full reindex and certify the result.
+///
+/// Stamps `head_sha` into the index only when the rebuild recorded zero
+/// item-level errors (#293 review, round 3): a rebuild that skipped even one
+/// memory is not a verified mirror, so the stamp is withheld — the next
+/// startup sees the SHA mismatch and rebuilds again — instead of certifying
+/// an incomplete index as intact.
+///
+/// Returns `true` when the reindex completed cleanly and was certified.
+pub async fn startup_reindex_and_certify(
+    router: &crate::repo_router::RepoRouter,
+    embedding: &dyn EmbeddingBackend,
+    index: &dyn VectorStore,
+    head_sha: Option<&str>,
+) -> bool {
+    match full_reindex(router, embedding, index).await {
+        Ok(stats) => {
+            info!(
+                added = stats.added,
+                errors = stats.errors,
+                "startup reindex complete"
+            );
+            if stats.errors == 0 {
+                if let Some(sha) = head_sha {
+                    index.set_commit_sha(Some(sha));
+                }
+                true
+            } else {
+                warn!(
+                    added = stats.added,
+                    errors = stats.errors,
+                    "startup reindex recorded item-level errors — SHA not stamped, \
+                     the next startup rebuilds instead of trusting a partial index"
+                );
+                false
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "startup reindex failed — SHA not stamped, will retry on next startup"
+            );
+            false
+        }
+    }
 }
 
 /// Persist the vector index at graceful shutdown.
@@ -4340,6 +4389,148 @@ mod tests {
                 fresh.index.commit_sha(),
                 expected,
                 "a complete mirror must advance the composite SHA"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Partial-rebuild certification (#293 review, round 3)
+        //
+        // A rebuild that recorded any item-level error is not a verified
+        // mirror — certification requires errors == 0. The startup stamp is
+        // withheld and incremental composite-SHA advancement is refused, so
+        // the next startup rebuilds from git truth instead of trusting a
+        // partially populated index that was stamped as intact.
+        // -------------------------------------------------------------------
+
+        /// Embedding backend that fails for content containing
+        /// "poisonword": the batch path errors and the per-item fallback
+        /// records a partial failure (other items embed fine).
+        struct PoisonEmbedding;
+
+        #[async_trait]
+        impl crate::embedding::EmbeddingBackend for PoisonEmbedding {
+            async fn embed(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, crate::error::MemoryError> {
+                if texts.iter().any(|t| t.contains("poisonword")) {
+                    return Err(crate::error::MemoryError::Internal("poisoned embed".into()));
+                }
+                Ok(texts.iter().map(|_| vec![0.0, 0.0, 0.0, 1.0]).collect())
+            }
+
+            fn dimensions(&self) -> usize {
+                4
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn startup_reindex_with_item_errors_withholds_certification() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let repo = Arc::new(MemoryRepo::init_or_open(tmp.path(), None).expect("repo init"));
+            let router = RepoRouter::single(Arc::clone(&repo));
+
+            let memory = |name: &str, content: &str| {
+                Memory::from_validated(
+                    MemoryName::new(name.to_string()).unwrap(),
+                    content.to_string(),
+                    MemoryMetadata::new(Scope::Root, vec![], None),
+                )
+            };
+            repo.save_memory(&memory("good", "cleanword payload"))
+                .await
+                .expect("save good");
+            repo.save_memory(&memory("bad", "poisonword payload"))
+                .await
+                .expect("save bad");
+            let head = router.head_sha().await;
+            assert!(head.is_some(), "git truth must yield a head SHA");
+
+            // Partial rebuild: one item embeds, one errors. The rebuild
+            // "completes" but must NOT be certified.
+            let index = InMemoryStore::new(4);
+            let certified =
+                startup_reindex_and_certify(&router, &PoisonEmbedding, &index, head.as_deref())
+                    .await;
+            assert!(
+                !certified,
+                "a rebuild with item-level errors must not be certified"
+            );
+            assert_eq!(
+                index.commit_sha(),
+                None,
+                "the SHA stamp must be withheld — stamping would make the \
+                 next startup skip the rebuild that repairs the gap"
+            );
+
+            // Contrast: a clean rebuild of the same truth is certified and
+            // stamps the SHA, proving the withheld stamp above came from
+            // the item-level error, not a missing head.
+            let clean_index = InMemoryStore::new(4);
+            let certified =
+                startup_reindex_and_certify(&router, &MockEmbedding, &clean_index, head.as_deref())
+                    .await;
+            assert!(certified, "a clean rebuild must be certified");
+            assert_eq!(
+                clean_index.commit_sha(),
+                head,
+                "a clean rebuild must stamp the head SHA"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn partial_incremental_reindex_refuses_composite_sha_advancement() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            // Git truth: one readable memory, so head_sha() is Some and
+            // advancement is genuinely possible.
+            let good = Memory::from_validated(
+                MemoryName::new("good".to_string()).unwrap(),
+                "goodword payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&good).await.expect("save");
+
+            // A pulled change set naming the readable memory plus one that
+            // cannot be read back: the reindex partially succeeds and
+            // records one item-level error.
+            let mref = |name: &str| {
+                MemoryRef::new(Scope::Root, MemoryName::new(name.to_string()).unwrap())
+            };
+            let result = MultiSyncResult {
+                results: vec![SyncEntry {
+                    label: "default".to_string(),
+                    scope: Scope::Root,
+                    pull: None,
+                    pull_error: None,
+                    push_ok: true,
+                    push_error: None,
+                    changes: None,
+                    resolved_changes: Some(ResolvedChanges {
+                        upserted: vec![mref("good"), mref("ghost")],
+                        removed: vec![],
+                        unresolved: 0,
+                    }),
+                    changes_complete: true,
+                }],
+            };
+            let (stats, any_reindex) = mirror_sync_results(&state, &result).await;
+            assert!(any_reindex);
+            assert_eq!(stats.added, 1, "the readable memory must still be mirrored");
+            assert_eq!(
+                stats.errors, 1,
+                "the unreadable memory must be recorded as an item-level error"
+            );
+            assert!(
+                !state.index_mirror_is_intact(),
+                "an item-level error must open a sticky mirror gap"
+            );
+            assert_eq!(
+                state.index.commit_sha(),
+                None,
+                "a partially successful reindex must refuse composite-SHA \
+                 advancement — partial success is not certification"
             );
         }
 

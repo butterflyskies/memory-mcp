@@ -407,8 +407,9 @@ pub struct AppState {
     ///
     /// Cleared — sticky for the process lifetime — when a mirror gap opens
     /// that only a full reindex can close: post-pull change discovery fails,
-    /// pulled files cannot be resolved, an incremental reindex fails
-    /// completely, or the startup reindex did not complete cleanly. While
+    /// pulled files cannot be resolved, an incremental reindex records any
+    /// item-level error, or the startup reindex did not complete cleanly
+    /// (#293 review, round 3: partial success is not certification). While
     /// cleared, composite-SHA advancement is refused at both sync and
     /// shutdown, so the next startup detects the SHA mismatch and rebuilds
     /// the vector index from git truth.

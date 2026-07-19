@@ -66,6 +66,21 @@ impl Config {
                     path.display()
                 ),
             })?;
+            // Every mapped branch is validated, not just the server-wide
+            // default (#293 review, round 3): an invalid override must be
+            // rejected here, not discovered at the first push/pull.
+            if let Some(branch) = &mapping.branch {
+                crate::types::validate_branch_name(branch).map_err(|_| {
+                    MemoryError::InvalidInput {
+                        reason: format!(
+                            "invalid branch '{}' for scope '{}' in config file {}",
+                            branch,
+                            mapping.scope,
+                            path.display()
+                        ),
+                    }
+                })?;
+            }
         }
         info!(
             path = %path.display(),
@@ -203,5 +218,35 @@ url = "git@github.com:org/team-memories.git"
     fn load_missing_file_returns_default() {
         let config = Config::load(Path::new("/nonexistent/path/config.toml")).unwrap();
         assert!(config.remotes.is_empty());
+    }
+
+    /// Every mapped branch is validated at config load (#293 review,
+    /// round 3) — an invalid override must be rejected here, not discovered
+    /// at the first push/pull against that repo.
+    #[test]
+    fn load_rejects_invalid_mapped_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[remotes]]
+scope = "ok"
+url = "https://example.com/ok.git"
+branch = "main"
+
+[[remotes]]
+scope = "work"
+url = "https://example.com/repo.git"
+branch = "bad..branch"
+"#,
+        )
+        .unwrap();
+        let err = Config::load(&path).expect_err("an invalid mapped branch must fail the load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bad..branch") && msg.contains("work"),
+            "the error must name the offending branch and scope: {msg}"
+        );
     }
 }
