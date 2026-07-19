@@ -180,6 +180,10 @@ impl FactId {
     /// `parent_id` must be non-empty and must not contain `:` — the
     /// rendered form is colon-delimited, and an id that cannot round-trip
     /// through its canonical string is not an id.
+    ///
+    /// `body` must be exactly `span.len()` bytes: the body *is* the parent
+    /// content at that span, so a length mismatch is false provenance and
+    /// is rejected rather than silently blessed with an id.
     pub fn derive(
         parent_id: impl Into<String>,
         chunker_version: ChunkerVersion,
@@ -188,6 +192,16 @@ impl FactId {
     ) -> Result<Self, MemoryError> {
         let parent_id = parent_id.into();
         Self::validate_parent_id(&parent_id)?;
+        if body.len() != span.len() {
+            return Err(MemoryError::InvalidInput {
+                reason: format!(
+                    "chunk body is {} bytes but source span {span} covers {} bytes — \
+                     a fact id must describe the body it is derived from",
+                    body.len(),
+                    span.len()
+                ),
+            });
+        }
 
         // Length-prefixed canonical encoding: no field concatenation can
         // collide with a different field split producing the same bytes.
@@ -266,10 +280,23 @@ impl fmt::Display for FactId {
 impl FromStr for FactId {
     type Err = MemoryError;
 
-    /// Strict parse of the canonical form. Anything that does not
-    /// round-trip byte-for-byte through [`fmt::Display`] is rejected —
-    /// there is no lenient mode (ADR-0019).
+    /// Strict parse of the canonical form. Acceptance implies
+    /// byte-for-byte canonicality: `parse(s)` succeeds only when
+    /// `render(parse(s)) == s`, so noncanonical numeric spellings
+    /// (leading zeros, signs) are rejected along with everything else
+    /// [`fmt::Display`] cannot produce — there is no lenient mode
+    /// (ADR-0019, ADR-0042 P1.3).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        /// Parse a numeric field, accepting only the canonical spelling:
+        /// the parsed value must re-render to exactly the input bytes.
+        /// Rust's integer `FromStr` tolerates leading zeros and a leading
+        /// `+`; laundering those through parse would break P1.3's
+        /// render∘parse identity.
+        fn parse_canonical<T: FromStr + ToString>(field: &str) -> Option<T> {
+            let value = field.parse::<T>().ok()?;
+            (value.to_string() == field).then_some(value)
+        }
+
         let malformed = |detail: &str| MemoryError::InvalidInput {
             reason: format!("malformed fact id '{s}': {detail}"),
         };
@@ -289,20 +316,17 @@ impl FromStr for FactId {
 
         Self::validate_parent_id(parent_id)?;
 
-        let chunker_version = version
-            .parse::<u32>()
+        let chunker_version = parse_canonical::<u32>(version)
             .map(ChunkerVersion::new)
-            .map_err(|_| malformed("chunker version is not a u32"))?;
+            .ok_or_else(|| malformed("chunker version is not a canonically spelled u32"))?;
 
         let (start, end) = span
             .split_once('-')
             .ok_or_else(|| malformed("span is not '<start>-<end>'"))?;
-        let start = start
-            .parse::<usize>()
-            .map_err(|_| malformed("span start is not an integer"))?;
-        let end = end
-            .parse::<usize>()
-            .map_err(|_| malformed("span end is not an integer"))?;
+        let start = parse_canonical::<usize>(start)
+            .ok_or_else(|| malformed("span start is not a canonically spelled integer"))?;
+        let end = parse_canonical::<usize>(end)
+            .ok_or_else(|| malformed("span end is not a canonically spelled integer"))?;
         let span = SourceSpan::new(start, end)?;
 
         if digest.len() != DIGEST_HEX_LEN
@@ -341,33 +365,136 @@ impl<'de> Deserialize<'de> for FactId {
 
 /// One entry in the derived retrieval catalog (#262 slice 3).
 ///
-/// Data-like wire DTO with public fields. The parent memory id, chunker
-/// version, and source span live inside [`FactRecord::id`] and are
-/// deliberately not duplicated as fields — a record and its identity
-/// cannot diverge. Accessors delegate.
+/// The parent memory id, chunker version, and source span live inside
+/// [`FactRecord::id`] and are deliberately not duplicated as fields — a
+/// record and its identity cannot diverge. Accessors delegate.
+///
+/// Invariant: the id is *true provenance* for the body — re-deriving a
+/// `FactId` from the record's own body at the id's coordinates reproduces
+/// the id exactly (which implies `body.len() == span.len()`). Enforced at
+/// construction ([`FactRecord::new`]) and on deserialization (strict serde
+/// per ADR-0019): a persisted catalog entry whose body and id disagree is
+/// corrupt derived state and fails closed instead of loading cleanly.
 ///
 /// The catalog is derived, rebuildable state; markdown remains canonical.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawFactRecord")]
 pub struct FactRecord {
     /// Deterministic identity (carries parent id, chunker version, span).
-    pub id: FactId,
+    id: FactId,
     /// Scope + name of the parent memory, for resolution and display.
-    pub parent: MemoryRef,
+    parent: MemoryRef,
     /// Markdown heading trail from the document root to this chunk
     /// (empty for preamble text before the first heading).
-    pub heading_path: Vec<String>,
+    heading_path: Vec<String>,
     /// The chunk's text — the parent content at the id's span, at the
     /// time the catalog was built.
-    pub body: String,
+    body: String,
     /// Tags inherited from the parent memory.
-    pub tags: Vec<String>,
+    tags: Vec<String>,
     /// Raw `[[reference]]` targets extracted from the chunk body
     /// (#262 slice 8). Unresolved targets are valid — dangling references
     /// are future-work markers, not errors. Empty until slice 8 lands.
-    pub refs_out: Vec<String>,
+    refs_out: Vec<String>,
+}
+
+/// Unvalidated wire shape for [`FactRecord`]; conversion enforces id/body
+/// consistency so no inconsistent record can enter through deserialization.
+#[derive(Deserialize)]
+struct RawFactRecord {
+    id: FactId,
+    parent: MemoryRef,
+    heading_path: Vec<String>,
+    body: String,
+    tags: Vec<String>,
+    refs_out: Vec<String>,
+}
+
+impl TryFrom<RawFactRecord> for FactRecord {
+    type Error = MemoryError;
+
+    fn try_from(raw: RawFactRecord) -> Result<Self, Self::Error> {
+        Self::new(
+            raw.id,
+            raw.parent,
+            raw.heading_path,
+            raw.body,
+            raw.tags,
+            raw.refs_out,
+        )
+    }
+}
+
+/// Check that `id` is true provenance for `body`: deriving a fresh id from
+/// the body at the id's own coordinates must reproduce `id` exactly.
+/// Rejects both a span whose length disagrees with the body (via
+/// [`FactId::derive`]) and a digest that does not match the body's content.
+fn validate_id_matches_body(id: &FactId, body: &str) -> Result<(), MemoryError> {
+    let derived = FactId::derive(id.parent_id(), id.chunker_version(), id.span(), body)?;
+    if derived != *id {
+        return Err(MemoryError::InvalidInput {
+            reason: format!(
+                "fact id '{id}' does not match its paired body: deriving from the body \
+                 yields '{derived}' — id and content have diverged"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl FactRecord {
+    /// Create a catalog record, enforcing that `id` is true provenance for
+    /// `body`: the id must re-derive exactly from the body at the id's own
+    /// parent/version/span coordinates.
+    pub fn new(
+        id: FactId,
+        parent: MemoryRef,
+        heading_path: Vec<String>,
+        body: String,
+        tags: Vec<String>,
+        refs_out: Vec<String>,
+    ) -> Result<Self, MemoryError> {
+        validate_id_matches_body(&id, &body)?;
+        Ok(Self {
+            id,
+            parent,
+            heading_path,
+            body,
+            tags,
+            refs_out,
+        })
+    }
+
+    /// Deterministic identity (carries parent id, chunker version, span).
+    pub const fn id(&self) -> &FactId {
+        &self.id
+    }
+
+    /// Scope + name of the parent memory.
+    pub const fn parent(&self) -> &MemoryRef {
+        &self.parent
+    }
+
+    /// Markdown heading trail from the document root to this chunk.
+    pub fn heading_path(&self) -> &[String] {
+        &self.heading_path
+    }
+
+    /// The chunk's text — the parent content at the id's span.
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Tags inherited from the parent memory.
+    pub fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    /// Raw `[[reference]]` targets extracted from the chunk body.
+    pub fn refs_out(&self) -> &[String] {
+        &self.refs_out
+    }
+
     /// The parent memory's id (UUID string), from [`FactRecord::id`].
     pub fn parent_id(&self) -> &str {
         self.id.parent_id()
@@ -395,14 +522,69 @@ impl FactRecord {
 /// are unchanged; once chunk retrieval is wired, hits additionally carry
 /// the specific fact that matched so clients see the precise hit and know
 /// where to drill in. `read` still returns the whole parent memory.
+///
+/// Invariant: same true-provenance contract as [`FactRecord`] — `text` is
+/// the matched chunk's body, so the fact id must re-derive exactly from it.
+/// Enforced at construction ([`MatchedChunk::new`]) and on deserialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawMatchedChunk")]
 pub struct MatchedChunk {
     /// Identity of the matched fact (carries parent id and span).
-    pub fact_id: FactId,
+    fact_id: FactId,
     /// Markdown heading trail locating the chunk within its parent.
-    pub heading_path: Vec<String>,
+    heading_path: Vec<String>,
     /// The matched chunk's text.
-    pub text: String,
+    text: String,
+}
+
+/// Unvalidated wire shape for [`MatchedChunk`]; conversion enforces
+/// id/text consistency.
+#[derive(Deserialize)]
+struct RawMatchedChunk {
+    fact_id: FactId,
+    heading_path: Vec<String>,
+    text: String,
+}
+
+impl TryFrom<RawMatchedChunk> for MatchedChunk {
+    type Error = MemoryError;
+
+    fn try_from(raw: RawMatchedChunk) -> Result<Self, Self::Error> {
+        Self::new(raw.fact_id, raw.heading_path, raw.text)
+    }
+}
+
+impl MatchedChunk {
+    /// Create matched-chunk provenance, enforcing that `fact_id` is true
+    /// provenance for `text` (it must re-derive exactly from the text at
+    /// the id's own coordinates).
+    pub fn new(
+        fact_id: FactId,
+        heading_path: Vec<String>,
+        text: String,
+    ) -> Result<Self, MemoryError> {
+        validate_id_matches_body(&fact_id, &text)?;
+        Ok(Self {
+            fact_id,
+            heading_path,
+            text,
+        })
+    }
+
+    /// Identity of the matched fact (carries parent id and span).
+    pub const fn fact_id(&self) -> &FactId {
+        &self.fact_id
+    }
+
+    /// Markdown heading trail locating the chunk within its parent.
+    pub fn heading_path(&self) -> &[String] {
+        &self.heading_path
+    }
+
+    /// The matched chunk's text.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 #[cfg(test)]

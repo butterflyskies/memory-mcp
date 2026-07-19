@@ -180,7 +180,9 @@ example regressions.
 | Invariant | Enforcement mechanism | Test | Slice |
 |---|---|---|---|
 | Markdown/git is canonical; every catalog and index is disposable derived state | Architecture posture: derived artifacts carry no authoritative state and every one has a rebuild-from-repo path (ADR-0038/0039 machinery today; atomic catalog rebuild in slice 3) | P4.2 rebuild idempotence; existing ADR-0039 repair tests | all (built: 3–5) |
-| Fact identity is deterministic, versioned, and domain-separated by parent / version / span / content digest | `FactId::derive`: pure function over a length-prefixed canonical encoding; version and span embedded in the id | P1.1 (property + example), P1.2 | 1 |
+| Fact identity is deterministic, versioned, and domain-separated by parent / version / span / content digest | `FactId::derive`: pure function over a length-prefixed canonical encoding; version and span embedded in the id; derive rejects a body whose byte length disagrees with the span | P1.1 (property + example), P1.2, P1.8 | 1 |
+| `FactId` canonical form is bijective on the accepted domain: `parse(render(id)) == id` and `parse(s) = Ok(id) ⇒ render(id) == s` | Strict `FromStr` with per-field canonical numeric parsing — noncanonical spellings (leading zeros, signs) are rejected, never normalized | P1.3 (both-direction properties + rejected-spelling examples) | 1 |
+| Catalog records and matched-chunk provenance carry true provenance: the id re-derives exactly from the paired body/text, enforced at construction *and* on deserialize (corrupt persisted state fails closed) | `FactRecord::new` / `MatchedChunk::new` validating constructors; `serde(try_from)` raw-shape deserialization re-runs the same validation; `FactId::derive` span/body length gate | P1.8 (constructor rejections, mutation regressions, generated-mutation property) | 1 |
 | Spans are valid UTF-8 byte boundaries, ordered, inside the parent, reproducing the represented source | `SourceSpan` construction invariant + `slice_in` validation (slice 1); chunker emission discipline (slice 2) | P1.5 (property + example); P2.2–P2.4 | 1–2 |
 | Same source + version ⇒ same facts/ids; changed identity input ⇒ changed id | Deterministic chunker feeding deterministic derivation; collision posture per P1.2 | P1.1, P1.2, P2.1, P2.7 | 1–2 |
 | Rebuild from identical truth is idempotent; stale schema/model/commit is detectable | Versioned derived catalog with staleness stamps (schema, model, commit) | P4.2; slice-3 staleness tests | 3–4 |
@@ -210,9 +212,13 @@ example regressions.
   removes prior generations entirely before new ones land. Property
   tests assert determinism and distinctness over generated inputs as
   collision-resistance *evidence*, not proof.
-- **P1.3 Canonical-form totality.** `parse(render(id)) == id` for
-  every derivable id, and the parser rejects every string `render`
-  cannot produce — no lenient mode (ADR-0019).
+- **P1.3 Canonical-form bijectivity.** `parse(render(id)) == id` for
+  every derivable id, and acceptance implies canonicality in the other
+  direction: `parse(s) = Ok(id) ⇒ render(id) == s`, byte for byte. The
+  parser rejects every string `render` cannot produce — including
+  noncanonical numeric spellings (leading zeros, signs) that Rust's
+  integer `FromStr` would silently normalize — no lenient mode
+  (ADR-0019).
 - **P1.4 Serde round-trip totality.**
   `deserialize(serialize(x)) == x` for `FactId`, `SourceSpan`,
   `ChunkerVersion`, `FactRecord`, `MatchedChunk`, and `MemoryRef`.
@@ -226,6 +232,14 @@ example regressions.
 - **P1.7 Version ordering.** `ChunkerVersion` ordering coincides with
   numeric ordering of the revision — monotonically increasing
   revisions compare monotonically.
+- **P1.8 True provenance.** A `FactId` describes exactly the body it
+  was derived from: `derive` rejects a body whose byte length disagrees
+  with the span, and `FactRecord` / `MatchedChunk` values cannot exist
+  — via constructor or deserialization — unless the id re-derives
+  exactly from the paired body/text. Persisted catalog corruption or a
+  future chunker bug fails closed on load instead of serving false
+  provenance. Test generators build body/span first and derive the id;
+  they never pair independently generated ids and bodies.
 
 ### Slice 2 — deterministic chunker
 
