@@ -421,6 +421,7 @@ impl AppState {
             router,
             embedding,
             index,
+            lexical: Arc::new(crate::search::LexicalIndex::new()),
             auth,
             branch,
             health,

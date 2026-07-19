@@ -654,7 +654,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // text is cheap, unlike embedding it — so it is rebuilt from the repo on
     // every startup and never persisted or migrated. Failure degrades recall
     // to semantic-only; it never blocks startup.
-    match memory_mcp::search::rebuild_lexical_from_repo(&state.repo, &state.lexical)
+    match memory_mcp::search::rebuild_lexical_from_router(&state.router, &state.lexical)
         .instrument(tracing::info_span!("startup.lexical_rebuild"))
         .await
     {
@@ -671,7 +671,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
                 "lexical index startup rebuild failed — keyword search \
                  degraded until background repair converges"
             );
-            memory_mcp::search::spawn_lexical_repair(&state.repo, &state.lexical);
+            memory_mcp::search::spawn_lexical_repair_for_router(&state.router, &state.lexical);
         }
     }
 

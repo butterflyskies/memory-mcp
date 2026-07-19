@@ -46,7 +46,7 @@ use crate::{
     recall_log::{BatchVerdict, RecallLog, RecallResult},
     repo::{traced_spawn_blocking, MemoryRepo},
     search::{
-        bm25::DegradeOnDrop, hybrid_search, spawn_lexical_repair, FusedHit, LexicalDoc,
+        bm25::DegradeOnDrop, hybrid_search, spawn_lexical_repair_for_router, FusedHit, LexicalDoc,
         LexicalIndex, LexicalOp,
     },
     types::{
@@ -474,6 +474,7 @@ where
 /// repair, instead of committing the partial mirror as healthy.
 async fn incremental_reindex(
     repo: &Arc<MemoryRepo>,
+    router: &crate::repo_router::RepoRouter,
     embedding: &dyn EmbeddingBackend,
     index: &dyn VectorStore,
     lexical: &Arc<LexicalIndex>,
@@ -481,7 +482,10 @@ async fn incremental_reindex(
 ) -> ReindexStats {
     let mut stats = ReindexStats::default();
     let mut lexical_ops: Vec<LexicalOp> = Vec::new();
-    let mut lexical_gap = false;
+    let mut lexical_gap = changes.unresolved > 0;
+    if lexical_gap {
+        lexical.mark_rebuild_required("pulled changes contained unresolvable memory files");
+    }
 
     // ---- 1. Removals --------------------------------------------------------
     for mref in &changes.removed {
@@ -544,9 +548,9 @@ async fn incremental_reindex(
             "incremental_reindex: lexical batch update failed; keyword search \
              degraded until repair completes"
         );
-        spawn_lexical_repair(repo, lexical);
+        spawn_lexical_repair_for_router(router, lexical);
     } else if lexical_gap {
-        spawn_lexical_repair(repo, lexical);
+        spawn_lexical_repair_for_router(router, lexical);
     }
 
     if to_embed.is_empty() {
@@ -619,6 +623,7 @@ async fn incremental_reindex(
 /// dying, or pulled files that cannot be resolved to memory references —
 /// marks the lexical index rebuild-required and schedules repair, so a
 /// partial or stale mirror can never keep reporting `Available`.
+#[cfg(test)]
 async fn mirror_pulled_changes(
     state: &Arc<AppState>,
     old_head: [u8; 20],
@@ -635,14 +640,14 @@ async fn mirror_pulled_changes(
             state.lexical.mark_rebuild_required(
                 "post-pull change diff failed — pulled changes not mirrored",
             );
-            spawn_lexical_repair(&state.repo, &state.lexical);
+            spawn_lexical_repair_for_router(&state.router, &state.lexical);
             return Err(e);
         }
         Err(e) => {
             state
                 .lexical
                 .mark_rebuild_required("post-pull change diff task did not run to completion");
-            spawn_lexical_repair(&state.repo, &state.lexical);
+            spawn_lexical_repair_for_router(&state.router, &state.lexical);
             return Err(MemoryError::Join(e.to_string()));
         }
     };
@@ -668,6 +673,7 @@ async fn mirror_pulled_changes(
     if !changes.is_empty() {
         let stats = incremental_reindex(
             &state.repo,
+            &state.router,
             state.embedding.as_ref(),
             state.index.as_ref(),
             &state.lexical,
@@ -687,7 +693,7 @@ async fn mirror_pulled_changes(
     }
 
     if changes.unresolved > 0 {
-        spawn_lexical_repair(&state.repo, &state.lexical);
+        spawn_lexical_repair_for_router(&state.router, &state.lexical);
     }
 
     // Advance the stored SHA so the next startup doesn't trigger a full
@@ -716,7 +722,7 @@ pub async fn full_reindex(
     embedding: &dyn EmbeddingBackend,
     index: &dyn VectorStore,
 ) -> Result<ReindexStats, MemoryError> {
-    let memories = router.list_memories(None).await?;
+    let memories = router.list_memories_strict().await?;
     if memories.is_empty() {
         return Ok(ReindexStats::default());
     }
@@ -890,7 +896,7 @@ impl MemoryServer {
                         "lexical index update failed during remember; keyword search \
                          degraded until repair completes"
                     );
-                    spawn_lexical_repair(&unit_state.repo, &unit_state.lexical);
+                    spawn_lexical_repair_for_router(&unit_state.router, &unit_state.lexical);
                 }
                 Ok(memory)
             })
@@ -957,7 +963,7 @@ impl MemoryServer {
             // rebuild from git truth (single-flight). This query — and every
             // query until the rebuild converges — serves semantic-only.
             if state.lexical.is_degraded() {
-                spawn_lexical_repair(&state.repo, &state.lexical);
+                spawn_lexical_repair_for_router(&state.router, &state.lexical);
             }
 
             // Semantic and lexical retrieval run in parallel; ranked lists
@@ -1115,7 +1121,7 @@ impl MemoryServer {
                     .await
                 {
                     warn!(name = %unit_name, error = %e, "lexical removal failed during forget; keyword search degraded until repair completes");
-                    spawn_lexical_repair(&unit_state.repo, &unit_state.lexical);
+                    spawn_lexical_repair_for_router(&unit_state.router, &unit_state.lexical);
                 }
                 Ok(())
             })
@@ -1258,7 +1264,7 @@ impl MemoryServer {
                             "lexical index update failed during edit; keyword search \
                              degraded until repair completes"
                         );
-                        spawn_lexical_repair(&unit_state.repo, &unit_state.lexical);
+                        spawn_lexical_repair_for_router(&unit_state.router, &unit_state.lexical);
                     }
                 }
                 Ok((memory, timing))
@@ -1370,10 +1376,27 @@ impl MemoryServer {
                 // 2. Atomically read source, write destination, delete source
                 //    in one git commit. Must happen before index mutations so a
                 //    failure leaves the index consistent with the repo on disk.
-                let dest = unit_state
+                let dest = match unit_state
                     .router
                     .move_memory(&unit_name, &unit_from_scope, &unit_new_name, &unit_to_scope)
-                    .await?;
+                    .await
+                {
+                    Ok(dest) => dest,
+                    Err(e) => {
+                        // Cross-repo moves can fail after the destination was
+                        // committed but before the source was deleted. The
+                        // exact git outcome is then uncertain, so rebuild the
+                        // lexical index from all repository truth.
+                        unit_state
+                            .lexical
+                            .mark_rebuild_required("repo move failed with an uncertain git outcome");
+                        spawn_lexical_repair_for_router(
+                            &unit_state.router,
+                            &unit_state.lexical,
+                        );
+                        return Err(e);
+                    }
+                };
 
                 let dest_qualified = dest.mem_ref().qualified_path();
                 let source_qualified =
@@ -1401,7 +1424,7 @@ impl MemoryServer {
                         "lexical index update failed during move; keyword search degraded \
                          until repair completes"
                     );
-                    spawn_lexical_repair(&unit_state.repo, &unit_state.lexical);
+                    spawn_lexical_repair_for_router(&unit_state.router, &unit_state.lexical);
                 }
 
                 // 4. Embed the content for the new scope's index entry.
@@ -1608,57 +1631,80 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             let start = Instant::now();
-            let branch = &state.branch;
+            let branch = state.branch.clone();
 
-            let sync_result = state
-                .router
-                .sync_all(&state.auth, branch, pull_first)
+            // Router-wide pull/push plus every derived-index mirror is one
+            // cancellation-shielded mutation unit. A disconnected requester
+            // cannot leave one mapped repo's pull committed but unmirrored.
+            let unit_state = Arc::clone(&state);
+            let unit_branch = branch.clone();
+            let (sync_result, total_reindex, any_reindex) =
+                shielded_mutation_unit(&state.lexical, async move {
+                    let sync_result = unit_state
+                        .router
+                        .sync_all(&unit_state.auth, &unit_branch, pull_first)
+                        .await?;
+
+                    let mut total_reindex = ReindexStats::default();
+                    let mut any_reindex = false;
+                    let mut mirror_incomplete = false;
+                    for entry in &sync_result.results {
+                        if !entry.changes_complete {
+                            mirror_incomplete = true;
+                            unit_state.lexical.mark_rebuild_required(
+                                "post-pull change diff failed — pulled changes not mirrored",
+                            );
+                            spawn_lexical_repair_for_router(
+                                &unit_state.router,
+                                &unit_state.lexical,
+                            );
+                        }
+                        if let Some(ref changes) = entry.resolved_changes {
+                            mirror_incomplete |= changes.unresolved > 0;
+                            let repo = unit_state.router.repo(&entry.scope);
+                            let stats = incremental_reindex(
+                                repo,
+                                &unit_state.router,
+                                unit_state.embedding.as_ref(),
+                                unit_state.index.as_ref(),
+                                &unit_state.lexical,
+                                changes,
+                            )
+                            .instrument(tracing::info_span!(
+                                "server.incremental_reindex",
+                                repo = %entry.label,
+                            ))
+                            .await;
+                            info!(
+                                repo = %entry.label,
+                                added = stats.added,
+                                updated = stats.updated,
+                                removed = stats.removed,
+                                errors = stats.errors,
+                                "incremental reindex complete"
+                            );
+                            total_reindex.added += stats.added;
+                            total_reindex.updated += stats.updated;
+                            total_reindex.removed += stats.removed;
+                            total_reindex.errors += stats.errors;
+                            any_reindex = true;
+                        }
+                    }
+
+                    let reindex_failed_completely = any_reindex
+                        && total_reindex.added == 0
+                        && total_reindex.updated == 0
+                        && total_reindex.errors > 0;
+                    if !mirror_incomplete && !reindex_failed_completely {
+                        if let Some(sha) = unit_state.router.head_sha().await {
+                            unit_state.index.set_commit_sha(Some(&sha));
+                        }
+                    }
+
+                    Ok((sync_result, total_reindex, any_reindex))
+                })
                 .await
                 .map_err(ErrorData::from)?;
-
-            // Incremental reindex for any repos that had changes.
-            let mut total_reindex = ReindexStats::default();
-            let mut any_reindex = false;
-            for entry in &sync_result.results {
-                if let Some(ref changes) = entry.changes {
-                    let repo = state.router.repo(&entry.scope);
-                    let stats = incremental_reindex(
-                        repo,
-                        state.embedding.as_ref(),
-                        state.index.as_ref(),
-                        changes,
-                    )
-                    .instrument(tracing::info_span!(
-                        "server.incremental_reindex",
-                        repo = %entry.label,
-                    ))
-                    .await;
-                    info!(
-                        repo = %entry.label,
-                        added = stats.added,
-                        updated = stats.updated,
-                        removed = stats.removed,
-                        errors = stats.errors,
-                        "incremental reindex complete"
-                    );
-                    total_reindex.added += stats.added;
-                    total_reindex.updated += stats.updated;
-                    total_reindex.removed += stats.removed;
-                    total_reindex.errors += stats.errors;
-                    any_reindex = true;
-                }
-            }
-
-            // Advance the default repo's stored SHA.
-            let reindex_failed_completely = any_reindex
-                && total_reindex.added == 0
-                && total_reindex.updated == 0
-                && total_reindex.errors > 0;
-            if !reindex_failed_completely {
-                if let Some(sha) = state.router.head_sha().await {
-                    state.index.set_commit_sha(Some(&sha));
-                }
-            }
 
             // Build pull status summary.
             let pull_status = if !pull_first {
@@ -3048,7 +3094,7 @@ mod tests {
         use crate::index::InMemoryStore;
         use crate::repo::MemoryRepo;
         use crate::search::bm25::FailPoint;
-        use crate::search::rebuild_lexical_from_repo;
+        use crate::search::{rebuild_lexical_from_repo, spawn_lexical_repair};
         use async_trait::async_trait;
 
         struct MockEmbedding;
@@ -3274,6 +3320,7 @@ mod tests {
             state.lexical.fail_next(FailPoint::Commit);
             let stats = incremental_reindex(
                 &state.repo,
+                &state.router,
                 state.embedding.as_ref(),
                 state.index.as_ref(),
                 &state.lexical,

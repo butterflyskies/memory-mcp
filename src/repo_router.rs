@@ -1,4 +1,4 @@
-//! Routes memory operations to the correct [`MemoryRepo`] based on scope.
+//! Routes memory operations to the correct [`crate::repo::MemoryRepo`] based on scope.
 //!
 //! When per-scope remote mappings are configured, each mapped scope prefix
 //! gets its own independent git repository. Unmapped scopes fall through to
@@ -13,10 +13,11 @@ use crate::{
     error::MemoryError,
     health::SubsystemReporter,
     repo::MemoryRepo,
-    types::{ChangedMemories, Memory, MemoryName, PullResult, Scope},
+    types::{ChangedMemories, Memory, MemoryName, PullResult, ResolvedChanges, Scope},
 };
 
 /// A scope-to-repo entry in the router.
+#[derive(Clone)]
 struct ScopeRoute {
     /// Scope prefix this route captures.
     prefix: String,
@@ -31,6 +32,7 @@ struct ScopeRoute {
 /// Holds a default repo for unmapped scopes and zero or more scope-specific
 /// repos. Write operations route to the repo that owns the scope. Read
 /// operations aggregate across all repos.
+#[derive(Clone)]
 pub struct RepoRouter {
     /// The default repo for scopes that don't match any configured mapping.
     default_repo: Arc<MemoryRepo>,
@@ -61,6 +63,10 @@ pub struct SyncEntry {
     pub push_ok: bool,
     /// Memories that changed during pull (for incremental reindex).
     pub changes: Option<ChangedMemories>,
+    /// Structured changed memories used by derived-index mirrors.
+    pub(crate) resolved_changes: Option<ResolvedChanges>,
+    /// Whether post-pull change discovery completed without gaps.
+    pub(crate) changes_complete: bool,
 }
 
 impl RepoRouter {
@@ -266,6 +272,18 @@ impl RepoRouter {
         Ok(all_memories)
     }
 
+    /// List memories across every repo, failing if any repo cannot be read.
+    ///
+    /// Rebuilds use this strict form because accepting a partial aggregate as
+    /// git truth would silently erase the missing repo from a derived index.
+    pub async fn list_memories_strict(&self) -> Result<Vec<Memory>, MemoryError> {
+        let mut all_memories = self.default_repo.list_memories(None).await?;
+        for route in &self.routes {
+            all_memories.extend(route.repo.list_memories(None).await?);
+        }
+        Ok(all_memories)
+    }
+
     // -----------------------------------------------------------------------
     // Sync operations — push/pull each repo independently
     // -----------------------------------------------------------------------
@@ -292,6 +310,8 @@ impl RepoRouter {
                 pull: None,
                 push_ok: false,
                 changes: None,
+                resolved_changes: None,
+                changes_complete: true,
             };
 
             let mut has_remote = true;
@@ -317,14 +337,22 @@ impl RepoRouter {
                             let oh = *oh;
                             let nh = *nh;
                             match crate::repo::traced_spawn_blocking(move || {
-                                repo_clone.diff_changed_memories(oh, nh)
+                                let changes = repo_clone.diff_changed_memories(oh, nh)?;
+                                let resolved = repo_clone.diff_changed_refs(oh, nh)?;
+                                Ok::<_, MemoryError>((changes, resolved))
                             })
                             .await
                             {
-                                Ok(Ok(changes)) if !changes.is_empty() => {
-                                    entry.changes = Some(changes);
+                                Ok(Ok((changes, resolved))) => {
+                                    if !changes.is_empty() {
+                                        entry.changes = Some(changes);
+                                    }
+                                    if !resolved.is_empty() || resolved.unresolved > 0 {
+                                        entry.resolved_changes = Some(resolved);
+                                    }
                                 }
                                 Ok(Err(e)) => {
+                                    entry.changes_complete = false;
                                     warn!(
                                         label = %label,
                                         error = %e,
@@ -332,13 +360,13 @@ impl RepoRouter {
                                     );
                                 }
                                 Err(e) => {
+                                    entry.changes_complete = false;
                                     warn!(
                                         label = %label,
                                         error = %e,
                                         "sync: spawn_blocking failed for diff"
                                     );
                                 }
-                                _ => {}
                             }
                         }
                         entry.pull = Some(pull_result);
@@ -446,7 +474,10 @@ impl RepoRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ScopePath;
+    use crate::{
+        search::{rebuild_lexical_from_router, LexicalIndex},
+        types::{MemoryMetadata, MemoryName, ScopeFilter, ScopePath},
+    };
 
     fn test_repo(dir: &tempfile::TempDir) -> Arc<MemoryRepo> {
         Arc::new(MemoryRepo::init_or_open(dir.path(), None).unwrap())
@@ -578,5 +609,48 @@ mod tests {
         assert_eq!(router.branch_for_scope(&Scope::Path(sp), "main"), "develop");
         let sp = ScopePath::new("other").unwrap();
         assert_eq!(router.branch_for_scope(&Scope::Path(sp), "main"), "main");
+    }
+
+    #[tokio::test]
+    async fn lexical_rebuild_uses_default_and_mapped_repo_truth() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let default_repo = test_repo(&default_dir);
+        let work_repo = test_repo(&work_dir);
+        let router = RepoRouter {
+            default_repo,
+            routes: vec![ScopeRoute {
+                prefix: "work".to_string(),
+                repo: work_repo,
+                branch: None,
+            }],
+        };
+
+        let root = Memory::from_validated(
+            MemoryName::new("root-note").unwrap(),
+            "rootneedle".to_string(),
+            MemoryMetadata::new(Scope::Root, vec![], None),
+        );
+        let work_scope = Scope::Path(ScopePath::new("work").unwrap());
+        let work = Memory::from_validated(
+            MemoryName::new("work-note").unwrap(),
+            "mappedneedle".to_string(),
+            MemoryMetadata::new(work_scope, vec![], None),
+        );
+        router.save_memory(&root).await.unwrap();
+        router.save_memory(&work).await.unwrap();
+
+        let lexical = Arc::new(LexicalIndex::new());
+        let count = rebuild_lexical_from_router(&router, &lexical)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let root_hits = lexical.search(&ScopeFilter::All, "rootneedle", 10).unwrap();
+        assert_eq!(root_hits[0].0, root.mem_ref().qualified_path());
+        let mapped_hits = lexical
+            .search(&ScopeFilter::All, "mappedneedle", 10)
+            .unwrap();
+        assert_eq!(mapped_hits[0].0, work.mem_ref().qualified_path());
     }
 }

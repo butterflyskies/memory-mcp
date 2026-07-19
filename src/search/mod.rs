@@ -17,6 +17,7 @@ use crate::{
     error::MemoryError,
     index::VectorStore,
     repo::{traced_spawn_blocking, MemoryRepo},
+    repo_router::RepoRouter,
     types::ScopeFilter,
 };
 
@@ -151,6 +152,41 @@ pub async fn rebuild_lexical_from_repo(
     }
 }
 
+/// Rebuild the lexical index from every repository owned by a router.
+///
+/// Unlike the user-facing aggregate list operation, this is strict: failure
+/// to read any mapped repository leaves the index degraded instead of
+/// treating a partial aggregate as authoritative git truth.
+pub async fn rebuild_lexical_from_router(
+    router: &RepoRouter,
+    lexical: &Arc<LexicalIndex>,
+) -> Result<usize, MemoryError> {
+    let token = lexical.begin_rebuild();
+    let memories = match router.list_memories_strict().await {
+        Ok(memories) => memories,
+        Err(e) => {
+            lexical.mark_rebuild_required("repository listing for lexical rebuild failed");
+            return Err(e);
+        }
+    };
+    let docs: Vec<LexicalDoc> = memories
+        .into_iter()
+        .map(|m| LexicalDoc {
+            qualified_name: m.mem_ref().qualified_path(),
+            name: m.name.to_string(),
+            content: m.content,
+        })
+        .collect();
+    let index = Arc::clone(lexical);
+    match traced_spawn_blocking(move || index.rebuild_from(token, docs)).await {
+        Ok(result) => result,
+        Err(e) => {
+            lexical.mark_rebuild_required("lexical rebuild task did not run to completion");
+            Err(MemoryError::Join(e.to_string()))
+        }
+    }
+}
+
 /// Spawn a background repair rebuild if the lexical index is degraded and
 /// no repair is already running.
 ///
@@ -179,6 +215,29 @@ pub fn spawn_lexical_repair(repo: &Arc<MemoryRepo>, lexical: &Arc<LexicalIndex>)
                  the next trigger repairs again"
             ),
             Ok(count) => info!(count, "lexical index repaired from git truth"),
+            Err(e) => warn!(error = %e, "lexical repair failed — index stays degraded"),
+        }
+    });
+}
+
+/// Spawn a single-flight repair from all repositories owned by a router.
+pub fn spawn_lexical_repair_for_router(router: &RepoRouter, lexical: &Arc<LexicalIndex>) {
+    if !lexical.is_degraded() || !lexical.try_claim_repair() {
+        return;
+    }
+    let router = router.clone();
+    let lexical = Arc::clone(lexical);
+    tokio::spawn(async move {
+        let result = rebuild_lexical_from_router(&router, &lexical).await;
+        lexical.finish_repair();
+        match result {
+            Ok(count) if lexical.is_degraded() => info!(
+                count,
+                "lexical rebuild completed but the index was re-flagged during \
+                 the rebuild (raced mirror or new divergence) — still degraded, \
+                 the next trigger repairs again"
+            ),
+            Ok(count) => info!(count, "lexical index repaired from all git repositories"),
             Err(e) => warn!(error = %e, "lexical repair failed — index stays degraded"),
         }
     });
