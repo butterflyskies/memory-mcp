@@ -270,13 +270,19 @@ example regressions.
 - **P2.3 Ordered non-overlap.** Emitted spans are strictly ordered by
   start and pairwise non-overlapping.
 - **P2.4 Coverage.** Concatenating the chunk bodies in span order
-  reproduces the parent content with no loss and no duplication,
-  modulo the chunker's documented boundary-whitespace handling.
+  reproduces the parent content byte for byte, with no loss and no
+  duplication. There is no whitespace caveat: the tiling absorbs
+  boundary whitespace into the preceding chunk (and whitespace before
+  the first unit into the first chunk), so coverage is byte-exact
+  including that whitespace.
 - **P2.5 Short-input degeneration.** Content under the tokenizer
   budget yields exactly one chunk spanning the whole body.
 - **P2.6 Budget respect.** Every chunk fits the actual embedding
-  tokenizer's budget, except indivisible atomic blocks, whose
-  fallback behavior must be documented and deterministic.
+  tokenizer's budget, with exactly one exception: the
+  single-Unicode-scalar fallback in character splitting, where a lone
+  character whose own token count exceeds the budget is emitted alone
+  and over budget. That is the only over-budget chunk shape the
+  chunker can produce, and it is deterministic.
 - **P2.7 Edit locality (prefix stability).** Stated precisely as the
   structural guarantee the implementation provides: prefix chunks
   whose boundary search completed without reaching the document tail
