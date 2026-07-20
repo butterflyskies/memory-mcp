@@ -988,6 +988,72 @@ pub async fn startup_reindex_and_certify(
     }
 }
 
+/// Prepare the vector index to serve from at startup: run the initial pull
+/// (when requested) **before** deciding index freshness, then rebuild and
+/// certify against post-pull git truth when the stored SHA is stale.
+///
+/// The ordering is the contract (#327): on a fresh repo path with a
+/// configured remote, the initial pull is what populates the repo. Deciding
+/// freshness — or rebuilding — before the pull completes certifies an index
+/// of the pre-pull (typically empty) tree, and the server signals ready
+/// while semantic recall misses every pulled memory.
+///
+/// The pull covers **every** routed repo — the default plus each configured
+/// scope-mapped remote, respecting per-route branch overrides (#328 review,
+/// round 2). Pulling only the default repo would leave mapped repos at their
+/// local init commits: the composite-HEAD reindex would certify their empty
+/// trees and readiness could go green while every remotely stored
+/// mapped-scope memory is absent until an explicit sync.
+///
+/// `initial_pull` carries `(auth, default_branch)` when
+/// `--require-remote-sync` is set; a pull failure on any repo is logged and
+/// startup continues (aggregate sync health shows degraded), matching the
+/// previous behavior.
+///
+/// Returns the index to serve from plus `reindex_ok`: `false` when a rebuild
+/// ran and did not certify cleanly, in which case the caller must record a
+/// startup mirror gap so SHA advancement stays blocked for this process.
+pub async fn startup_prepare_index(
+    initial_pull: Option<(&crate::auth::AuthProvider, &str)>,
+    router: &crate::repo_router::RepoRouter,
+    embedding: &dyn EmbeddingBackend,
+    loaded_index: Box<dyn VectorStore>,
+    fresh_index: impl FnOnce() -> Box<dyn VectorStore>,
+) -> (Box<dyn VectorStore>, bool) {
+    if let Some((auth, default_branch)) = initial_pull {
+        info!("--require-remote-sync: performing initial pull across all repos");
+        if !router.pull_all(auth, default_branch).await {
+            warn!("initial pull failed for one or more repos — sync health will show degraded");
+        }
+    }
+
+    // Freshness is judged against git truth as it stands *after* the pull.
+    // If the stored SHA doesn't match, discard the loaded index entirely and
+    // rebuild from scratch — this prevents ghost entries from deleted
+    // memories lingering.
+    let head_sha = router.head_sha().await;
+    if head_sha == loaded_index.commit_sha() {
+        tracing::debug!(sha = ?head_sha, "index SHA matches repo HEAD — skipping reindex");
+        return (loaded_index, true);
+    }
+
+    info!(
+        head = ?head_sha,
+        index = ?loaded_index.commit_sha(),
+        "index SHA does not match repo HEAD — rebuilding from scratch"
+    );
+    let index = fresh_index();
+
+    // Certification requires errors == 0 (#293 review, round 3): a partial
+    // rebuild must not stamp the SHA, or the next startup would see index
+    // SHA == HEAD and skip the reindex that repairs the gap.
+    let reindex_ok =
+        startup_reindex_and_certify(router, embedding, index.as_ref(), head_sha.as_deref())
+            .instrument(tracing::info_span!("startup.full_reindex"))
+            .await;
+    (index, reindex_ok)
+}
+
 /// Persist the vector index at graceful shutdown.
 ///
 /// Advances the stored composite SHA to the router's current HEAD only when
@@ -4443,6 +4509,240 @@ mod tests {
                 clean_index.commit_sha(),
                 head,
                 "a clean rebuild must stamp the head SHA"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Startup ordering: pull before index construction (#327)
+        //
+        // Fresh repo path + configured non-empty remote (fresh-clone
+        // deployment): the initial pull must complete BEFORE index freshness
+        // is decided, so the startup reindex runs against post-pull git
+        // truth. Previously the index was rebuilt and certified against the
+        // local init commit, and the server reported ready with a semantic
+        // index that missed every memory on the remote.
+        // -------------------------------------------------------------------
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn startup_prepare_index_pulls_before_freshness_on_fresh_repo() {
+            // Non-empty remote: a writer pushes one memory to a bare origin.
+            let remote_dir = tempfile::tempdir().expect("tempdir");
+            git2::Repository::init_bare(remote_dir.path()).expect("bare init");
+            let remote_url = format!("file://{}", remote_dir.path().display());
+
+            let writer_dir = tempfile::tempdir().expect("tempdir");
+            let writer = Arc::new(
+                MemoryRepo::init_or_open(writer_dir.path(), Some(&remote_url))
+                    .expect("writer repo"),
+            );
+            let pulled = Memory::from_validated(
+                MemoryName::new("pulled".to_string()).unwrap(),
+                "pulledword payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            writer.save_memory(&pulled).await.expect("writer save");
+            writer.push(&sync_auth(), "main").await.expect("push");
+
+            // Fresh server path: init_or_open creates a local init commit
+            // and configures origin, but never fetches — the fresh-boot
+            // branch of the startup sequence.
+            let server_dir = tempfile::tempdir().expect("tempdir");
+            let repo = Arc::new(
+                MemoryRepo::init_or_open(server_dir.path(), Some(&remote_url))
+                    .expect("server repo"),
+            );
+            let router = RepoRouter::single(Arc::clone(&repo));
+            let pre_pull_head = router.head_sha().await;
+            assert!(pre_pull_head.is_some(), "fresh repo must have init commit");
+
+            // Fresh boot: no persisted index (commit_sha None), so a rebuild
+            // runs either way — the regression is WHAT it runs against.
+            let auth = sync_auth();
+            let (index, reindex_ok) = startup_prepare_index(
+                Some((&auth, "main")),
+                &router,
+                &MockEmbedding,
+                Box::new(InMemoryStore::new(4)),
+                || Box::new(InMemoryStore::new(4)),
+            )
+            .await;
+
+            assert!(reindex_ok, "clean rebuild over pulled truth must certify");
+
+            // The pull ran before freshness was decided: HEAD moved past the
+            // local init commit and the certified SHA is post-pull truth.
+            let head = router.head_sha().await;
+            assert!(head.is_some(), "git truth must yield a head SHA");
+            assert_ne!(
+                head, pre_pull_head,
+                "initial pull must advance HEAD past the local init commit"
+            );
+            assert_eq!(
+                index.commit_sha(),
+                head,
+                "startup must certify the index against post-pull git truth"
+            );
+
+            // …and recall sees the pulled memory before ready is signaled:
+            // the index handed to the server already contains it.
+            let qualified =
+                MemoryRef::new(Scope::Root, MemoryName::new("pulled".to_string()).unwrap())
+                    .qualified_path();
+            assert!(
+                index.find_by_name(&qualified).is_some(),
+                "pulled memory must be present in the startup index"
+            );
+            let hits = index
+                .search(&ScopeFilter::All, &[0.0, 0.0, 0.0, 1.0], 10)
+                .expect("search");
+            assert!(
+                hits.iter().any(|(_, name, _)| name == &qualified),
+                "semantic search must surface the pulled memory, got: {hits:?}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Startup ordering, second lane: scope-mapped remotes (#328 review,
+        // round 2)
+        //
+        // Fresh deployment with a default remote AND a configured
+        // scope-mapped remote, both non-empty: the startup pull must cover
+        // every routed repo — respecting per-route branch overrides — before
+        // the composite-HEAD freshness decision. Pulling only the default
+        // repo would certify the mapped repo's empty local-init commit and
+        // readiness could go green while every remotely stored mapped-scope
+        // memory is absent until an explicit sync.
+        // -------------------------------------------------------------------
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn startup_prepare_index_pulls_mapped_remotes_before_freshness() {
+            let auth = sync_auth();
+
+            // Default remote: a writer pushes one root-scope memory to main.
+            let default_remote_dir = tempfile::tempdir().expect("tempdir");
+            git2::Repository::init_bare(default_remote_dir.path()).expect("bare init");
+            let default_url = format!("file://{}", default_remote_dir.path().display());
+            let default_writer_dir = tempfile::tempdir().expect("tempdir");
+            let default_writer = Arc::new(
+                MemoryRepo::init_or_open(default_writer_dir.path(), Some(&default_url))
+                    .expect("default writer repo"),
+            );
+            let default_memory = Memory::from_validated(
+                MemoryName::new("pulled-default".to_string()).unwrap(),
+                "defaultword payload".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            default_writer
+                .save_memory(&default_memory)
+                .await
+                .expect("default writer save");
+            default_writer.push(&auth, "main").await.expect("push");
+
+            // Mapped remote: a writer pushes one work-scope memory, then the
+            // bare repo's only branch is renamed to `develop` — the memory
+            // exists ONLY on the route's override branch, so it is reachable
+            // only if the startup pull respects the override.
+            let work_scope = Scope::Path(crate::types::ScopePath::new("work").unwrap());
+            let work_remote_dir = tempfile::tempdir().expect("tempdir");
+            git2::Repository::init_bare(work_remote_dir.path()).expect("bare init");
+            let work_url = format!("file://{}", work_remote_dir.path().display());
+            let work_writer_dir = tempfile::tempdir().expect("tempdir");
+            let work_writer = Arc::new(
+                MemoryRepo::init_or_open(work_writer_dir.path(), Some(&work_url))
+                    .expect("work writer repo"),
+            );
+            let work_memory = Memory::from_validated(
+                MemoryName::new("pulled-work".to_string()).unwrap(),
+                "mappedword payload".to_string(),
+                MemoryMetadata::new(work_scope.clone(), vec![], None),
+            );
+            work_writer
+                .save_memory(&work_memory)
+                .await
+                .expect("work writer save");
+            work_writer.push(&auth, "main").await.expect("push");
+            git2::Repository::open(work_remote_dir.path())
+                .expect("open bare")
+                .find_reference("refs/heads/main")
+                .expect("main ref")
+                .rename("refs/heads/develop", true, "seed develop only")
+                .expect("rename to develop");
+
+            // Fresh server side: default repo and mapped repo are both
+            // locally initialised, never fetched — the fresh-boot branch of
+            // the startup sequence with per-scope remotes configured.
+            let server_default_dir = tempfile::tempdir().expect("tempdir");
+            let default_repo = Arc::new(
+                MemoryRepo::init_or_open(server_default_dir.path(), Some(&default_url))
+                    .expect("server default repo"),
+            );
+            let server_work_dir = tempfile::tempdir().expect("tempdir");
+            let health = HealthRegistry::new();
+            let mapping = RemoteMapping {
+                scope: "work".to_string(),
+                url: work_url,
+                path: Some(server_work_dir.path().display().to_string()),
+                branch: Some("develop".to_string()),
+            };
+            let router = RepoRouter::from_config(
+                default_repo,
+                std::slice::from_ref(&mapping),
+                &health.git,
+                &health.sync,
+            )
+            .expect("router from config");
+            let pre_pull_head = router.head_sha().await;
+            assert!(
+                pre_pull_head.is_some(),
+                "fresh repos must have init commits"
+            );
+
+            let (index, reindex_ok) = startup_prepare_index(
+                Some((&auth, "main")),
+                &router,
+                &MockEmbedding,
+                Box::new(InMemoryStore::new(4)),
+                || Box::new(InMemoryStore::new(4)),
+            )
+            .await;
+
+            assert!(reindex_ok, "clean rebuild over pulled truth must certify");
+
+            // Every routed repo was pulled before freshness was decided: the
+            // composite HEAD moved past the local init commits and the
+            // certified SHA is post-pull truth.
+            let head = router.head_sha().await;
+            assert_ne!(
+                head, pre_pull_head,
+                "initial pull must advance the composite HEAD past the local init commits"
+            );
+            assert_eq!(
+                index.commit_sha(),
+                head,
+                "startup must certify the index against post-pull composite git truth"
+            );
+
+            // BOTH memories are indexed before ready is signaled.
+            for (scope, name) in [(Scope::Root, "pulled-default"), (work_scope, "pulled-work")] {
+                let qualified = MemoryRef::new(scope, MemoryName::new(name.to_string()).unwrap())
+                    .qualified_path();
+                assert!(
+                    index.find_by_name(&qualified).is_some(),
+                    "{qualified} must be present in the startup index"
+                );
+                let hits = index
+                    .search(&ScopeFilter::All, &[0.0, 0.0, 0.0, 1.0], 10)
+                    .expect("search");
+                assert!(
+                    hits.iter().any(|(_, hit, _)| hit == &qualified),
+                    "semantic search must surface {qualified}, got: {hits:?}"
+                );
+            }
+
+            // A fully clean startup pull settles aggregate sync health ok.
+            assert!(
+                health.sync.load().healthy,
+                "a fully clean initial pull must settle aggregate sync health"
             );
         }
 

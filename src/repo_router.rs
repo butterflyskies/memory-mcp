@@ -585,6 +585,55 @@ impl RepoRouter {
         Ok(result)
     }
 
+    /// Pull every repo — the default plus each scope-mapped route, respecting
+    /// per-route branch overrides — without pushing (#328 review, round 2).
+    ///
+    /// This is the startup counterpart of [`RepoRouter::sync_all`]'s pull
+    /// phase: on a fresh deployment the initial pull is what populates each
+    /// repo, so all of them must be pulled before index freshness is decided,
+    /// not just the default. A failure on one repo does not abort the rest.
+    ///
+    /// When the router carries a sync reporter, the aggregate outcome is
+    /// settled once after every repo completes. The per-operation reports
+    /// from [`MemoryRepo::pull`] are last-operation-wins, so a failed
+    /// mapped-remote pull followed by a clean pull would otherwise leave
+    /// shared sync health green while a scope's remote memories are absent.
+    ///
+    /// Returns `true` when every repo pulled cleanly.
+    pub async fn pull_all(&self, auth: &AuthProvider, default_branch: &str) -> bool {
+        let mut failures: Vec<String> = Vec::new();
+        for (label, repo, branch_override, _scope) in self.all_repos() {
+            let branch = branch_override.unwrap_or(default_branch);
+            match repo.pull(auth, branch).await {
+                Ok(result) => info!(label = %label, ?result, "initial pull completed"),
+                Err(e) => {
+                    warn!(
+                        label = %label,
+                        error = %e,
+                        "initial pull failed — continuing with remaining repos"
+                    );
+                    failures.push(format!("{label}: {e}"));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            warn!(
+                failed = failures.len(),
+                "initial pull: {} repo(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            );
+        }
+        if let Some(reporter) = &self.sync_reporter {
+            if failures.is_empty() {
+                reporter.report_ok();
+            } else {
+                reporter.report_err("one or more repos failed the initial pull");
+            }
+        }
+        failures.is_empty()
+    }
+
     /// Get a composite HEAD SHA covering all repos.
     ///
     /// When no scope-specific routes are configured, returns the default repo's
@@ -1165,6 +1214,57 @@ mod tests {
         assert!(
             health.sync.load().healthy,
             "a fully clean sync must settle the reporter healthy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup pull-all aggregate health (#328 review, round 2)
+    //
+    // `pull_all` is the startup counterpart of `sync_all`'s pull phase and
+    // carries the same last-operation-wins hazard: a failed mapped-remote
+    // pull followed by a clean pull would leave the shared sync reporter
+    // healthy while a scope's remote memories are absent. The router must
+    // settle sync health once from the complete outcome.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_pull_health_reflects_failed_mapped_remote_not_last_pull() {
+        let (_default_remote, default_url) = seeded_remote("seed-default").await;
+        let default_dir = tempfile::tempdir().unwrap();
+        let default_repo =
+            Arc::new(MemoryRepo::init_or_open(default_dir.path(), Some(&default_url)).unwrap());
+
+        // Route order is prefix-length descending, so "broken" (unreachable
+        // remote) pulls BEFORE "work" (clean): the last per-operation report
+        // is the clean pull, and only the aggregate settle keeps readiness
+        // honest.
+        let (_work_remote, work_url) = seeded_remote("seed-work").await;
+        let broken_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let health = crate::health::HealthRegistry::new();
+        let mappings = vec![
+            crate::config::RemoteMapping {
+                scope: "broken".to_string(),
+                url: "file:///nonexistent/memory-mcp-test-remote.git".to_string(),
+                path: Some(broken_dir.path().display().to_string()),
+                branch: None,
+            },
+            crate::config::RemoteMapping {
+                scope: "work".to_string(),
+                url: work_url,
+                path: Some(work_dir.path().display().to_string()),
+                branch: None,
+            },
+        ];
+        let router =
+            RepoRouter::from_config(default_repo, &mappings, &health.git, &health.sync).unwrap();
+
+        let all_ok = router.pull_all(&sync_test_auth(), "main").await;
+        assert!(!all_ok, "pull_all must report the failed mapped remote");
+        assert!(
+            !health.sync.load().healthy,
+            "aggregate sync health must reflect the failed mapped-remote \
+             pull, not the last repo's clean pull"
         );
     }
 
