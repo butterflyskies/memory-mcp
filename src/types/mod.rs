@@ -13,8 +13,8 @@ mod validated;
 pub(crate) use args::ResolvedChanges;
 pub use args::{
     AppState, BatchMarkAppliedArgs, ChangedMemories, EditArgs, ForgetArgs, ListArgs, ListField,
-    MarkAppliedArgs, MoveArgs, PullResult, ReadArgs, RecallArgs, RecallStatsArgs, ReindexStats,
-    RememberArgs, SyncArgs, Verdict, VerdictEntry,
+    MarkAppliedArgs, MoveArgs, MutationGuard, MutationRegistry, PullResult, ReadArgs, RecallArgs,
+    RecallStatsArgs, ReindexStats, RememberArgs, SyncArgs, Verdict, VerdictEntry,
 };
 
 pub(crate) use args::{ListToolArgs, LIST_MAX_LIMIT};

@@ -373,10 +373,13 @@ fn second_instance_fails_fast_when_configs_share_a_mapped_repo() {
 /// SIGTERM during an active session exercises the signal branch of
 /// shutdown (#329 review, round 2): the running service must be cancelled
 /// and awaited — draining rmcp cleanup — *before* `run_serve` persists the
-/// vector index. The stderr log order is the receipt: the drain completion
-/// line must precede the index-saved line, and the exit must be clean
-/// (the in-process `shutdown_signal_drains_in_flight_tool_call_before_returning`
-/// unit test proves the drain blocks on in-flight mutations).
+/// vector index. The stderr log order is the receipt: the transport drain
+/// line, then the mutation-registry drain line (#329 review, round 3 — the
+/// application-side gate with no transport-imposed ceiling), then the
+/// index-saved line, and the exit must be clean. The in-process unit tests
+/// (`shutdown_signal_drains_in_flight_tool_call_before_returning` and
+/// `shutdown_awaits_mutation_blocked_beyond_rmcp_drain_window`) prove the
+/// two drains actually block on in-flight work.
 #[cfg(unix)]
 #[test]
 fn sigterm_drains_service_before_index_persistence() {
@@ -406,11 +409,15 @@ fn sigterm_drains_service_before_index_persistence() {
     let drained = stderr
         .find("stdio transport drained and closed")
         .unwrap_or_else(|| panic!("missing drain completion log line in stderr:\n{stderr}"));
+    let mutations_drained = stderr
+        .find("mutation units drained")
+        .unwrap_or_else(|| panic!("missing mutation-registry drain log line in stderr:\n{stderr}"));
     let saved = stderr
         .find("vector index saved")
         .unwrap_or_else(|| panic!("missing index persistence log line in stderr:\n{stderr}"));
     assert!(
-        drained < saved,
-        "service drain must complete before index persistence:\n{stderr}"
+        drained < mutations_drained && mutations_drained < saved,
+        "shutdown order must be transport drain, then mutation-registry \
+         drain (#329 round 3), then index persistence:\n{stderr}"
     );
 }

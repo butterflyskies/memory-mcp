@@ -726,14 +726,26 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long shutdown waits for in-flight application mutation units after
+/// the transport has closed, before giving up and persisting the index
+/// *uncertified* (#329 review, round 3).
+///
+/// Generous on purpose: a unit mid-embedding on a cold CPU backend can
+/// legitimately take tens of seconds. Expiry never certifies — the drain
+/// helper records a mirror gap so the persisted index keeps its last
+/// verified SHA and the next startup reindexes from git truth.
+const SHUTDOWN_MUTATION_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Terminate the process explicitly after a stdio serve session.
 ///
 /// tokio's `Stdin` performs reads on the blocking thread pool; a read that
 /// is still pending — the client held its end of the pipe open while we shut
 /// down on a signal — keeps the runtime's drop at the end of `main` waiting
 /// indefinitely. All durable state (git repos, vector index, recall log) has
-/// already been flushed by `run_serve` by the time it returns, so exiting
-/// here loses nothing and makes SIGTERM shutdown deterministic.
+/// already been flushed by `run_serve` by the time it returns — including
+/// awaiting the in-flight mutation registry, or refusing index certification
+/// when its deadline expired — so exiting here loses nothing and makes
+/// SIGTERM shutdown deterministic.
 fn exit_after_stdio_serve(result: anyhow::Result<()>) -> ! {
     match result {
         Ok(()) => std::process::exit(0),
@@ -1080,6 +1092,23 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         Transport::Stdio => serve_stdio(Arc::clone(&state)).await?,
     }
 
+    // The transport drain above cannot vouch for application mutations:
+    // rmcp bounds its awaited response drain (~2s) and detaches handler
+    // tasks, so a mutation stalled past that window is still running when
+    // the transport reports closed (#329 review, round 3). Await the
+    // application's own mutation registry before touching the index. On
+    // deadline expiry the helper records a mirror gap, so persistence below
+    // keeps the last verified SHA instead of certifying an index a killed
+    // mutation never finished mirroring.
+    if memory_mcp::server::drain_mutations_before_persist(
+        &state_for_shutdown,
+        SHUTDOWN_MUTATION_DRAIN_DEADLINE,
+    )
+    .await
+    {
+        info!("mutation units drained — persisting vector index");
+    }
+
     // Persist the scoped vector index so the next startup can skip a full
     // reindex. The stored SHA only advances when the in-process mirror is
     // intact — a recorded mirror gap keeps the last verified SHA so the next
@@ -1189,6 +1218,13 @@ async fn serve_stdio(state: Arc<AppState>) -> anyhow::Result<()> {
 /// mutation (#329 review, round 2). So on shutdown this cancels through the
 /// service's token and then awaits the same waiting future, making
 /// drain-before-persist a contract instead of a coincidence.
+///
+/// That contract is *bounded*: rmcp 1.8 drains handler responses for at
+/// most ~2 seconds and its handler tasks are detached, so a mutation
+/// stalled past the window outlives this function (#329 review, round 3).
+/// Returning here therefore only means the transport is closed —
+/// `run_serve` must still await the application's mutation registry
+/// (`drain_mutations_before_persist`) before index persistence may certify.
 async fn drive_service_until_quit<S>(
     service: rmcp::service::RunningService<rmcp::RoleServer, S>,
     shutdown: impl std::future::Future<Output = ()>,
@@ -1901,12 +1937,16 @@ mod tests {
     }
 
     /// Test handler whose only tool call blocks until released, recording
-    /// entry and completion so tests can assert drain ordering.
+    /// entry and completion so tests can assert drain ordering. When a
+    /// mutation registry is supplied, the call holds a registry slot for its
+    /// full duration — the same accounting `shielded_mutation_unit` gives
+    /// real mutation units.
     #[derive(Clone)]
     struct BlockingToolServer {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
         done: Arc<std::sync::atomic::AtomicBool>,
+        registry: Option<Arc<memory_mcp::types::MutationRegistry>>,
     }
 
     impl rmcp::ServerHandler for BlockingToolServer {
@@ -1915,6 +1955,7 @@ mod tests {
             _request: rmcp::model::CallToolRequestParams,
             _context: rmcp::service::RequestContext<rmcp::RoleServer>,
         ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+            let _slot = self.registry.as_ref().map(|r| r.enter());
             self.entered.notify_one();
             self.release.notified().await;
             self.done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1922,31 +1963,14 @@ mod tests {
         }
     }
 
-    /// Regression for #329 review round 2 (medium): a shutdown signal must
-    /// not let `drive_service_until_quit` return while a tool call is still
-    /// executing. `run_serve` persists the vector index immediately after
-    /// this function returns, so returning early would race persistence
-    /// against the in-flight mutation. The blocked handler is released only
-    /// 250ms *after* the shutdown fires; the old drop-the-waiting-future
-    /// code returned immediately and failed the `done` assertion.
-    #[tokio::test]
-    async fn shutdown_signal_drains_in_flight_tool_call_before_returning() {
+    /// Drive the client half of an in-memory stdio transport: initialize
+    /// handshake, then a `tools/call` that blocks inside the handler. Holds
+    /// its end of the pipe open, draining server output until close.
+    fn spawn_blocking_tool_client(
+        client_io: tokio::io::DuplexStream,
+    ) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handler = BlockingToolServer {
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-            done: Arc::clone(&done),
-        };
-
-        // Drive the client side over the in-memory transport: initialize
-        // handshake, then a tools/call that blocks inside the handler.
-        let client = tokio::spawn(async move {
+        tokio::spawn(async move {
             let (read_half, mut write_half) = tokio::io::split(client_io);
             let mut lines = BufReader::new(read_half).lines();
             write_half
@@ -1985,7 +2009,31 @@ mod tests {
             // whatever the server sends until it closes the transport.
             while let Ok(Some(_)) = lines.next_line().await {}
             drop(write_half);
-        });
+        })
+    }
+
+    /// Regression for #329 review round 2 (medium): a shutdown signal must
+    /// not let `drive_service_until_quit` return while a tool call is still
+    /// executing. `run_serve` persists the vector index immediately after
+    /// this function returns, so returning early would race persistence
+    /// against the in-flight mutation. The blocked handler is released only
+    /// 250ms *after* the shutdown fires; the old drop-the-waiting-future
+    /// code returned immediately and failed the `done` assertion.
+    #[tokio::test]
+    async fn shutdown_signal_drains_in_flight_tool_call_before_returning() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = BlockingToolServer {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            done: Arc::clone(&done),
+            registry: None,
+        };
+
+        let client = spawn_blocking_tool_client(client_io);
 
         let service = rmcp::serve_server(handler, server_io)
             .await
@@ -2015,6 +2063,93 @@ mod tests {
             done.load(std::sync::atomic::Ordering::SeqCst),
             "service returned before the in-flight tool call completed — \
              index persistence would race the mutation"
+        );
+        releaser.await.expect("releaser task");
+        client.abort();
+    }
+
+    /// Regression for #329 review round 3 (medium): rmcp's awaited
+    /// cancellation drain is bounded (~2s in rmcp 1.8) and its handler tasks
+    /// are detached, so a mutation blocked *beyond* that window outlives
+    /// `waiting()` — the round-2 test above releases at 250ms, inside the
+    /// window, and cannot exercise this boundary. Here the handler holds a
+    /// mutation-registry slot (the same accounting `shielded_mutation_unit`
+    /// gives real units) and stays blocked until 4s after the shutdown
+    /// signal, proving:
+    ///
+    /// 1. the transport drain returns first with the mutation still
+    ///    executing (`done` is false) — exactly the state in which
+    ///    `run_serve` previously began stamping the index, and
+    /// 2. the registry drain — the gate `run_serve` now applies before
+    ///    persistence — does not pass until the mutation completes, with no
+    ///    2s ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_awaits_mutation_blocked_beyond_rmcp_drain_window() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let registry = Arc::new(memory_mcp::types::MutationRegistry::default());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = BlockingToolServer {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            done: Arc::clone(&done),
+            registry: Some(Arc::clone(&registry)),
+        };
+
+        let client = spawn_blocking_tool_client(client_io);
+
+        let service = rmcp::serve_server(handler, server_io)
+            .await
+            .expect("initialize over in-memory transport");
+
+        // Wait until the mutation is provably in flight and registered.
+        entered.notified().await;
+        assert_eq!(registry.in_flight(), 1, "handler must hold its slot");
+
+        // Release the blocked handler 4s after the signal fires — well
+        // *outside* rmcp's ~2s cancellation drain window.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            release.notify_one();
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        shutdown_tx.send(()).expect("send shutdown signal");
+        drive_service_until_quit(service, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("drive_service_until_quit");
+
+        // The transport gave up before the mutation finished. If this fires,
+        // rmcp's bounded-drain behavior changed (it now awaits handlers
+        // fully) — re-evaluate whether the registry gate and this regression
+        // still model reality.
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "expected the transport drain to return while the mutation was \
+             still blocked (rmcp's ~2s drain ceiling); it drained fully instead"
+        );
+        assert_eq!(
+            registry.in_flight(),
+            1,
+            "the abandoned mutation must still hold its registry slot"
+        );
+
+        // The gate `run_serve` applies before persistence: it must wait out
+        // the mutation rather than inherit the transport's ceiling.
+        assert!(
+            registry
+                .drained_within(std::time::Duration::from_secs(30))
+                .await,
+            "registry drain must resolve once the mutation completes"
+        );
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "registry drained before the mutation completed — index \
+             persistence would still race the mutation"
         );
         releaser.await.expect("releaser task");
         client.abort();

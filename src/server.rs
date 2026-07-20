@@ -435,17 +435,25 @@ impl Drop for EditStageTiming {
 /// requester is needed to observe the failure. The `JoinError` arm below is
 /// only the *reporting* path for a requester that is still awaiting; it is
 /// not what the contract relies on.
-async fn shielded_mutation_unit<T, F>(
-    lexical: &Arc<LexicalIndex>,
-    unit: F,
-) -> Result<T, MemoryError>
+///
+/// Every unit also registers with [`AppState::mutations`] before it is
+/// spawned (#329 review, round 3): the transport's shutdown drain is bounded
+/// and detaches handler tasks, so index persistence gates on this registry —
+/// not the transport — to know when application mutations have quiesced. The
+/// slot is held by an RAII guard inside the detached task, so panic unwinds
+/// and task drops release it alongside the `DegradeOnDrop` marking.
+async fn shielded_mutation_unit<T, F>(state: &Arc<AppState>, unit: F) -> Result<T, MemoryError>
 where
     F: std::future::Future<Output = Result<T, MemoryError>> + Send + 'static,
     T: Send + 'static,
 {
-    let guard_lexical = Arc::clone(lexical);
+    // Enter the registry before spawning: from this point shutdown cannot
+    // certify index persistence until the unit's slot is released.
+    let mutation_slot = state.mutations.enter();
+    let guard_lexical = Arc::clone(&state.lexical);
     let worker = tokio::spawn(
         async move {
+            let _mutation_slot = mutation_slot;
             let guard = DegradeOnDrop::new(guard_lexical, "mutation unit died before completing");
             let outcome = unit.await;
             guard.defuse();
@@ -1067,7 +1075,51 @@ pub async fn startup_prepare_index(
 /// failed and the sync mirror refused SHA advancement — the index
 /// keeps the SHA it last legitimately verified, so the next startup sees the
 /// mismatch against git HEAD and rebuilds the vector index from git truth
-/// instead of trusting the incomplete mirror (#293 review, round 2).
+/// Await in-flight application mutation units before shutdown persistence.
+///
+/// The transport's own shutdown drain cannot vouch for these: rmcp's awaited
+/// cancellation bounds its response drain (~2s in rmcp 1.8) and detaches
+/// handler tasks, so a mutation stalled past the window — e.g. an embedding
+/// call after the git commit already landed — is still running when
+/// `waiting()` returns (#329 review, round 3). This waits on the
+/// application's [`MutationRegistry`](crate::types::MutationRegistry)
+/// instead, with no transport-imposed ceiling.
+///
+/// Returns `true` when every unit completed within `deadline`. On timeout it
+/// records a mirror gap and returns `false`: persistence then keeps the last
+/// verified SHA instead of stamping the (already mutated) git HEAD onto an
+/// index whose mirror the killed unit never finished, so the next startup
+/// detects the mismatch and reindexes from git truth. A hard shutdown
+/// deadline may abandon a mutation, but it must never certify the index as
+/// intact.
+pub async fn drain_mutations_before_persist(
+    state: &AppState,
+    deadline: std::time::Duration,
+) -> bool {
+    if state.mutations.drained_within(deadline).await {
+        true
+    } else {
+        warn!(
+            in_flight = state.mutations.in_flight(),
+            deadline_ms = deadline.as_millis() as u64,
+            "mutation units still in flight at shutdown drain deadline — \
+             refusing index certification so the next startup reindexes from git truth"
+        );
+        state.mark_index_mirror_incomplete();
+        false
+    }
+}
+
+/// Persist the vector index at graceful shutdown.
+///
+/// Advances the stored composite SHA to the router's current HEAD only when
+/// the in-process mirror is intact ([`AppState::index_mirror_is_intact`]).
+/// When a mirror gap was recorded — e.g. a sync's post-pull change discovery
+/// failed and the sync mirror refused SHA advancement, or the shutdown
+/// mutation drain deadline expired — the index keeps the SHA it last
+/// legitimately verified, so the next startup sees the mismatch against git
+/// HEAD and rebuilds the vector index from git truth instead of trusting the
+/// incomplete mirror (#293 review, round 2).
 pub async fn persist_index_on_shutdown(
     state: &AppState,
     index_dir: &std::path::Path,
@@ -1163,7 +1215,7 @@ impl MemoryServer {
             // git while stranding the mirror dispatch (#310, ADR-0039).
             let start = Instant::now();
             let unit_state = Arc::clone(&state);
-            let memory = shielded_mutation_unit(&state.lexical, async move {
+            let memory = shielded_mutation_unit(&state, async move {
                 unit_state.router.save_memory(&memory).await?;
                 info!(repo_ms = start.elapsed().as_millis(), "saved to repo");
 
@@ -1392,7 +1444,7 @@ impl MemoryServer {
             // deletion while stranding the index removals (#310, ADR-0039).
             let unit_state = Arc::clone(&state);
             let unit_name = name.clone();
-            shielded_mutation_unit(&state.lexical, async move {
+            shielded_mutation_unit(&state, async move {
                 // Delete from repo first — if this fails, index is untouched,
                 // memory stays functional.
                 unit_state
@@ -1527,7 +1579,7 @@ impl MemoryServer {
             // git while stranding the mirror dispatch (#310, ADR-0039).
             timing.stage = "repo_save";
             let unit_state = Arc::clone(&state);
-            let (memory, mut timing) = shielded_mutation_unit(&state.lexical, async move {
+            let (memory, mut timing) = shielded_mutation_unit(&state, async move {
                 let stage_start = Instant::now();
                 let save_result = unit_state.router.save_memory(&memory).await;
                 timing.repo_save_ms = elapsed_ms(stage_start);
@@ -1663,7 +1715,7 @@ impl MemoryServer {
             let unit_new_name = new_name.clone();
             let unit_from_scope = from_scope.clone();
             let unit_to_scope = to_scope.clone();
-            let dest = shielded_mutation_unit(&state.lexical, async move {
+            let dest = shielded_mutation_unit(&state, async move {
                 // 2. Atomically read source, write destination, delete source
                 //    in one git commit. Must happen before index mutations so a
                 //    failure leaves the index consistent with the repo on disk.
@@ -1930,7 +1982,7 @@ impl MemoryServer {
             let unit_state = Arc::clone(&state);
             let unit_branch = branch.clone();
             let (sync_result, total_reindex, any_reindex) =
-                shielded_mutation_unit(&state.lexical, async move {
+                shielded_mutation_unit(&state, async move {
                     let sync_result = unit_state
                         .router
                         .sync_all(&unit_state.auth, &unit_branch, pull_first)
@@ -4925,6 +4977,124 @@ mod tests {
             );
         }
 
+        /// #329 review round 3: a shutdown drain deadline that expires with
+        /// a mutation unit still in flight must never certify the index.
+        /// The unit here holds its registry slot while git HEAD has already
+        /// advanced (the unit's commit landed; its index mirror has not) —
+        /// the exact `move` failure mode from the review. The drain must
+        /// time out, record a mirror gap, and persistence must keep the
+        /// last verified SHA so the next startup reindexes from git truth.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shutdown_drain_timeout_refuses_index_certification() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            // Verified state at A: git truth exists, mirror is intact, and
+            // shutdown-style persistence stamps HEAD-A.
+            let note_a = Memory::from_validated(
+                MemoryName::new("note-a".to_string()).unwrap(),
+                "payload a".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&note_a).await.expect("save a");
+            let dir_a = tempfile::tempdir().expect("index dir a");
+            persist_index_on_shutdown(&state, dir_a.path())
+                .await
+                .expect("persist at A");
+            let sha_a = state.index.commit_sha().expect("verified SHA at A");
+
+            // A mutation unit is in flight past the drain deadline: its git
+            // commit already moved HEAD past A, its index mirror is pending.
+            let stuck_unit_slot = state.mutations.enter();
+            let note_b = Memory::from_validated(
+                MemoryName::new("note-b".to_string()).unwrap(),
+                "payload b".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&note_b).await.expect("save b");
+            let head_b = state.router.head_sha().await.expect("git HEAD at B");
+            assert_ne!(head_b, sha_a, "git must have advanced past A");
+
+            // The deadline expires: certification must be refused…
+            let drained =
+                drain_mutations_before_persist(&state, std::time::Duration::from_millis(50)).await;
+            assert!(!drained, "drain must report the expired deadline");
+            assert!(
+                !state.index_mirror_is_intact(),
+                "an expired drain deadline must record a mirror gap — \
+                 certifying here is exactly the round-3 data-loss path"
+            );
+
+            // …so persistence keeps the SHA verified at A, not HEAD-B.
+            let dir_b = tempfile::tempdir().expect("index dir b");
+            persist_index_on_shutdown(&state, dir_b.path())
+                .await
+                .expect("persist after timeout");
+            assert_eq!(
+                state.index.commit_sha().as_deref(),
+                Some(sha_a.as_str()),
+                "timeout persistence must keep the last verified SHA"
+            );
+            assert_ne!(
+                state.index.commit_sha().as_deref(),
+                Some(head_b.as_str()),
+                "stamping HEAD after an expired drain would make the next \
+                 startup skip the reindex that repairs the missing mirror"
+            );
+            drop(stuck_unit_slot);
+        }
+
+        /// #329 review round 3: `shielded_mutation_unit` must account its
+        /// unit in the shutdown mutation registry for the unit's full
+        /// duration — the registry, not the transport, is what gates index
+        /// persistence at shutdown.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shielded_mutation_unit_holds_registry_slot_until_completion() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let unit_entered = Arc::clone(&entered);
+            let unit_release = Arc::clone(&release);
+            let requester_state = Arc::clone(&state);
+            let requester = tokio::spawn(async move {
+                shielded_mutation_unit::<(), _>(&requester_state, async move {
+                    unit_entered.notify_one();
+                    unit_release.notified().await;
+                    Ok(())
+                })
+                .await
+            });
+
+            entered.notified().await;
+            assert_eq!(
+                state.mutations.in_flight(),
+                1,
+                "a running unit must hold exactly one registry slot"
+            );
+            assert!(
+                !state
+                    .mutations
+                    .drained_within(std::time::Duration::from_millis(50))
+                    .await,
+                "the registry must not drain while the unit is executing"
+            );
+
+            release.notify_one();
+            requester
+                .await
+                .expect("requester task")
+                .expect("unit outcome");
+            assert!(
+                state
+                    .mutations
+                    .drained_within(std::time::Duration::from_secs(5))
+                    .await,
+                "the slot must be released when the unit completes"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn post_pull_diff_failure_marks_degraded_and_schedules_repair() {
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -5061,9 +5231,9 @@ mod tests {
 
             let unit_state = Arc::clone(&state);
             let unit_release = Arc::clone(&release);
-            let requester_lexical = Arc::clone(&state.lexical);
+            let requester_state = Arc::clone(&state);
             let requester = tokio::spawn(async move {
-                shielded_mutation_unit::<(), _>(&requester_lexical, async move {
+                shielded_mutation_unit::<(), _>(&requester_state, async move {
                     // Real git commit — the unit dies *after* truth moved.
                     let memory = Memory::from_validated(
                         MemoryName::new("committed".to_string()).unwrap(),
@@ -5089,6 +5259,17 @@ mod tests {
             // The Drop-guard owned by the detached task must record the
             // divergence with no requester left to observe a JoinError.
             await_degraded(&state).await;
+
+            // The panicked unit must also release its shutdown-registry
+            // slot (#329 review, round 3) — a leaked slot would hold up
+            // shutdown persistence until the drain deadline every time.
+            assert!(
+                state
+                    .mutations
+                    .drained_within(std::time::Duration::from_secs(5))
+                    .await,
+                "a panicked mutation unit must release its registry slot"
+            );
 
             // Git truth holds the memory the panic stranded.
             state
