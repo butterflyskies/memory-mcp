@@ -16,8 +16,22 @@ use crate::error::MemoryError;
 use super::memory::MemoryRef;
 
 /// Number of hex characters of the SHA-256 content digest embedded in a
-/// rendered [`FactId`] (16 hex chars = 64 bits).
-const DIGEST_HEX_LEN: usize = 16;
+/// rendered [`FactId`] (16 hex chars = 64 bits). Also the truncation
+/// width of the chunker's tokenizer-identity digest.
+pub(crate) const DIGEST_HEX_LEN: usize = 16;
+
+/// The first `hex_chars` lowercase hex characters of `bytes`
+/// (consuming `hex_chars / 2` leading bytes). Shared digest-truncation
+/// helper for [`FactId::derive`] and the chunker's tokenizer identity,
+/// so both render the same way.
+pub(crate) fn hex_prefix(bytes: &[u8], hex_chars: usize) -> String {
+    let mut out = String::with_capacity(hex_chars);
+    for byte in &bytes[..hex_chars / 2] {
+        use fmt::Write;
+        write!(out, "{byte:02x}").expect("writing hex to a String cannot fail");
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // ChunkerVersion
@@ -214,12 +228,7 @@ impl FactId {
         hasher.update((body.len() as u64).to_le_bytes());
         hasher.update(body.as_bytes());
         let full = hasher.finalize();
-
-        let mut digest = String::with_capacity(DIGEST_HEX_LEN);
-        for byte in &full[..DIGEST_HEX_LEN / 2] {
-            use fmt::Write;
-            write!(digest, "{byte:02x}").expect("writing hex to a String cannot fail");
-        }
+        let digest = hex_prefix(&full[..], DIGEST_HEX_LEN);
 
         Ok(Self {
             parent_id,

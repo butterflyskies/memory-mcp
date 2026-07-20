@@ -74,11 +74,13 @@
 //! WordPiece counts are not monotone over prefixes, the probed
 //! boundary is *a* deterministic fitting one (identical to a greedy
 //! scan whenever counts are monotone). Pieces never re-merge across a
-//! split. Documented fallback: if even a single character exceeds the budget
-//! (only possible when the budget is smaller than the special-token
-//! overhead plus one), that character is emitted alone as an over-budget
-//! chunk — deterministic, and the only case ADR-0042 P2.6 permits over
-//! budget.
+//! split. Documented fallback: a single character that alone exceeds
+//! the budget is emitted alone. The invariant is shape, not cause:
+//! single-character chunks may exceed the budget, and that is the only
+//! over-budget chunk shape this chunker produces (ADR-0042 P2.6).
+//! When that shape occurs depends on the tokenizer — byte-level BPE
+//! tokenizers can map one character to several tokens, so it is not
+//! confined to budgets below the special-token overhead.
 //!
 //! # Versioning
 //!
@@ -91,11 +93,18 @@
 //! budgets are never silently mixed (ADR-0042 "stale schema/model"
 //! ledger row).
 
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::{fmt, str::FromStr};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 use crate::error::MemoryError;
-use crate::types::{ChunkerVersion, FactId, FactRecord, MemoryRef, SourceSpan};
+use crate::types::{
+    hex_prefix, ChunkerVersion, FactId, FactRecord, MemoryRef, SourceSpan, DIGEST_HEX_LEN,
+};
 
 /// Revision of the chunking algorithm implemented by this module.
 ///
@@ -173,10 +182,7 @@ impl HfTokenCounter {
         let digest = Sha256::digest(canonical.as_bytes());
         let mut identity = label.into();
         identity.push_str("@sha256:");
-        for byte in &digest[..8] {
-            use std::fmt::Write;
-            write!(identity, "{byte:02x}").expect("writing hex to a String cannot fail");
-        }
+        identity.push_str(&hex_prefix(&digest[..], DIGEST_HEX_LEN));
         Ok(Self {
             tokenizer,
             identity,
@@ -199,6 +205,110 @@ impl TokenCounter for HfTokenCounter {
 }
 
 // ---------------------------------------------------------------------------
+// TokenBudget
+// ---------------------------------------------------------------------------
+
+/// Non-zero token budget a chunk must fit within.
+///
+/// Zero is unrepresentable: a zero budget admits nothing, not even the
+/// tokenizer's special tokens, and would degenerate every body into
+/// per-character fallback chunks by construction. Validation lives in
+/// the [`TryFrom<usize>`] conversion, so a [`ChunkerConfig`] can only
+/// ever hold a usable budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TokenBudget(NonZeroUsize);
+
+impl TokenBudget {
+    /// The budget as a plain count.
+    pub(crate) const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl TryFrom<usize> for TokenBudget {
+    type Error = MemoryError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        NonZeroUsize::new(value)
+            .map(Self)
+            .ok_or_else(|| MemoryError::InvalidInput {
+                reason: "chunker token budget must be non-zero \
+                         (a zero budget admits nothing, not even the tokenizer's special tokens)"
+                    .to_string(),
+            })
+    }
+}
+
+impl fmt::Display for TokenBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChunkerFingerprint
+// ---------------------------------------------------------------------------
+
+/// Full identity of a chunking run: algorithm revision, tokenizer
+/// identity (content-bound — see [`TokenCounter::identity`]), and token
+/// budget.
+///
+/// Canonical string form (also the serde representation):
+///
+/// ```text
+/// chunker:v<version>:tokenizer=<identity>:budget=<max-tokens>
+/// ```
+///
+/// The slice-3 catalog stamps this value; a mismatch on load —
+/// algorithm change, embedding-model swap (BGE → ModernBERT), an
+/// upstream tokenizer revision under the same model id, or a budget
+/// change — is detectable staleness and forces a full rebuild rather
+/// than mixing chunk vintages (ADR-0042). The stamp is compared for
+/// equality, never picked apart: parsing only checks the `chunker:v`
+/// prefix that marks a value as a chunker fingerprint at all.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ChunkerFingerprint(String);
+
+impl ChunkerFingerprint {
+    /// The canonical string form.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ChunkerFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ChunkerFingerprint {
+    type Err = MemoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with("chunker:v") {
+            return Err(MemoryError::InvalidInput {
+                reason: format!("malformed chunker fingerprint '{s}': missing 'chunker:v' prefix"),
+            });
+        }
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl Serialize for ChunkerFingerprint {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChunkerFingerprint {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ChunkerConfig
 // ---------------------------------------------------------------------------
 
@@ -211,30 +321,22 @@ impl TokenCounter for HfTokenCounter {
 /// the anticipated next one.
 pub(crate) struct ChunkerConfig {
     counter: Box<dyn TokenCounter>,
-    max_tokens: usize,
+    max_tokens: TokenBudget,
 }
 
 impl ChunkerConfig {
-    /// Create a config. `max_tokens` must be non-zero (a zero budget
-    /// admits nothing, not even the tokenizer's special tokens).
-    pub(crate) fn new(
-        counter: Box<dyn TokenCounter>,
-        max_tokens: usize,
-    ) -> Result<Self, MemoryError> {
-        if max_tokens == 0 {
-            return Err(MemoryError::InvalidInput {
-                reason: "chunker token budget must be non-zero".to_string(),
-            });
-        }
-        Ok(Self {
+    /// Create a config. Budget validity (non-zero) is carried by
+    /// [`TokenBudget`]'s type, so construction cannot fail.
+    pub(crate) fn new(counter: Box<dyn TokenCounter>, max_tokens: TokenBudget) -> Self {
+        Self {
             counter,
             max_tokens,
-        })
+        }
     }
 
     /// The token budget a chunk must fit within.
     pub(crate) fn max_tokens(&self) -> usize {
-        self.max_tokens
+        self.max_tokens.get()
     }
 
     /// Number of tokens `text` encodes to under this config's tokenizer.
@@ -242,26 +344,50 @@ impl ChunkerConfig {
         self.counter.count(text)
     }
 
-    /// Full identity of a chunking run: algorithm revision, tokenizer
-    /// identity (content-bound — see [`TokenCounter::identity`]), and
-    /// token budget.
-    ///
-    /// The slice-3 catalog stamps this string; a mismatch on load —
-    /// algorithm change, embedding-model swap (BGE → ModernBERT), an
-    /// upstream tokenizer revision under the same model id, or a
-    /// budget change — is detectable staleness and forces a full
-    /// rebuild rather than mixing chunk vintages (ADR-0042).
-    pub(crate) fn fingerprint(&self) -> String {
-        format!(
+    /// This config's [`ChunkerFingerprint`] — the staleness stamp for
+    /// the slice-3 catalog.
+    pub(crate) fn fingerprint(&self) -> ChunkerFingerprint {
+        ChunkerFingerprint(format!(
             "chunker:v{}:tokenizer={}:budget={}",
             CHUNKER_VERSION,
             self.counter.identity(),
             self.max_tokens
-        )
+        ))
     }
 
     fn fits(&self, text: &str) -> Result<bool, MemoryError> {
-        Ok(self.counter.count(text)? <= self.max_tokens)
+        Ok(self.counter.count(text)? <= self.max_tokens.get())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HeadingPath
+// ---------------------------------------------------------------------------
+
+/// Markdown heading trail from the document root to a unit or chunk,
+/// in root-to-leaf order (empty for preamble before the first
+/// heading).
+///
+/// Segments are `Arc<str>` so the parser's per-unit snapshots share
+/// one allocation per heading — snapshotting is O(depth) pointer
+/// clones, not string copies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HeadingPath(Vec<Arc<str>>);
+
+impl HeadingPath {
+    /// True for preamble trails (no heading in effect).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Trail segments in root-to-leaf order.
+    pub(crate) fn segments(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(AsRef::as_ref)
+    }
+
+    /// Owned segment strings, for assembling catalog records.
+    pub(crate) fn to_vec(&self) -> Vec<String> {
+        self.segments().map(str::to_string).collect()
     }
 }
 
@@ -276,10 +402,10 @@ pub(crate) struct Chunk {
     /// Byte range into the parent body. Chunk spans are strictly
     /// ordered, non-overlapping, and tile the body exactly.
     pub(crate) span: SourceSpan,
-    /// Heading trail from the document root to this chunk (empty for
-    /// preamble before the first heading). A chunk that starts with a
-    /// heading includes that heading in its own trail.
-    pub(crate) heading_path: Vec<String>,
+    /// Heading trail from the document root to this chunk. A chunk
+    /// that starts with a heading includes that heading in its own
+    /// trail.
+    pub(crate) heading_path: HeadingPath,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +432,7 @@ pub(crate) fn chunk_markdown(
         units.push(Unit {
             start: 0,
             end: content.len(),
-            heading_path: Vec::new(),
+            heading_path: HeadingPath::default(),
         });
     }
     tile(&mut units, content.len());
@@ -366,7 +492,7 @@ pub(crate) fn chunk_into_facts(
             FactRecord::new(
                 id,
                 parent.clone(),
-                chunk.heading_path,
+                chunk.heading_path.to_vec(),
                 body.to_string(),
                 tags.to_vec(),
                 Vec::new(),
@@ -379,11 +505,11 @@ fn push_chunk(
     chunks: &mut Vec<Chunk>,
     start: usize,
     end: usize,
-    heading_path: &[String],
+    heading_path: &HeadingPath,
 ) -> Result<(), MemoryError> {
     chunks.push(Chunk {
         span: SourceSpan::new(start, end)?,
-        heading_path: heading_path.to_vec(),
+        heading_path: heading_path.clone(),
     });
     Ok(())
 }
@@ -412,6 +538,24 @@ fn push_chunk(
 /// deterministic fitting boundary — identical to the greedy
 /// stop-at-first-overflow scan whenever counts are monotone — and
 /// every returned `n > 0` was verified by `fits` before being chosen.
+///
+/// # Append stability (edit locality, ADR-0042 P2.7)
+///
+/// The probe sequence — `n` = 1, 2, 4, … then bisection of the first
+/// (fits, does-not-fit] bracket — is a pure function of the `fits`
+/// predicate over the group's own leading candidates, *unless* the
+/// doubling reaches the remaining-candidates cap `total` (the document
+/// tail). A group whose budget transition was bracketed strictly
+/// before that cap therefore re-probes the identical sequence and
+/// chooses the identical boundary when candidates are appended after
+/// the document — by path determinism alone, independent of whether
+/// token counts are monotone. Only a group whose search touched the
+/// tail — the final group, or one whose doubling ran within range of
+/// the old end — can shift on append, and under non-monotone counts
+/// that seam region can exceed exactly one chunk. The guaranteed
+/// invariant is edit locality: prefix chunks whose boundary search
+/// completed without reaching the document tail are byte-stable under
+/// suffix append.
 fn packed_len(
     total: usize,
     mut fits: impl FnMut(usize) -> Result<bool, MemoryError>,
@@ -453,7 +597,7 @@ fn packed_len(
 fn split_oversized(
     text: &str,
     base: usize,
-    heading_path: &[String],
+    heading_path: &HeadingPath,
     config: &ChunkerConfig,
     chunks: &mut Vec<Chunk>,
 ) -> Result<(), MemoryError> {
@@ -498,12 +642,15 @@ fn split_oversized(
 /// at UTF-8 character boundaries, each piece a [`packed_len`]-probed
 /// run of characters that fits. Documented fallback: a single
 /// character that alone exceeds the budget is emitted alone, over
-/// budget — the only over-budget chunk shape this chunker produces
-/// (ADR-0042 P2.6).
+/// budget. The invariant is shape, not cause: single-character chunks
+/// may exceed the budget, and that is the only over-budget chunk shape
+/// this chunker produces (ADR-0042 P2.6). Whether one character can
+/// exceed a given budget depends on the tokenizer — byte-level BPE
+/// tokenizers can map one character to several tokens.
 fn char_split(
     seg: &str,
     base: usize,
-    heading_path: &[String],
+    heading_path: &HeadingPath,
     config: &ChunkerConfig,
     chunks: &mut Vec<Chunk>,
 ) -> Result<(), MemoryError> {
@@ -541,7 +688,7 @@ fn char_split(
 struct Unit {
     start: usize,
     end: usize,
-    heading_path: Vec<String>,
+    heading_path: HeadingPath,
 }
 
 /// Extend unit spans so they tile the whole body: each unit absorbs the
@@ -573,9 +720,12 @@ fn parse_units(content: &str) -> Vec<Unit> {
     let mut units: Vec<Unit> = Vec::new();
     let mut open: Option<Unit> = None;
     let mut fence: Option<Fence> = None;
-    // (level, text) pairs; the path snapshot is the texts in order.
-    let mut heading_stack: Vec<(usize, String)> = Vec::new();
-    let snapshot = |stack: &[(usize, String)]| stack.iter().map(|(_, text)| text.clone()).collect();
+    // (level, text) pairs; the path snapshot is the texts in order,
+    // sharing each heading's allocation across every unit under it.
+    let mut heading_stack: Vec<(usize, Arc<str>)> = Vec::new();
+    let snapshot = |stack: &[(usize, Arc<str>)]| {
+        HeadingPath(stack.iter().map(|(_, text)| Arc::clone(text)).collect())
+    };
 
     let mut offset = 0usize;
     for line in content.split_inclusive('\n') {
@@ -610,7 +760,7 @@ fn parse_units(content: &str) -> Vec<Unit> {
             while heading_stack.last().is_some_and(|(l, _)| *l >= level) {
                 heading_stack.pop();
             }
-            heading_stack.push((level, text));
+            heading_stack.push((level, Arc::from(text)));
             units.push(Unit {
                 start: line_start,
                 end: line_end,

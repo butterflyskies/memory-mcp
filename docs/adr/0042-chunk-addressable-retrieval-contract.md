@@ -277,9 +277,23 @@ example regressions.
 - **P2.6 Budget respect.** Every chunk fits the actual embedding
   tokenizer's budget, except indivisible atomic blocks, whose
   fallback behavior must be documented and deterministic.
-- **P2.7 Prefix stability.** Editing only a suffix of the parent
-  leaves the chunks (spans, bodies, and therefore `FactId`s) of the
-  unchanged prefix intact.
+- **P2.7 Edit locality (prefix stability).** Stated precisely as the
+  structural guarantee the implementation provides: prefix chunks
+  whose boundary search completed without reaching the document tail
+  are byte-stable (spans, bodies, and therefore `FactId`s) under
+  suffix append. The basis is path determinism, not token-count
+  monotonicity: the packing search's probe sequence (doubling 1, 2,
+  4, … then bisection) is a pure function of the fits predicate over
+  the group's own leading candidates *unless* the doubling reaches
+  the remaining-candidates cap, so any group whose budget transition
+  was found strictly before that cap re-derives the identical
+  boundary after an append. Only groups whose search touched the
+  document tail — the final group, or one within doubling range of
+  the old end — can shift on append, and because real tokenizer
+  counts are not monotone over prefixes, that seam region can exceed
+  exactly one chunk. The common case (only the final chunk re-forms)
+  is verified empirically by the property tests; the seam-aware
+  statement above is the invariant.
 
 ### Slices 4–6 — indexes, fusion, collapse
 

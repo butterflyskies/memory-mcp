@@ -46,9 +46,13 @@ fn bge_tokenizer() -> &'static Tokenizer {
     })
 }
 
+fn budget(max_tokens: usize) -> TokenBudget {
+    TokenBudget::try_from(max_tokens).expect("non-zero budget")
+}
+
 fn config(max_tokens: usize) -> ChunkerConfig {
     let counter = HfTokenCounter::new(bge_tokenizer().clone(), MODEL_ID).expect("wrap tokenizer");
-    ChunkerConfig::new(Box::new(counter), max_tokens).expect("non-zero budget")
+    ChunkerConfig::new(Box::new(counter), budget(max_tokens))
 }
 
 const PARENT: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -97,7 +101,7 @@ fn parse_units_splits_on_structural_boundaries() {
     );
     assert!(units
         .iter()
-        .all(|u| u.heading_path == vec!["Title".to_string()]));
+        .all(|u| u.heading_path.to_vec() == vec!["Title".to_string()]));
 }
 
 /// Boundary policy — red if the heading stack stops popping same-or-
@@ -114,7 +118,7 @@ fn parse_units_tracks_heading_stack() {
             .find(|u| u.start == start)
             .expect("unit at needle")
             .heading_path
-            .clone()
+            .to_vec()
     };
     assert_eq!(path_of("text b"), vec!["A", "B"]);
     assert_eq!(path_of("text c"), vec!["A", "B", "C"]);
@@ -180,6 +184,7 @@ fn parse_units_list_marker_edge_cases() {
     assert!(is_list_item("  - nested\n"));
     assert!(is_list_item("3. ordered\n"));
     assert!(is_list_item("42) ordered\n"));
+    assert!(is_list_item("123456789. ordered\n")); // 9 digits: the cap itself
     assert!(is_list_item("-\n")); // empty item
     assert!(!is_list_item("*emphasis*\n"));
     assert!(!is_list_item("-dash-word\n"));
@@ -227,7 +232,7 @@ fn short_memory_is_exactly_one_chunk() {
         (0, content.len())
     );
     // The chunk starts with the heading, so its trail includes it.
-    assert_eq!(chunks[0].heading_path, vec!["Notes"]);
+    assert_eq!(chunks[0].heading_path.to_vec(), vec!["Notes"]);
 }
 
 /// Two-section fixture split by a budget that admits either section but
@@ -272,8 +277,8 @@ fn sections_split_at_structural_boundary() {
         (chunks[1].span.start(), chunks[1].span.end()),
         (beta_start, content.len())
     );
-    assert_eq!(chunks[0].heading_path, vec!["Alpha"]);
-    assert_eq!(chunks[1].heading_path, vec!["Beta"]);
+    assert_eq!(chunks[0].heading_path.to_vec(), vec!["Alpha"]);
+    assert_eq!(chunks[1].heading_path.to_vec(), vec!["Beta"]);
 }
 
 /// P2.6 — red if an oversized code fence splits mid-line: the
@@ -360,6 +365,143 @@ fn single_char_over_budget_falls_back_deterministically() {
     }
 }
 
+/// Non-monotonicity reality check — red if BGE's `[UNK]` cliff stops
+/// existing (a >100-character word collapses to a single `[UNK]`, so
+/// the whole run counts *fewer* tokens than a shorter prefix) or if
+/// the chunker misbehaves in its presence. The counterintuitive but
+/// correct outcome: the whole 150-character run fits a small budget
+/// because it *is* one `[UNK]`, so it stays a single chunk.
+#[test]
+fn unk_cliff_makes_whole_run_count_less_than_prefix() {
+    let content = "x".repeat(150);
+    let cfg = config(16);
+    let whole = cfg.count(&content).expect("count");
+    let prefix = cfg.count(&content[..50]).expect("count");
+    assert!(
+        whole < prefix,
+        "fixture drift: the [UNK] collapse must make the whole run ({whole} tokens) \
+         count lower than a 50-char prefix ({prefix} tokens)"
+    );
+
+    let chunks = chunks_of(&content, &cfg);
+    assert_eq!(reconstruct(&content, &chunks), content);
+    for chunk in &chunks {
+        let body = chunk.span.slice_in(&content).expect("span resolves");
+        assert!(cfg.count(body).expect("count") <= cfg.max_tokens());
+    }
+    // The collapse makes the whole run fit: P2.5 forces one chunk.
+    assert!(whole <= cfg.max_tokens());
+    assert_eq!(chunks.len(), 1);
+}
+
+/// P2.6 mixed-path — red if an over-budget unit stops routing each
+/// line down the right splitting path: short leading lines must
+/// coalesce into one whole-line-packed chunk, the far-over-budget
+/// line must char-split (boundaries mid-line), short trailing lines
+/// must coalesce again after the split, and reconstruction stays
+/// exact.
+#[test]
+fn mixed_short_and_oversized_lines_coalesce_and_char_split() {
+    let mut content = String::from("short one\nshort two\nshort three\n");
+    let long_start = content.len();
+    content.push_str(&"alpha beta gamma delta epsilon ".repeat(40));
+    content.push('\n');
+    let long_end = content.len();
+    content.push_str("tail one\ntail two\ntail three\n");
+
+    let cfg = config(32);
+    assert_eq!(
+        parse_units(&content).len(),
+        1,
+        "fixture drift: the blank-line-free body must be one unit"
+    );
+    assert!(
+        cfg.count(&content[long_start..long_end]).expect("count") > cfg.max_tokens(),
+        "fixture drift: the long line must exceed the budget alone"
+    );
+
+    let chunks = chunks_of(&content, &cfg);
+    // Leading shorts coalesce into exactly one chunk ending at the
+    // long line.
+    assert_eq!(chunks[0].span.start(), 0);
+    assert_eq!(chunks[0].span.end(), long_start);
+    // The long line char-splits: at least one chunk starts mid-line
+    // inside it.
+    assert!(
+        chunks.iter().any(|c| {
+            let start = c.span.start();
+            start > long_start && start < long_end && content.as_bytes()[start - 1] != b'\n'
+        }),
+        "expected a chunk boundary inside the oversized line, off any line start"
+    );
+    // Trailing shorts coalesce into exactly one final chunk.
+    let last = chunks.last().expect("chunks");
+    assert_eq!(last.span.start(), long_end);
+    assert_eq!(last.span.end(), content.len());
+
+    for chunk in &chunks {
+        let body = chunk.span.slice_in(&content).expect("span resolves");
+        assert!(cfg.count(body).expect("count") <= cfg.max_tokens());
+    }
+    assert_eq!(reconstruct(&content, &chunks), content);
+}
+
+/// Boundary + whitespace policy, CRLF edition — red if `\r\n` line
+/// endings break structural parsing (heading text keeping its `\r`,
+/// fences not closing, list items not splitting) or exact
+/// reconstruction anywhere in the pipeline.
+#[test]
+fn crlf_document_chunks_and_reconstructs() {
+    let content = "# Title\r\n\r\nparagraph line one\r\nparagraph line two\r\n\r\n\
+                   - item one\r\n- item two\r\n\r\n```rust\r\nlet x = 1;\r\n```\r\n";
+    let cfg = config(16);
+    assert!(
+        cfg.count(content).expect("count") > cfg.max_tokens(),
+        "fixture drift: the document must exceed the budget so chunking is non-trivial"
+    );
+
+    let chunks = chunks_of(content, &cfg);
+    assert!(chunks.len() > 1, "document must split");
+    for chunk in &chunks {
+        let body = chunk.span.slice_in(content).expect("span resolves");
+        assert!(cfg.count(body).expect("count") <= cfg.max_tokens());
+        assert_eq!(chunk.heading_path.to_vec(), vec!["Title"]);
+        assert!(
+            chunk.heading_path.segments().all(|s| !s.contains('\r')),
+            "heading text must not keep the carriage return"
+        );
+    }
+    assert_eq!(reconstruct(content, &chunks), content);
+}
+
+/// Boundary policy — red if nested list markers stop starting their
+/// own units regardless of indent depth, or if a nested-list document
+/// stops reconstructing exactly.
+#[test]
+fn nested_list_markers_start_their_own_units() {
+    let content = "- top level item\n  - nested child item\n    - deeper grandchild\n\
+                   - second top item\n  1. ordered nested child\n";
+    let units = parse_units(content);
+    // Every line is a marker line (bullet or ordered, at three indent
+    // depths), so every line start must start its own unit.
+    let mut line_starts = vec![0usize];
+    line_starts.extend(
+        content
+            .match_indices('\n')
+            .map(|(i, _)| i + 1)
+            .filter(|&i| i < content.len()),
+    );
+    assert_eq!(
+        units.iter().map(|u| u.start).collect::<Vec<_>>(),
+        line_starts,
+        "every nested marker must start its own unit"
+    );
+
+    let cfg = config(16);
+    let chunks = chunks_of(content, &cfg);
+    assert_eq!(reconstruct(content, &chunks), content);
+}
+
 /// True provenance (P1.8 carried into slice 2) — red if the chunker
 /// emits records whose ids do not describe their bodies, drops the
 /// chunker version stamp, forgets parent tags, or populates `refs_out`
@@ -440,17 +582,27 @@ impl TokenCounter for StubCounter {
 fn fingerprint_incorporates_version_tokenizer_and_budget() {
     let bge_512 = config(512).fingerprint();
     let bge_8192 = config(8192).fingerprint();
-    let modern_8192 = ChunkerConfig::new(Box::new(StubCounter("modernbert-test")), 8192)
-        .expect("config")
-        .fingerprint();
+    let modern_8192 =
+        ChunkerConfig::new(Box::new(StubCounter("modernbert-test")), budget(8192)).fingerprint();
 
-    assert!(bge_512.contains(MODEL_ID));
-    assert!(bge_512.contains("512"));
-    assert!(bge_512.contains(&format!("v{CHUNKER_VERSION}")));
+    assert!(bge_512.as_str().contains(MODEL_ID));
+    assert!(bge_512.as_str().contains("512"));
+    assert!(bge_512.as_str().contains(&format!("v{CHUNKER_VERSION}")));
     assert_ne!(bge_512, bge_8192, "budget must change the fingerprint");
     assert_ne!(
         bge_8192, modern_8192,
         "tokenizer must change the fingerprint"
+    );
+    // The stamp round-trips through its canonical string (the slice-3
+    // catalog persists and re-parses it).
+    let round_tripped: ChunkerFingerprint = bge_512
+        .to_string()
+        .parse()
+        .expect("canonical form re-parses");
+    assert_eq!(round_tripped, bge_512);
+    assert!(
+        "not-a-fingerprint".parse::<ChunkerFingerprint>().is_err(),
+        "a value without the chunker prefix is not a fingerprint"
     );
 }
 
@@ -490,12 +642,8 @@ fn fingerprint_binds_tokenizer_content_not_just_label() {
         "same label, different tokenizer bytes must not share an identity"
     );
 
-    let fp_a = ChunkerConfig::new(Box::new(a), 512)
-        .expect("config")
-        .fingerprint();
-    let fp_altered = ChunkerConfig::new(Box::new(altered), 512)
-        .expect("config")
-        .fingerprint();
+    let fp_a = ChunkerConfig::new(Box::new(a), budget(512)).fingerprint();
+    let fp_altered = ChunkerConfig::new(Box::new(altered), budget(512)).fingerprint();
     assert_ne!(
         fp_a, fp_altered,
         "same label, different tokenizer bytes must not share a fingerprint"
@@ -504,11 +652,19 @@ fn fingerprint_binds_tokenizer_content_not_just_label() {
 
 /// Config validation — red if a zero budget is accepted; it admits
 /// nothing (not even special tokens) and would degenerate every body
-/// into per-character fallback chunks by construction.
+/// into per-character fallback chunks by construction. The rejection
+/// lives in `TokenBudget`'s `TryFrom`, so a `ChunkerConfig` can never
+/// hold a zero budget at all.
 #[test]
 fn zero_budget_is_rejected() {
-    let counter = Box::new(StubCounter("stub"));
-    assert!(ChunkerConfig::new(counter, 0).is_err());
+    let err = TokenBudget::try_from(0).expect_err("zero budget must be rejected");
+    match err {
+        MemoryError::InvalidInput { reason } => assert!(
+            reason.contains("non-zero"),
+            "rejection must name the non-zero requirement, got: {reason}"
+        ),
+        other => panic!("expected MemoryError::InvalidInput, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +702,7 @@ fn counting_config(
         calls: std::sync::Arc::clone(&calls),
     };
     (
-        ChunkerConfig::new(Box::new(counter), max_tokens).expect("non-zero budget"),
+        ChunkerConfig::new(Box::new(counter), budget(max_tokens)),
         calls,
     )
 }
@@ -910,6 +1066,15 @@ mod properties {
         /// a suffix change into earlier group boundaries) and under any
         /// id scheme that hashes whole-document position context into
         /// every chunk.
+        ///
+        /// Scope note: this verifies the *common case* empirically —
+        /// only the final chunk re-forms on these generated documents.
+        /// The structural guarantee is the seam-aware edit-locality
+        /// statement (`packed_len` doc, ADR-0042 P2.7): prefix chunks
+        /// whose boundary search completed without reaching the
+        /// document tail are byte-stable, and under non-monotone token
+        /// counts the re-forming seam can in principle exceed the
+        /// single final chunk.
         #[test]
         fn appended_suffix_preserves_prefix_chunks(
             base in structured_doc(true),
@@ -1035,6 +1200,47 @@ mod properties {
         })
     }
 
+    /// A *single indivisible unit* measuring well over `budget`: a
+    /// fenced code block of many short lines (drives `split_oversized`
+    /// whole-line packing) or a one-line list item (drives
+    /// `char_split` character packing). The scaled documents above are
+    /// many small units, so without this the oversized-splitting paths
+    /// only ever ran at the toy budget 16.
+    fn oversized_unit(budget: usize) -> impl Strategy<Value = String> {
+        (
+            proptest::collection::vec(filler_word(), 6..12),
+            any::<bool>(),
+        )
+            .prop_map(move |(words, fenced)| {
+                let sentence = words.join(" ");
+                // ~1.5× the budget in tokens at ~6 chars/token.
+                let target_chars = budget * 6 * 3 / 2;
+                if fenced {
+                    let mut doc = String::from("```text\n");
+                    while doc.len() < target_chars {
+                        doc.push_str(&sentence);
+                        doc.push('\n');
+                    }
+                    doc.push_str("```\n");
+                    doc
+                } else {
+                    let mut doc = String::from("- ");
+                    while doc.len() < target_chars {
+                        doc.push_str(&sentence);
+                        doc.push(' ');
+                    }
+                    doc.push('\n');
+                    doc
+                }
+            })
+    }
+
+    /// The large budgets paired with a single oversized unit.
+    fn oversized_budget_and_unit() -> impl Strategy<Value = (usize, String)> {
+        proptest::sample::select(&[512usize, 8192][..])
+            .prop_flat_map(|budget| oversized_unit(budget).prop_map(move |doc| (budget, doc)))
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 8, ..ProptestConfig::default() })]
 
@@ -1076,7 +1282,10 @@ mod properties {
         /// the small-document property above rarely has more than one
         /// chunk at 512/8192, so this is the append-stability check
         /// that actually exercises interior chunk boundaries at the
-        /// real budgets.
+        /// real budgets. Like the small variant, this verifies the
+        /// common case empirically (only the final chunk re-forms);
+        /// the guaranteed invariant is the seam-aware edit-locality
+        /// statement in `packed_len`'s doc and ADR-0042 P2.7.
         #[test]
         fn scaled_docs_preserve_prefix_chunks_on_append(
             (budget, base) in scaled_budget_and_doc(6..=10),
@@ -1095,6 +1304,39 @@ mod properties {
             let base_ids = fact_ids(&base, cfg);
             let grown_ids = fact_ids(&grown, cfg);
             prop_assert_eq!(&grown_ids[..stable], &base_ids[..stable]);
+        }
+
+        /// P2.6 at scale — red if the oversized-splitting paths
+        /// (`split_oversized` line packing for a fence,
+        /// `char_split` character packing for a one-line list item)
+        /// misbehave at the production budgets: a single unit over the
+        /// 512/8192 budget must split into multiple chunks, every
+        /// chunk must fit the budget (the filler contains no
+        /// indivisible fallback shapes), and tiling/reconstruction
+        /// must stay exact. Before this, those paths only ever ran at
+        /// the toy budget 16.
+        #[test]
+        fn oversized_units_split_at_production_budgets(
+            (budget, content) in oversized_budget_and_unit()
+        ) {
+            let cfg = shared_config(budget);
+            prop_assert_eq!(
+                parse_units(&content).len(),
+                1,
+                "generator drift: the block must parse as one unit"
+            );
+            prop_assert!(
+                cfg.count(&content).expect("count") > cfg.max_tokens(),
+                "generator drift: the unit must exceed the budget"
+            );
+
+            let chunks = chunks_of(&content, cfg);
+            prop_assert!(chunks.len() >= 2, "an over-budget unit must split");
+            for chunk in &chunks {
+                let body = chunk.span.slice_in(&content).expect("span resolves");
+                prop_assert!(cfg.count(body).expect("count") <= cfg.max_tokens());
+            }
+            prop_assert_eq!(reconstruct(&content, &chunks), content);
         }
     }
 }
