@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use mcp_session::BoundedSessionManagerBuilder;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio_util::sync::CancellationToken;
@@ -82,8 +82,25 @@ struct LoginArgs {
     k8s_secret_name: String,
 }
 
+/// MCP transport for the `serve` command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Transport {
+    /// Streamable HTTP server on `--bind` (default). Shared daemon; serves
+    /// many clients and networked deployments (ADR-0001).
+    Http,
+    /// JSON-RPC over stdin/stdout. One process per client, lifecycle managed
+    /// by the MCP client; for single-user local use (ADR-0040).
+    Stdio,
+}
+
 #[derive(Args)]
 struct ServeArgs {
+    /// MCP transport. `http` serves Streamable HTTP on --bind; `stdio`
+    /// serves a single client over stdin/stdout. HTTP-only flags (--bind,
+    /// --mcp-path, session limits, --allowed-host) are ignored under stdio.
+    #[arg(long, value_enum, default_value = "http", env = "MEMORY_MCP_TRANSPORT")]
+    transport: Transport,
+
     /// Address to bind the HTTP server to.
     #[arg(long, default_value = "127.0.0.1:8080", env = "MEMORY_MCP_BIND")]
     bind: String,
@@ -702,10 +719,67 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Single-writer lock
+// ---------------------------------------------------------------------------
+
+/// Acquire the advisory single-writer lock for a memory repository.
+///
+/// The server assumes exclusive ownership of the git repo, the usearch index
+/// files, and the recall log; none of these tolerate a second writer
+/// (ADR-0040). The lock is an OS advisory lock ([`std::fs::File::try_lock`],
+/// `flock` semantics on Linux) on `<index_dir>/.lock`, so the kernel releases
+/// it when the process exits — including on crash — and it can never go stale.
+///
+/// Fails fast when another process holds the lock, naming the holder's pid.
+/// No waiting, no lease heuristics: a second server on the same repository is
+/// a deployment error regardless of which transport either process uses.
+///
+/// The returned guard must be kept alive for the lifetime of the server;
+/// dropping it releases the lock.
+fn acquire_single_writer_lock(index_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(index_dir)
+        .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
+    let lock_path = index_dir.join(".lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {
+            // Best-effort holder breadcrumb for the contention error below.
+            // The lock itself is the flock, not this content.
+            file.set_len(0).ok();
+            use std::io::Write;
+            let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
+            Ok(file)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let holder = std::fs::read_to_string(&lock_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            anyhow::bail!(
+                "another memory-mcp process (pid {holder}) is already serving this \
+                 repository (lock file: {}). The server requires exclusive access \
+                 to the memory repo, its vector index, and its recall log — stop \
+                 the other instance or point --repo-path at a different repository.",
+                lock_path.display()
+            )
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to lock {}", lock_path.display())),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server startup
 // ---------------------------------------------------------------------------
 
-/// Start and run the MCP HTTP server with the provided arguments.
+/// Start and run the MCP server with the provided arguments, over the
+/// selected transport (streamable HTTP by default, or stdio).
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Validate branch name early to prevent ref injection.
     validate_branch_name(&args.branch).context("invalid --branch value")?;
@@ -721,8 +795,17 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         .context("failed to canonicalize repo path")?;
     info!("repo path: {}", repo_path.display());
 
+    // Data-dir layout: the vector index, recall log, and single-writer lock
+    // all live under `.memory-mcp-index` inside the repo path.
+    let index_dir = repo_path.join(".memory-mcp-index");
+
+    // Enforce single-writer before any subsystem opens: the git repo, index
+    // files, and recall log all assume exclusive ownership (ADR-0040).
+    // Acquiring before the (slow) embedding init makes contention fail fast.
+    let _single_writer_lock = acquire_single_writer_lock(&index_dir)?;
+
     // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
-    let remote_url = args.remote_url.filter(|u| !u.is_empty());
+    let remote_url = args.remote_url.clone().filter(|u| !u.is_empty());
 
     if args.require_remote_sync && remote_url.is_none() {
         anyhow::bail!("--require-remote-sync requires --remote-url to be set");
@@ -756,9 +839,6 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     );
 
     let dimensions = embedding.dimensions();
-
-    // Attempt to load the scoped index; create fresh if missing or corrupt.
-    let index_dir = repo_path.join(".memory-mcp-index");
 
     // Remove legacy single-index files if they still exist from an old install.
     let old_index = index_dir.join("index.usearch");
@@ -918,6 +998,31 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Keep a reference for post-shutdown index persistence.
     let state_for_shutdown = Arc::clone(&state);
 
+    match args.transport {
+        Transport::Http => serve_http(&args, Arc::clone(&state)).await?,
+        Transport::Stdio => serve_stdio(Arc::clone(&state)).await?,
+    }
+
+    // Persist the scoped vector index so the next startup can skip a full
+    // reindex. The stored SHA only advances when the in-process mirror is
+    // intact — a recorded mirror gap keeps the last verified SHA so the next
+    // startup rebuilds from git truth.
+    if let Err(e) =
+        memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
+    {
+        tracing::warn!("failed to persist vector index on shutdown: {}", e);
+    } else {
+        info!("vector index saved to {}", index_dir.display());
+    }
+
+    Ok(())
+}
+
+/// Serve MCP over streamable HTTP (ADR-0001): axum router with health
+/// endpoints, bounded session manager, graceful shutdown on SIGINT/SIGTERM.
+async fn serve_http(args: &ServeArgs, state: Arc<AppState>) -> anyhow::Result<()> {
+    let state_for_routes = Arc::clone(&state);
+
     // Build the MCP service.
     let ct = CancellationToken::new();
     let ct_child = ct.child_token();
@@ -962,7 +1067,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         .route("/healthz", axum::routing::get(healthz_handler))
         .route("/readyz", axum::routing::get(readyz_handler))
         .route("/version", axum::routing::get(version_handler))
-        .with_state(Arc::clone(&state_for_shutdown))
+        .with_state(state_for_routes)
         .nest_service(&mcp_path, service);
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
@@ -994,16 +1099,43 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         .await
         .context("server error")?;
 
-    // Persist the scoped vector index so the next startup can skip a full
-    // reindex. The stored SHA only advances when the in-process mirror is
-    // intact — a recorded mirror gap keeps the last verified SHA so the next
-    // startup rebuilds from git truth.
-    if let Err(e) =
-        memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
+    Ok(())
+}
+
+/// Serve MCP over stdio (ADR-0040): stdout carries JSON-RPC framing (all
+/// tracing goes to stderr), stdin EOF is the normal end-of-session signal.
+/// One process serves exactly one client; the MCP client owns the lifecycle.
+async fn serve_stdio(state: Arc<AppState>) -> anyhow::Result<()> {
+    info!("serving MCP over stdio (stdout is the protocol channel)");
+
+    let service = rmcp::serve_server(MemoryServer::new(state), rmcp::transport::stdio())
+        .await
+        .context("failed to initialize stdio transport")?;
+
+    // Quit when the client closes stdin (normal MCP lifecycle) or on a
+    // shutdown signal — either way the caller persists the index afterwards.
+    #[cfg(unix)]
     {
-        tracing::warn!("failed to persist vector index on shutdown: {}", e);
-    } else {
-        info!("vector index saved to {}", index_dir.display());
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            quit = service.waiting() => {
+                let reason = quit.context("stdio transport task failed")?;
+                info!(?reason, "stdio transport closed");
+            }
+            _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
+            _ = sigterm.recv() => info!("shutdown signal received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            quit = service.waiting() => {
+                let reason = quit.context("stdio transport task failed")?;
+                info!(?reason, "stdio transport closed");
+            }
+            _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
+        }
     }
 
     Ok(())
@@ -1139,6 +1271,57 @@ mod tests {
             Some(Command::Serve(args)) => assert_eq!(args.bind, "0.0.0.0:9090"),
             _ => panic!("expected Serve command"),
         }
+    }
+
+    #[test]
+    fn test_cli_serve_transport_defaults_to_http() {
+        let cli = Cli::try_parse_from(["memory-mcp", "serve"]).expect("serve should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.transport, Transport::Http),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_transport_stdio_parses() {
+        let cli = Cli::try_parse_from(["memory-mcp", "serve", "--transport", "stdio"])
+            .expect("serve --transport stdio should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.transport, Transport::Stdio),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_transport_rejects_unknown_value() {
+        assert!(
+            Cli::try_parse_from(["memory-mcp", "serve", "--transport", "carrier-pigeon"]).is_err(),
+            "unknown transport value must be rejected"
+        );
+    }
+
+    #[test]
+    fn single_writer_lock_excludes_second_acquisition_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_dir = tmp.path().join(".memory-mcp-index");
+
+        let guard = acquire_single_writer_lock(&index_dir).expect("first acquire");
+
+        // flock is per open-file-description, so a second acquisition from
+        // the same process still contends — same shape as a second process.
+        let err = acquire_single_writer_lock(&index_dir).expect_err("second acquire must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already serving"),
+            "error should explain the contention: {msg}"
+        );
+        assert!(
+            msg.contains(&std::process::id().to_string()),
+            "error should name the holder pid: {msg}"
+        );
+
+        drop(guard);
+        let _reacquired = acquire_single_writer_lock(&index_dir).expect("re-acquire after release");
     }
 
     #[test]

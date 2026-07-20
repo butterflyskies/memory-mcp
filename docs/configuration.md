@@ -8,6 +8,7 @@ authoritative list.
 
 | Flag | Environment variable | Default | Purpose |
 |---|---|---|---|
+| `--transport` | `MEMORY_MCP_TRANSPORT` | `http` | MCP transport: `http` (Streamable HTTP daemon) or `stdio` (one process per client, managed by the MCP client) |
 | `--bind` | `MEMORY_MCP_BIND` | `127.0.0.1:8080` | HTTP listener address |
 | `--repo-path` | `MEMORY_MCP_REPO_PATH` | `~/.memory-mcp` | Git-backed memory repository |
 | `--config` | `MEMORY_MCP_CONFIG` | `~/.config/memory-mcp/config.toml` | TOML config file for per-scope remote mapping; empty string disables config loading |
@@ -18,6 +19,13 @@ authoritative list.
 | `--require-remote-sync` | `MEMORY_MCP_REQUIRE_REMOTE_SYNC` | `false` | Make remote sync health affect readiness |
 | `--recall-log-busy-timeout` | `MEMORY_MCP_RECALL_LOG_BUSY_TIMEOUT` | `5` | SQLite lock wait in seconds |
 | `--health-stale-secs` | `MEMORY_MCP_HEALTH_STALE_SECS` | `0` | Mark inactive subsystems stale; 0 disables |
+
+Under `--transport stdio` the HTTP-only flags (`--bind`, `--mcp-path`,
+`--allowed-host`, and the session limits below) are ignored: stdout carries
+JSON-RPC framing, all logs go to stderr, and the MCP client owns the process
+lifecycle. Regardless of transport, only one server process may serve a
+repository at a time — a second instance exits immediately with an error
+naming the process that holds the lock (ADR-0040).
 
 ## Sessions and embedding work
 

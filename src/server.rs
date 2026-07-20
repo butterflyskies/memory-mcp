@@ -7,13 +7,10 @@ const SNIPPET_MAX_CHARS: usize = 500;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use rmcp::{
-    handler::server::{
-        router::tool::ToolRouter,
-        tool::{Extension, ToolCallContext},
-        wrapper::Parameters,
-    },
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, ErrorData, Meta, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, ErrorData, Extensions, Meta, ServerCapabilities,
+        ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
@@ -21,11 +18,19 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn, Instrument};
 
-/// Extract the `Mcp-Session-Id` header from HTTP request parts.
+/// Extract the `Mcp-Session-Id` header from the request's HTTP parts.
+///
+/// The streamable HTTP transport stores `http::request::Parts` in the request
+/// extensions; over stdio there is no HTTP request, so the parts are absent
+/// and the session is labelled `"stdio"` (one stdio process serves exactly
+/// one client, so no further disambiguation is needed).
 ///
 /// Returns `"unknown"` if the header is absent or not valid UTF-8.
 /// Truncates to 128 chars to bound span field size from untrusted input.
-fn extract_session_id(parts: &http::request::Parts) -> String {
+fn extract_session_id(extensions: &Extensions) -> String {
+    let Some(parts) = extensions.get::<http::request::Parts>() else {
+        return "stdio".to_owned();
+    };
     let raw = parts
         .headers
         .get("mcp-session-id")
@@ -1108,7 +1113,7 @@ impl MemoryServer {
     async fn remember(
         &self,
         Parameters(args): Parameters<RememberArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         if args.content.len() > MAX_CONTENT_SIZE {
@@ -1120,7 +1125,7 @@ impl MemoryServer {
                 ),
             }));
         }
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let content_size = args.content.len();
         let span = tracing::info_span!(
             "handler.remember",
@@ -1224,9 +1229,9 @@ impl MemoryServer {
     async fn recall(
         &self,
         Parameters(args): Parameters<RecallArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let recall_id = RecallLog::generate_recall_id();
         // Note: query text is intentionally omitted from the span (R-17 privacy decision).
         let span = tracing::info_span!(
@@ -1366,10 +1371,10 @@ impl MemoryServer {
     async fn forget(
         &self,
         Parameters(args): Parameters<ForgetArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.forget",
             session_id = %session_id,
@@ -1445,7 +1450,7 @@ impl MemoryServer {
     async fn edit(
         &self,
         Parameters(args): Parameters<EditArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
         let mut timing = EditStageTiming::new();
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
@@ -1465,7 +1470,7 @@ impl MemoryServer {
                 }));
             }
         }
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let content_size = args.content.as_ref().map(|c| c.len()).unwrap_or(0);
         let span = tracing::info_span!(
             "handler.edit",
@@ -1596,14 +1601,14 @@ impl MemoryServer {
     async fn move_memory(
         &self,
         Parameters(args): Parameters<MoveArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         let new_name = match args.new_name {
             Some(n) => MemoryName::new(n).map_err(ErrorData::from)?,
             None => name.clone(),
         };
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.move",
             session_id = %session_id,
@@ -1775,9 +1780,9 @@ impl MemoryServer {
     async fn list(
         &self,
         Parameters(args): Parameters<ListToolArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.list",
             session_id = %session_id,
@@ -1848,10 +1853,10 @@ impl MemoryServer {
     async fn read(
         &self,
         Parameters(args): Parameters<ReadArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.read",
             session_id = %session_id,
@@ -1905,10 +1910,10 @@ impl MemoryServer {
     async fn sync(
         &self,
         Parameters(args): Parameters<SyncArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
         let pull_first = args.pull_first.unwrap_or(true);
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.sync",
             session_id = %session_id,
@@ -2019,9 +2024,9 @@ impl MemoryServer {
     async fn mark_applied(
         &self,
         Parameters(args): Parameters<MarkAppliedArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.mark_applied",
             session_id = %session_id,
@@ -2113,9 +2118,9 @@ impl MemoryServer {
     async fn batch_mark_applied(
         &self,
         Parameters(args): Parameters<BatchMarkAppliedArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let count = args.verdicts.len();
         let span = tracing::info_span!(
             "handler.batch_mark_applied",
@@ -2231,9 +2236,9 @@ impl MemoryServer {
     async fn recall_stats(
         &self,
         Parameters(_args): Parameters<RecallStatsArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.recall_stats",
             session_id = %session_id,
@@ -2558,12 +2563,15 @@ mod tests {
         MemoryServer::new(state)
     }
 
-    fn list_test_parts() -> http::request::Parts {
-        http::Request::builder()
+    fn list_test_extensions() -> Extensions {
+        let parts = http::Request::builder()
             .body(())
             .expect("request")
             .into_parts()
-            .0
+            .0;
+        let mut ext = Extensions::new();
+        ext.insert(parts);
+        ext
     }
 
     #[test]
@@ -2596,7 +2604,7 @@ mod tests {
                     cursor: None,
                     fields: None,
                 }),
-                Extension(list_test_parts()),
+                list_test_extensions(),
             )
             .await
             .expect_err("zero limit must fail");
@@ -2610,7 +2618,7 @@ mod tests {
                     cursor: Some("garbage".to_string()),
                     fields: None,
                 }),
-                Extension(list_test_parts()),
+                list_test_extensions(),
             )
             .await
             .expect_err("malformed cursor must fail");
@@ -2639,7 +2647,7 @@ mod tests {
                         cursor,
                         fields: Some(vec![ListField::Name]),
                     }),
-                    Extension(list_test_parts()),
+                    list_test_extensions(),
                 )
                 .await
                 .expect("list page");
@@ -2688,7 +2696,7 @@ mod tests {
                     cursor: None,
                     fields: Some(vec![ListField::Name]),
                 }),
-                Extension(list_test_parts()),
+                list_test_extensions(),
             )
             .await
             .expect("default-limit page");
@@ -3325,13 +3333,16 @@ mod tests {
             }
         }
 
-        fn parts() -> http::request::Parts {
-            http::Request::builder()
+        fn test_extensions() -> Extensions {
+            let parts = http::Request::builder()
                 .uri("/")
                 .body(())
                 .expect("request")
                 .into_parts()
-                .0
+                .0;
+            let mut ext = Extensions::new();
+            ext.insert(parts);
+            ext
         }
 
         fn test_state(tmp: &tempfile::TempDir) -> Arc<AppState> {
@@ -3391,7 +3402,7 @@ mod tests {
                         scope: None,
                         source: None,
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
         }
@@ -3437,7 +3448,7 @@ mod tests {
                         tags: None,
                         scope: None,
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("edit must stay best-effort despite the lexical failure");
@@ -3468,7 +3479,7 @@ mod tests {
                         name: "doomed".to_string(),
                         scope: None,
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("forget must stay best-effort despite the lexical failure");
@@ -3496,7 +3507,7 @@ mod tests {
                         to_scope: "proj".to_string(),
                         new_name: None,
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("move must stay best-effort despite the lexical failure");
@@ -3607,7 +3618,7 @@ mod tests {
                         scope: None,
                         limit: Some(5),
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("recall must serve semantic-only while degraded");
@@ -3694,7 +3705,7 @@ mod tests {
                             tags: None,
                             scope: None,
                         }),
-                        Extension(parts()),
+                        test_extensions(),
                     )
                     .await
             });
@@ -3742,7 +3753,7 @@ mod tests {
                             name: "doomed".to_string(),
                             scope: None,
                         }),
-                        Extension(parts()),
+                        test_extensions(),
                     )
                     .await
             });
@@ -3789,7 +3800,7 @@ mod tests {
                             to_scope: "proj".to_string(),
                             new_name: None,
                         }),
-                        Extension(parts()),
+                        test_extensions(),
                     )
                     .await
             });
@@ -3922,7 +3933,7 @@ mod tests {
                     Parameters(SyncArgs {
                         pull_first: Some(pull_first),
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
         }
@@ -5008,7 +5019,7 @@ mod tests {
                         scope: None,
                         limit: Some(5),
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("recall must serve semantic-only while degraded");
