@@ -1117,7 +1117,8 @@ fn reindex_marker_path(index_dir: &std::path::Path) -> std::path::PathBuf {
 
 /// Durably record that the next startup must rebuild the vector index.
 ///
-/// Goes through [`crate::fs_util::atomic_write`] (#329 review, round 5):
+/// Goes through the hardened `crate::fs_util::atomic_write_durable` helper
+/// (#329 review, round 5):
 /// the temp file is fsynced before the atomic rename and the parent
 /// directory is fsynced after it, so the marker survives power loss once
 /// this returns and a partially written marker never exists under the final
@@ -1129,7 +1130,7 @@ fn reindex_marker_path(index_dir: &std::path::Path) -> std::path::PathBuf {
 /// persisted on the timeout path.
 pub fn write_reindex_required_marker(index_dir: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(index_dir)?;
-    crate::fs_util::atomic_write(
+    crate::fs_util::atomic_write_durable(
         &reindex_marker_path(index_dir),
         b"shutdown mutation drain deadline expired; the on-disk index snapshot \
           is no longer certified - startup must rebuild from git truth\n",

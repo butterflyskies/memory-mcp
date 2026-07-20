@@ -1,8 +1,11 @@
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-19
+
 ### Added
 
 - **Chunk-addressable retrieval contract** (#262 slice 1, ADR-0042): typed identity and wire shapes for fact-level retrieval units — deterministic `FactId` (parent id + chunker version + source span + content digest, canonical `fact:v1:...` string form), validated non-empty UTF-8 `SourceSpan`, `ChunkerVersion`, and the crate-internal catalog (`FactRecord`) and recall-provenance (`MatchedChunk`) shapes, which go public when their slices wire them. Contract only — no behavioral wiring; the deterministic chunker, derived catalog, chunk indexes, and response wiring land in later slices. `MemoryRef` gains strict `Serialize`/`Deserialize` support for shapes that embed a parent reference. Existing whole-memory retrieval is unchanged. ADR-0042 carries the #262 invariant ledger (each invariant mapped to enforcement, test, and owning slice) and the index-persistence posture; `proptest` lands as a dev-dependency seeding the repository's property-based-testing layer (serde round-trip totality, canonical-form totality, span validity, and collision-resistance evidence over generated inputs).
+- **Native stdio transport for single-user local deployments** (#104, #329, ADR-0040): `memory-mcp serve --transport stdio` lets an MCP client own the server process lifecycle without a daemon, port, bind address, or Host allowlist; stdin EOF and termination signals drain in-flight mutations before index persistence, and stdout remains JSON-RPC-only while tracing stays on stderr. Streamable HTTP remains the default and the supported networked/multi-client transport. Both transports now enforce one writer per default or scope-mapped repository with a symlink-safe advisory lock, so a second stdio process or HTTP daemon fails fast instead of racing git, the vector index, or the recall log.
 
 ## [0.17.1] - 2026-07-19
 

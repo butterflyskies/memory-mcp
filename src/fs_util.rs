@@ -231,6 +231,25 @@ impl Drop for TempGuard<'_> {
 ///
 /// Callers must ensure no concurrent writes target the same `path`.
 pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    atomic_write_with_parent_sync(path, data, false, fsync_dir)
+}
+
+/// Atomically write `data` and require the parent-directory fsync to succeed.
+///
+/// Use this for tiny correctness markers whose caller must distinguish a
+/// crash-durable rename from a rename that merely reached the page cache.
+/// The ordinary [`atomic_write`] keeps its historical best-effort directory
+/// fsync behavior for callers where the rename itself is sufficient.
+pub(crate) fn atomic_write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    atomic_write_with_parent_sync(path, data, true, fsync_dir)
+}
+
+fn atomic_write_with_parent_sync(
+    path: &Path,
+    data: &[u8],
+    require_parent_sync: bool,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -259,7 +278,10 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     // Fsync the parent directory so the rename is durable even on hard crash.
     // Best-effort: the rename already committed, so a dir-fsync failure should
     // not cause callers to treat the write as failed.
-    if let Err(e) = fsync_dir(parent) {
+    if let Err(e) = sync_parent(parent) {
+        if require_parent_sync {
+            return Err(e);
+        }
         tracing::warn!("fsync of parent directory failed (data is written): {e}");
     }
 
@@ -323,6 +345,31 @@ mod tests {
         atomic_write(&target, b"new content").unwrap();
 
         assert_eq!(fs::read_to_string(&target).unwrap(), "new content");
+    }
+
+    #[test]
+    fn durable_atomic_write_propagates_parent_fsync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("marker");
+
+        let err = atomic_write_with_parent_sync(&target, b"revoked", true, |_| {
+            Err(std::io::Error::other("injected parent fsync failure"))
+        })
+        .expect_err("strict durability must propagate parent fsync failure");
+
+        assert!(
+            err.to_string().contains("injected parent fsync failure"),
+            "the exact durability failure must reach the caller: {err}"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"revoked",
+            "the rename may have completed, but must not be certified durable"
+        );
+        assert!(
+            !dir.path().join(".marker.tmp").exists(),
+            "the temp file must not linger after the post-rename failure"
+        );
     }
 
     #[cfg(unix)]

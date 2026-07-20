@@ -257,7 +257,8 @@ pub const REVOKED_COMMIT_SHA_SENTINEL: &str = "revoked:shutdown-drain-timeout";
 /// the startup freshness check reads via [`UsearchStore::load`] — to
 /// [`REVOKED_COMMIT_SHA_SENTINEL`]. The snapshot's key map and vector data
 /// are preserved untouched, and dirty in-memory index state is never
-/// persisted. The rewrite goes through [`crate::fs_util::atomic_write`]
+/// persisted. The rewrite goes through the hardened
+/// `crate::fs_util::atomic_write_durable` helper
 /// (fsynced temp file, `O_NOFOLLOW` on Unix, atomic rename, parent-dir
 /// fsync), so the revocation is crash-durable and symlink-safe.
 ///
@@ -286,7 +287,7 @@ pub fn revoke_persisted_certification(dir: &Path) -> std::io::Result<()> {
     }
     value["commit_sha"] = serde_json::Value::from(REVOKED_COMMIT_SHA_SENTINEL);
     let payload = serde_json::to_string(&value).map_err(std::io::Error::other)?;
-    crate::fs_util::atomic_write(&keys_path, payload.as_bytes())
+    crate::fs_util::atomic_write_durable(&keys_path, payload.as_bytes())
 }
 
 /// Convert a `RawIndexError` to `MemoryError::Index`, preserving the message

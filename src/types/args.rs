@@ -394,8 +394,8 @@ pub struct ReindexStats {
 /// Admission is *sealable* (#329 review, round 4): a handler task the
 /// transport detached but has not yet polled would otherwise register
 /// *after* shutdown observed zero in-flight — a late entrant the drain
-/// never counts. Once [`seal`](Self::seal) is called, [`try_enter`]
-/// (Self::try_enter) refuses new admissions, so the drain converges over
+/// never counts. Once [`seal`](Self::seal) is called,
+/// [`try_enter`](Self::try_enter) refuses new admissions, so the drain converges over
 /// exactly the sealed-in units.
 #[derive(Debug, Default)]
 pub struct MutationRegistry {

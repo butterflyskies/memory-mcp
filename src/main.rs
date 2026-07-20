@@ -789,13 +789,31 @@ fn acquire_single_writer_lock(repo_path: &std::path::Path) -> anyhow::Result<std
     std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
     let lock_path = index_dir.join(".lock");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        anyhow::bail!(
+            "refusing symlink at single-writer lock path {}",
+            lock_path.display()
+        );
+    }
+    let file = options
         .open(&lock_path)
         .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
+    anyhow::ensure!(
+        file.metadata()
+            .with_context(|| format!("failed to inspect lock file {}", lock_path.display()))?
+            .is_file(),
+        "single-writer lock path is not a regular file: {}",
+        lock_path.display()
+    );
     match file.try_lock() {
         Ok(()) => {
             // Best-effort holder breadcrumb for the contention error below.
@@ -806,9 +824,12 @@ fn acquire_single_writer_lock(repo_path: &std::path::Path) -> anyhow::Result<std
             Ok(file)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            let holder = std::fs::read_to_string(&lock_path)
+            use std::io::Read;
+            let mut holder_text = String::new();
+            let holder = (&file)
+                .read_to_string(&mut holder_text)
                 .ok()
-                .map(|s| s.trim().to_string())
+                .map(|_| holder_text.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "unknown".to_string());
             anyhow::bail!(
@@ -1493,6 +1514,29 @@ mod tests {
 
         drop(guard);
         let _reacquired = acquire_single_writer_lock(&index_dir).expect("re-acquire after release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_writer_lock_rejects_planted_symlink_without_clobbering_target() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let index_dir = repo.path().join(".memory-mcp-index");
+        std::fs::create_dir(&index_dir).expect("index dir");
+        let target = repo.path().join("decoy");
+        std::fs::write(&target, b"do not clobber\n").expect("seed target");
+        std::os::unix::fs::symlink(&target, index_dir.join(".lock")).expect("plant symlink");
+
+        let err = acquire_single_writer_lock(repo.path())
+            .expect_err("O_NOFOLLOW must reject a planted lock symlink");
+        assert!(
+            format!("{err:#}").contains("failed to open lock file"),
+            "startup must fail loudly at the unsafe lock path: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"do not clobber\n",
+            "PID breadcrumb writes must never reach the symlink target"
+        );
     }
 
     #[test]
