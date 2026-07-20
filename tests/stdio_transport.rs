@@ -79,7 +79,11 @@ fn send(child: &mut Child, msg: &serde_json::Value) {
 
 /// Drive the MCP initialize handshake to completion and return the
 /// `initialize` response.
-fn initialize(child: &mut Child, rx: &mpsc::Receiver<String>) -> serde_json::Value {
+fn initialize(
+    child: &mut Child,
+    rx: &mpsc::Receiver<String>,
+    stderr_path: &Path,
+) -> serde_json::Value {
     send(
         child,
         &serde_json::json!({
@@ -93,13 +97,22 @@ fn initialize(child: &mut Child, rx: &mpsc::Receiver<String>) -> serde_json::Val
             }
         }),
     );
-    let resp: serde_json::Value =
-        serde_json::from_str(&next_line(rx)).expect("initialize response is valid JSON");
+    let line = rx.recv_timeout(RESPONSE_TIMEOUT).unwrap_or_else(|e| {
+        let stderr = std::fs::read_to_string(stderr_path)
+            .unwrap_or_else(|read_err| format!("<failed to read stderr: {read_err}>"));
+        panic!("failed waiting for initialize response ({e}); child stderr:\n{stderr}")
+    });
+    let resp: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+        let stderr = std::fs::read_to_string(stderr_path)
+            .unwrap_or_else(|read_err| format!("<failed to read stderr: {read_err}>"));
+        panic!("initialize response is not valid JSON ({e}): {line}; child stderr:\n{stderr}")
+    });
     assert_eq!(resp["id"], 1, "initialize response id: {resp}");
-    assert!(
-        resp.get("error").is_none(),
-        "initialize must not error: {resp}"
-    );
+    if resp.get("error").is_some() {
+        let stderr = std::fs::read_to_string(stderr_path)
+            .unwrap_or_else(|e| format!("<failed to read stderr: {e}>"));
+        panic!("initialize must not error: {resp}; child stderr:\n{stderr}");
+    }
     send(
         child,
         &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
@@ -134,7 +147,7 @@ fn stdio_round_trip_serves_tools_with_clean_stdout() {
     let rx = stdout_lines(&mut server.0);
     let mut transcript: Vec<String> = Vec::new();
 
-    let init_resp = initialize(&mut server.0, &rx);
+    let init_resp = initialize(&mut server.0, &rx, &stderr_path);
     transcript.push(init_resp.to_string());
     assert!(
         init_resp["result"]["serverInfo"]["name"].is_string(),
@@ -220,15 +233,15 @@ fn stdio_round_trip_serves_tools_with_clean_stdout() {
 #[test]
 fn second_instance_fails_fast_while_first_holds_the_lock() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let stderr_file =
-        std::fs::File::create(tmp.path().join("first-stderr.log")).expect("stderr capture");
+    let stderr_path = tmp.path().join("first-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr capture");
 
     let mut first = spawn_stdio_server(tmp.path(), Stdio::from(stderr_file));
     let rx = stdout_lines(&mut first.0);
 
     // Complete the handshake so the first instance is provably up. The lock
     // is acquired before subsystem init, so this wait is conservative.
-    initialize(&mut first.0, &rx);
+    initialize(&mut first.0, &rx, &stderr_path);
 
     // Second instance against the same repo, using the default HTTP
     // transport: the lock applies across transports, and it must fail before
@@ -300,8 +313,8 @@ fn second_instance_fails_fast_when_configs_share_a_mapped_repo() {
     let config_a = write_config("config-a.toml");
     let config_b = write_config("config-b.toml");
 
-    let stderr_file =
-        std::fs::File::create(tmp.path().join("first-stderr.log")).expect("stderr capture");
+    let stderr_path = tmp.path().join("first-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr capture");
     let mut first = Command::new(env!("CARGO_BIN_EXE_memory-mcp"))
         .args([
             "serve",
@@ -323,7 +336,7 @@ fn second_instance_fails_fast_when_configs_share_a_mapped_repo() {
 
     // Complete the handshake so the first instance provably holds every
     // lock (they are all acquired before subsystem init).
-    initialize(&mut first.0, &rx);
+    initialize(&mut first.0, &rx, &stderr_path);
 
     // Second instance: different default repo, same mapped repo. Without
     // mapped-repo locking both processes would happily serve and mutate the
@@ -389,7 +402,7 @@ fn sigterm_drains_service_before_index_persistence() {
 
     let mut server = spawn_stdio_server(tmp.path(), Stdio::from(stderr_file));
     let rx = stdout_lines(&mut server.0);
-    initialize(&mut server.0, &rx);
+    initialize(&mut server.0, &rx, &stderr_path);
 
     // SIGTERM, not stdin EOF: the client end stays open so only the signal
     // path can end the session.
