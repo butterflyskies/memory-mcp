@@ -1054,6 +1054,7 @@ pub async fn startup_prepare_index(
     initial_pull: Option<(&crate::auth::AuthProvider, &str)>,
     router: &crate::repo_router::RepoRouter,
     embedding: &dyn EmbeddingBackend,
+    index_dir: &std::path::Path,
     loaded_index: Box<dyn VectorStore>,
     fresh_index: impl FnOnce() -> Box<dyn VectorStore>,
 ) -> (Box<dyn VectorStore>, bool) {
@@ -1069,7 +1070,11 @@ pub async fn startup_prepare_index(
     // rebuild from scratch — this prevents ghost entries from deleted
     // memories lingering.
     let head_sha = router.head_sha().await;
-    if head_sha == loaded_index.commit_sha() {
+    if !startup_needs_reindex(
+        index_dir,
+        head_sha.as_deref(),
+        loaded_index.commit_sha().as_deref(),
+    ) {
         tracing::debug!(sha = ?head_sha, "index SHA matches repo HEAD — skipping reindex");
         return (loaded_index, true);
     }
@@ -1088,17 +1093,93 @@ pub async fn startup_prepare_index(
         startup_reindex_and_certify(router, embedding, index.as_ref(), head_sha.as_deref())
             .instrument(tracing::info_span!("startup.full_reindex"))
             .await;
+    if reindex_ok {
+        clear_reindex_required_marker(index_dir);
+    }
     (index, reindex_ok)
 }
 
-/// Persist the vector index at graceful shutdown.
+/// File name of the durable reindex-required marker inside the index dir.
 ///
-/// Advances the stored composite SHA to the router's current HEAD only when
-/// the in-process mirror is intact ([`AppState::index_mirror_is_intact`]).
-/// When a mirror gap was recorded — e.g. a sync's post-pull change discovery
-/// failed and the sync mirror refused SHA advancement — the index
-/// keeps the SHA it last legitimately verified, so the next startup sees the
-/// mismatch against git HEAD and rebuilds the vector index from git truth
+/// Written when the shutdown mutation drain deadline expires. In-memory
+/// certification revocation alone is not durable on that path: `run_serve`
+/// deliberately skips index persistence after a timeout, so the previous
+/// clean on-disk snapshot survives — and its stored SHA can still equal an
+/// unadvanced git HEAD (#329 review, round 4). The marker outlives the
+/// process so the next startup forces a rebuild *before* any SHA freshness
+/// comparison, honouring the invariant that every timeout guarantees a
+/// next-start reindex independently of HEAD.
+pub const REINDEX_REQUIRED_MARKER: &str = ".reindex-required";
+
+fn reindex_marker_path(index_dir: &std::path::Path) -> std::path::PathBuf {
+    index_dir.join(REINDEX_REQUIRED_MARKER)
+}
+
+/// Durably record that the next startup must rebuild the vector index.
+///
+/// Crash-safe-ish: the content is written to a temp file and renamed into
+/// place, so a partially written marker never exists under the final name.
+/// Only this tiny marker touches disk — the dirty in-memory index state is
+/// never persisted on the timeout path.
+pub fn write_reindex_required_marker(index_dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(index_dir)?;
+    let tmp = index_dir.join(".reindex-required.tmp");
+    std::fs::write(
+        &tmp,
+        b"shutdown mutation drain deadline expired; the on-disk index snapshot \
+          is no longer certified - startup must rebuild from git truth\n",
+    )?;
+    std::fs::rename(&tmp, reindex_marker_path(index_dir))
+}
+
+/// Whether a durable reindex-required marker is present in the index dir.
+pub fn reindex_required_marker_present(index_dir: &std::path::Path) -> bool {
+    reindex_marker_path(index_dir).exists()
+}
+
+/// Remove the reindex-required marker after a clean startup rebuild.
+///
+/// Call only once the rebuild certified (`startup_reindex_and_certify`
+/// returned `true`): clearing earlier would drop the forced-reindex
+/// guarantee if the process died mid-rebuild while the old snapshot still
+/// matched HEAD. Absence is not an error; any other removal failure is
+/// logged and left in place — a lingering marker only costs a redundant
+/// rebuild, never correctness.
+pub fn clear_reindex_required_marker(index_dir: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(reindex_marker_path(index_dir)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                error = %e,
+                "failed to clear reindex-required marker — the next startup \
+                 will redundantly rebuild the vector index"
+            );
+        }
+    }
+}
+
+/// Decide whether startup must rebuild the vector index from git truth.
+///
+/// The durable reindex-required marker is checked *before* the SHA
+/// freshness comparison: a drain-timeout shutdown revokes certification
+/// only in memory and skips persistence entirely, so the surviving on-disk
+/// snapshot can still carry a stored SHA equal to an unadvanced HEAD (#329
+/// review, round 4). Without the marker taking precedence, that equality
+/// would skip the rebuild the timeout contract promised.
+pub fn startup_needs_reindex(
+    index_dir: &std::path::Path,
+    head_sha: Option<&str>,
+    stored_sha: Option<&str>,
+) -> bool {
+    if reindex_required_marker_present(index_dir) {
+        info!(
+            "reindex-required marker present — forcing rebuild from git truth \
+             regardless of stored-SHA/HEAD equality"
+        );
+        return true;
+    }
+    head_sha != stored_sha
+}
+
 /// Await in-flight application mutation units before shutdown persistence.
 ///
 /// The transport's own shutdown drain cannot vouch for these: rmcp's awaited
@@ -1117,18 +1198,21 @@ pub async fn startup_prepare_index(
 ///
 /// Returns `true` when every unit completed within `deadline`. On timeout it
 /// records a mirror gap, *revokes the index's stored certification SHA*, and
-/// returns `false`. Revocation must not depend on HEAD comparison (#329
+/// writes a durable reindex-required marker into `index_dir` before
+/// returning `false`. Revocation must not depend on HEAD comparison (#329
 /// review, round 4): an abandoned `remember`/`edit` may have mutated the
 /// vector index while its shielded git save never advanced HEAD, so the
 /// previously verified SHA can still equal HEAD while the index is dirty —
 /// keeping it would let the next startup certify the dirty index and skip
-/// the reindex. With the SHA revoked (and `run_serve` additionally skipping
-/// persistence entirely on timeout), the next startup can never match
-/// stored-SHA == HEAD and always rebuilds from git truth. A hard shutdown
-/// deadline may abandon a mutation, but it must never certify the index as
-/// intact.
+/// the reindex. And because `run_serve` deliberately skips persistence on
+/// timeout, the in-memory revocation alone would die with the process while
+/// the old clean snapshot (stored SHA possibly == unadvanced HEAD) survived
+/// — only the on-disk marker makes the forced next-start reindex durable
+/// (#329 review, round 4, remaining Low). A hard shutdown deadline may
+/// abandon a mutation, but it must never certify the index as intact.
 pub async fn drain_mutations_before_persist(
     state: &AppState,
+    index_dir: &std::path::Path,
     deadline: std::time::Duration,
 ) -> bool {
     state.mutations.seal();
@@ -1146,6 +1230,16 @@ pub async fn drain_mutations_before_persist(
         // the vector index without advancing git HEAD, so the last verified
         // SHA is no longer trustworthy evidence of freshness.
         state.index.set_commit_sha(None);
+        // The in-memory revocation dies with this process while persistence
+        // is skipped — make the forced next-start reindex durable.
+        if let Err(e) = write_reindex_required_marker(index_dir) {
+            tracing::error!(
+                error = %e,
+                "failed to write reindex-required marker — if git HEAD did \
+                 not advance, the next startup may wrongly certify the old \
+                 on-disk snapshot as fresh"
+            );
+        }
         false
     }
 }
@@ -4713,6 +4807,7 @@ mod tests {
                 Some((&auth, "main")),
                 &router,
                 &MockEmbedding,
+                server_dir.path().join(".memory-mcp-index").as_path(),
                 Box::new(InMemoryStore::new(4)),
                 || Box::new(InMemoryStore::new(4)),
             )
@@ -4852,6 +4947,7 @@ mod tests {
                 Some((&auth, "main")),
                 &router,
                 &MockEmbedding,
+                server_default_dir.path().join(".memory-mcp-index").as_path(),
                 Box::new(InMemoryStore::new(4)),
                 || Box::new(InMemoryStore::new(4)),
             )
@@ -5104,9 +5200,17 @@ mod tests {
             assert_ne!(head_b, sha_a, "git must have advanced past A");
 
             // The deadline expires: certification must be refused…
-            let drained =
-                drain_mutations_before_persist(&state, std::time::Duration::from_millis(50)).await;
+            let drained = drain_mutations_before_persist(
+                &state,
+                dir_a.path(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
             assert!(!drained, "drain must report the expired deadline");
+            assert!(
+                reindex_required_marker_present(dir_a.path()),
+                "an expired drain deadline must leave a durable marker"
+            );
             assert!(
                 !state.index_mirror_is_intact(),
                 "an expired drain deadline must record a mirror gap — \
@@ -5140,76 +5244,186 @@ mod tests {
             drop(stuck_unit_slot);
         }
 
-        /// #329 review round 4: the round-3 test above advances HEAD A→B
+        /// #329 review rounds 4–5: the round-3 test above advances HEAD A→B
         /// before the timeout, so it only ever exercises the SHA-mismatch
-        /// path. Here the abandoned unit has dirtied the *vector index*
-        /// while git HEAD never advanced — `remember`/`edit` mutate the
-        /// index before their shielded git save — so the previously
-        /// verified SHA still equals current HEAD. Certification must be
-        /// revoked independently of HEAD equality, or the next startup
-        /// would accept the dirty index and skip the reindex.
+        /// path. Here git HEAD never advances — `remember`/`edit` mutate the
+        /// vector index before their shielded git save — so the previously
+        /// certified on-disk snapshot's SHA still equals current HEAD at the
+        /// next boot. In-memory revocation alone is not durable on this path
+        /// because production (`run_serve`) deliberately *skips* persistence
+        /// after a timeout (round 4, remaining Low). This test follows the
+        /// exact production ordering — timeout → revoke → skip persistence →
+        /// process exit — then reloads with unchanged HEAD and proves the
+        /// durable marker forces the rebuild and is consumed by it.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn shutdown_drain_timeout_forces_reindex_without_head_advance() {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let state = test_state(&tmp);
+            let index_dir = tempfile::tempdir().expect("index dir");
+            let usearch_state = |tmp: &tempfile::TempDir, index: Box<dyn VectorStore>| {
+                let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo init");
+                Arc::new(AppState::new(
+                    Arc::new(repo),
+                    "main".to_string(),
+                    Box::new(MockEmbedding),
+                    index,
+                    AuthProvider::new(),
+                    HealthRegistry::new(),
+                    None,
+                ))
+            };
 
-            // Verified state at A: stored SHA == git HEAD.
-            let note_a = Memory::from_validated(
-                MemoryName::new("note-a".to_string()).unwrap(),
-                "payload a".to_string(),
-                MemoryMetadata::new(Scope::Root, vec![], None),
+            // ---- Session 1: a clean shutdown leaves an on-disk snapshot
+            // certified at HEAD-A.
+            let sha_a = {
+                let state = usearch_state(
+                    &tmp,
+                    Box::new(crate::index::UsearchStore::new(4).expect("usearch store")),
+                );
+                let note_a = Memory::from_validated(
+                    MemoryName::new("note-a".to_string()).unwrap(),
+                    "payload a".to_string(),
+                    MemoryMetadata::new(Scope::Root, vec![], None),
+                );
+                state.repo.save_memory(&note_a).await.expect("save a");
+                assert!(
+                    drain_mutations_before_persist(
+                        &state,
+                        index_dir.path(),
+                        std::time::Duration::from_millis(200)
+                    )
+                    .await,
+                    "an idle registry must drain cleanly"
+                );
+                persist_index_on_shutdown(&state, index_dir.path())
+                    .await
+                    .expect("persist at A");
+                state.index.commit_sha().expect("verified SHA at A")
+            };
+            assert!(
+                !reindex_required_marker_present(index_dir.path()),
+                "a clean shutdown must not leave a reindex-required marker"
             );
-            state.repo.save_memory(&note_a).await.expect("save a");
-            let dir_a = tempfile::tempdir().expect("index dir a");
-            persist_index_on_shutdown(&state, dir_a.path())
-                .await
-                .expect("persist at A");
-            let sha_a = state.index.commit_sha().expect("verified SHA at A");
 
-            // An admitted unit dirties the vector index (the pre-shielded
-            // `remember`/`edit` step) and then stalls before its git save —
-            // HEAD does NOT advance.
-            let stuck_unit_slot = state.mutations.enter();
-            state
-                .index
-                .add(
-                    &Scope::Root,
-                    &[0.0, 0.0, 1.0, 0.0],
-                    qualified(&Scope::Root, "ghost"),
+            // ---- Session 2: production ordering on a drain timeout. The
+            // snapshot is loaded from disk exactly as `run_serve` does.
+            {
+                let loaded = crate::index::UsearchStore::load(index_dir.path(), 4)
+                    .expect("load snapshot at A");
+                assert_eq!(
+                    loaded.commit_sha().as_deref(),
+                    Some(sha_a.as_str()),
+                    "precondition: the loaded snapshot is certified at A"
+                );
+                let state = usearch_state(&tmp, Box::new(loaded));
+
+                // An admitted unit dirties the in-memory vector index (the
+                // pre-shielded `remember`/`edit` step) and stalls before its
+                // git save — HEAD does NOT advance.
+                let stuck_unit_slot = state.mutations.enter();
+                state
+                    .index
+                    .add(
+                        &Scope::Root,
+                        &[0.0, 0.0, 1.0, 0.0],
+                        qualified(&Scope::Root, "ghost"),
+                    )
+                    .expect("dirty the vector index without a git commit");
+                assert_eq!(
+                    state.router.head_sha().await.as_deref(),
+                    Some(sha_a.as_str()),
+                    "precondition: git HEAD must not have advanced past A"
+                );
+
+                // Timeout: revoke in memory + write the durable marker…
+                let drained = drain_mutations_before_persist(
+                    &state,
+                    index_dir.path(),
+                    std::time::Duration::from_millis(50),
                 )
-                .expect("dirty the vector index without a git commit");
-            assert_eq!(
-                state.router.head_sha().await.as_deref(),
-                Some(sha_a.as_str()),
-                "precondition: git HEAD must not have advanced past A"
-            );
+                .await;
+                assert!(!drained, "drain must report the expired deadline");
+                assert_eq!(
+                    state.index.commit_sha(),
+                    None,
+                    "certification must be revoked even though stored SHA \
+                     still equals HEAD"
+                );
+                assert!(
+                    reindex_required_marker_present(index_dir.path()),
+                    "the timeout must leave a durable reindex-required marker"
+                );
 
-            let drained =
-                drain_mutations_before_persist(&state, std::time::Duration::from_millis(50)).await;
-            assert!(!drained, "drain must report the expired deadline");
+                // …then production explicitly SKIPS persist_index_on_shutdown
+                // (`run_serve` leaves the on-disk index untouched on timeout),
+                // and the process exits — the dirty in-memory index and the
+                // in-memory revocation both die here.
+                drop(stuck_unit_slot);
+            }
 
-            // The falsely fresh SHA (old SHA == current HEAD) must be gone…
+            // ---- Session 3: restart with UNCHANGED git HEAD.
+            let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo reopen");
+            let router = RepoRouter::single(Arc::new(repo));
+            let head = router.head_sha().await;
+            let loaded =
+                crate::index::UsearchStore::load(index_dir.path(), 4).expect("reload snapshot");
             assert_eq!(
-                state.index.commit_sha(),
+                loaded.find_by_name(&qualified(&Scope::Root, "ghost")),
                 None,
-                "certification must be revoked even though stored SHA still \
-                 equals HEAD — HEAD equality is not evidence of a clean mirror"
+                "the dirty in-memory state must never have been persisted"
+            );
+            // The trap the marker exists to disarm: the surviving snapshot's
+            // stored SHA equals the unadvanced HEAD, so the SHA check alone
+            // would skip the reindex.
+            assert_eq!(
+                loaded.commit_sha().as_deref(),
+                Some(sha_a.as_str()),
+                "precondition: the old snapshot still carries the SHA \
+                 certified at A"
+            );
+            assert_eq!(
+                head.as_deref(),
+                Some(sha_a.as_str()),
+                "precondition: git HEAD is unchanged, so stored SHA == HEAD"
+            );
+            assert!(
+                startup_needs_reindex(
+                    index_dir.path(),
+                    head.as_deref(),
+                    loaded.commit_sha().as_deref()
+                ),
+                "the durable marker must force the rebuild before the \
+                 SHA==HEAD comparison can skip it"
             );
 
-            // …including through any persistence that runs afterwards, so
-            // the next boot can never see stored-SHA == HEAD and must
-            // reindex from git truth.
-            let dir_b = tempfile::tempdir().expect("index dir b");
-            persist_index_on_shutdown(&state, dir_b.path())
-                .await
-                .expect("persist after timeout");
-            assert_eq!(state.index.commit_sha(), None);
-            assert_ne!(
-                state.index.commit_sha().as_deref(),
-                state.router.head_sha().await.as_deref(),
-                "the dirty index must not be bootable as fresh"
+            // Startup discards the loaded snapshot and rebuilds from git
+            // truth (mirroring `run_serve`), then consumes the marker only
+            // once the rebuild certified.
+            let fresh = crate::index::UsearchStore::new(4).expect("fresh store");
+            assert!(
+                startup_reindex_and_certify(&router, &MockEmbedding, &fresh, head.as_deref()).await,
+                "the forced rebuild from git truth must certify"
             );
-            drop(stuck_unit_slot);
+            assert!(
+                fresh
+                    .find_by_name(&qualified(&Scope::Root, "note-a"))
+                    .is_some(),
+                "the rebuild must reindex git truth"
+            );
+            assert_eq!(fresh.commit_sha(), head, "the rebuild must stamp HEAD");
+            clear_reindex_required_marker(index_dir.path());
+            assert!(
+                !reindex_required_marker_present(index_dir.path()),
+                "a certified rebuild must consume the marker"
+            );
+            assert!(
+                !startup_needs_reindex(
+                    index_dir.path(),
+                    head.as_deref(),
+                    fresh.commit_sha().as_deref()
+                ),
+                "with the marker consumed and the rebuild certified, the \
+                 next boot may skip the reindex again"
+            );
         }
 
         /// #329 review round 4: once the shutdown drain seals admission,
@@ -5223,9 +5437,19 @@ mod tests {
             let server = MemoryServer::new(Arc::clone(&state));
 
             // An idle shutdown drain seals admission and reports drained.
+            let marker_dir = tempfile::tempdir().expect("marker dir");
             assert!(
-                drain_mutations_before_persist(&state, std::time::Duration::from_millis(200)).await,
+                drain_mutations_before_persist(
+                    &state,
+                    marker_dir.path(),
+                    std::time::Duration::from_millis(200)
+                )
+                .await,
                 "an idle registry must drain cleanly"
+            );
+            assert!(
+                !reindex_required_marker_present(marker_dir.path()),
+                "a clean drain must not leave a reindex-required marker"
             );
 
             // A handler arriving after the seal (e.g. a detached task the

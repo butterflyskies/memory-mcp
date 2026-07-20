@@ -1002,6 +1002,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         initial_pull,
         &router,
         embedding.as_ref(),
+        &index_dir,
         loaded_index,
         move || {
             Box::new(
@@ -1102,6 +1103,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // observed zero in-flight).
     if memory_mcp::server::drain_mutations_before_persist(
         &state_for_shutdown,
+        &index_dir,
         SHUTDOWN_MUTATION_DRAIN_DEADLINE,
     )
     .await
@@ -1130,10 +1132,15 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         // commit landed, HEAD moved and the SHA check forces a reindex; if
         // it never landed, the snapshot still mirrors git truth. The drain
         // helper has also revoked the in-memory certification for any other
-        // persistence path.
+        // persistence path, and — because that revocation dies with this
+        // process while the old snapshot's stored SHA may still equal an
+        // unadvanced HEAD — written a durable reindex-required marker so the
+        // next startup rebuilds regardless of SHA/HEAD equality (#329
+        // review, round 4).
         tracing::warn!(
             "mutation drain deadline expired — leaving the on-disk vector index \
-             untouched; the next startup reindexes from git truth as needed"
+             untouched; the reindex-required marker forces the next startup to \
+             rebuild from git truth"
         );
     }
 
