@@ -84,6 +84,25 @@ invalidates every derived `FactId` and forces a full catalog rebuild —
 there are no chunk migrations, only rebuilds from git truth. Catalog
 staleness detection (schema/model/commit) is slice 3.
 
+*Amended with slice 2:* the chunker is tokenizer- and budget-parametric.
+It consumes a `TokenCounter` (tokenizer handle plus stable identity) and
+a token budget taken from the embedding model's configuration
+(`max_position_embeddings`), never a hard-coded constant — BGE-small at
+512 tokens is the current instantiation, and the anticipated successor
+is **ModernBERT**, whose ~8192-token context radically changes chunk
+economics (larger budget, far fewer splits). The chunker exposes a
+*fingerprint* — algorithm revision, tokenizer identity, and budget —
+for the slice-3 staleness stamp: an embedding-model or budget swap
+changes the fingerprint and forces a full rebuild instead of silently
+mixing chunk vintages. The tokenizer identity is bound to tokenizer
+*content*, not a label: it embeds a SHA-256 digest of the tokenizer's
+canonical serialization as configured for counting, so an upstream
+re-release of `tokenizer.json` under the same model id (a mutable HF
+revision) is a visible fingerprint change, never a shared stamp
+between artifacts that count differently. This extends the "stale schema/model"
+detectability row of the ledger to the tokenizer/budget pair;
+`ChunkerVersion` itself stays reserved for algorithm revisions.
+
 ### Ranking and collapse
 Semantic and lexical retrieval both rank facts; fusion (RRF, per
 ADR-0038) happens at `FactId`. After fusion, results **collapse to the
@@ -251,16 +270,36 @@ example regressions.
 - **P2.3 Ordered non-overlap.** Emitted spans are strictly ordered by
   start and pairwise non-overlapping.
 - **P2.4 Coverage.** Concatenating the chunk bodies in span order
-  reproduces the parent content with no loss and no duplication,
-  modulo the chunker's documented boundary-whitespace handling.
+  reproduces the parent content byte for byte, with no loss and no
+  duplication. There is no whitespace caveat: the tiling absorbs
+  boundary whitespace into the preceding chunk (and whitespace before
+  the first unit into the first chunk), so coverage is byte-exact
+  including that whitespace.
 - **P2.5 Short-input degeneration.** Content under the tokenizer
   budget yields exactly one chunk spanning the whole body.
 - **P2.6 Budget respect.** Every chunk fits the actual embedding
-  tokenizer's budget, except indivisible atomic blocks, whose
-  fallback behavior must be documented and deterministic.
-- **P2.7 Prefix stability.** Editing only a suffix of the parent
-  leaves the chunks (spans, bodies, and therefore `FactId`s) of the
-  unchanged prefix intact.
+  tokenizer's budget, with exactly one exception: the
+  single-Unicode-scalar fallback in character splitting, where a lone
+  character whose own token count exceeds the budget is emitted alone
+  and over budget. That is the only over-budget chunk shape the
+  chunker can produce, and it is deterministic.
+- **P2.7 Edit locality (prefix stability).** Stated precisely as the
+  structural guarantee the implementation provides: prefix chunks
+  whose boundary search completed without reaching the document tail
+  are byte-stable (spans, bodies, and therefore `FactId`s) under
+  suffix append. The basis is path determinism, not token-count
+  monotonicity: the packing search's probe sequence (doubling 1, 2,
+  4, … then bisection) is a pure function of the fits predicate over
+  the group's own leading candidates *unless* the doubling reaches
+  the remaining-candidates cap, so any group whose budget transition
+  was found strictly before that cap re-derives the identical
+  boundary after an append. Only groups whose search touched the
+  document tail — the final group, or one within doubling range of
+  the old end — can shift on append, and because real tokenizer
+  counts are not monotone over prefixes, that seam region can exceed
+  exactly one chunk. The common case (only the final chunk re-forms)
+  is verified empirically by the property tests; the seam-aware
+  statement above is the invariant.
 
 ### Slices 4–6 — indexes, fusion, collapse
 

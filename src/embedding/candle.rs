@@ -50,6 +50,10 @@ struct CandleInner {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
+    /// Truncation budget, from the model config's maximum sequence
+    /// length — not a hard-coded constant, so a model swap (e.g. BGE's
+    /// 512 → ModernBERT's ~8192) carries its own budget (ADR-0042).
+    max_tokens: usize,
 }
 
 impl CandleEmbeddingEngine {
@@ -79,6 +83,12 @@ impl CandleEmbeddingEngine {
         let (config, mut tokenizer, weights_path) =
             load_model_files().map_err(|e| MemoryError::Embedding(e.to_string()))?;
 
+        // Truncate at the model's own maximum sequence length (512 for
+        // BGE-small; a future model such as ModernBERT brings its own,
+        // e.g. ~8192). The chunker's token budget must match this value
+        // so "fits the chunk budget" means "won't be truncated here".
+        let max_tokens = config.max_position_embeddings;
+
         // Enable padding so encode_batch produces equal-length sequences.
         tokenizer.with_padding(Some(PaddingParams {
             strategy: tokenizers::PaddingStrategy::BatchLongest,
@@ -86,7 +96,7 @@ impl CandleEmbeddingEngine {
         }));
         tokenizer
             .with_truncation(Some(TruncationParams {
-                max_length: 512,
+                max_length: max_tokens,
                 ..Default::default()
             }))
             .map_err(|e| MemoryError::Embedding(format!("failed to set truncation: {e}")))?;
@@ -114,6 +124,7 @@ impl CandleEmbeddingEngine {
                     model,
                     tokenizer,
                     device,
+                    max_tokens,
                 };
                 worker_loop(inner, dim, rx);
             })
@@ -214,7 +225,7 @@ fn worker_loop(mut inner: CandleInner, dim: usize, rx: mpsc::Receiver<EmbedReque
                 ..Default::default()
             }));
             let _ = inner.tokenizer.with_truncation(Some(TruncationParams {
-                max_length: 512,
+                max_length: inner.max_tokens,
                 ..Default::default()
             }));
         }
@@ -351,7 +362,8 @@ fn embed_batch(inner: &CandleInner, texts: &[String]) -> Result<Vec<Vec<f32>>, M
 /// Embed a single chunk of texts through the BERT model in one forward pass.
 ///
 /// Texts are tokenised with padding (to the longest sequence in the chunk)
-/// and truncation (to 512 tokens), then passed through BERT together.
+/// and truncation (to the model's maximum sequence length), then passed
+/// through BERT together.
 /// An attention mask ensures padding tokens do not affect the output.
 /// CLS pooling extracts the first token's hidden state, which is then
 /// L2-normalised to produce unit vectors.

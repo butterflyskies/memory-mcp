@@ -21,10 +21,16 @@ pub(crate) use args::{ListToolArgs, LIST_MAX_LIMIT};
 
 pub use chunk::{ChunkerVersion, FactId, SourceSpan};
 
-// The catalog and recall-wire shapes (`FactRecord`, `MatchedChunk`) are
-// deliberately not re-exported: they stay internal to `chunk` until
-// their owning slices (#262 slices 3 and 7) produce a consumer
-// (ADR-0042) — every `pub` item is a semver commitment.
+// The catalog and recall-wire shapes stay off the public surface until
+// their owning slices (#262 slices 3 and 7) produce an external
+// consumer (ADR-0042) — every `pub` item is a semver commitment.
+// `FactRecord` gained a crate-internal consumer in slice 2 (the
+// chunker), so it is re-exported `pub(crate)`; `MatchedChunk` still has
+// none and stays internal to `chunk`.
+pub(crate) use chunk::FactRecord;
+// Digest-truncation helper shared with the chunker's tokenizer
+// identity (same width, same rendering as `FactId` digests).
+pub(crate) use chunk::{hex_prefix, DIGEST_HEX_LEN};
 
 pub use memory::{parse_qualified_name, Memory, MemoryMetadata, MemoryName, MemoryRef};
 
