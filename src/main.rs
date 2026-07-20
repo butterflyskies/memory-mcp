@@ -822,13 +822,11 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // index freshness check (#327): on a fresh repo path the pull is what
     // populates the repo, so the startup reindex must run against post-pull
     // git truth — otherwise the server reports ready while semantic recall
-    // misses every pulled memory. The pull also seeds the sync reporter with
-    // a known state.
-    let initial_pull = (args.require_remote_sync && remote_url.is_some()).then_some((
-        &repo,
-        &auth,
-        args.branch.as_str(),
-    ));
+    // misses every pulled memory. The pull covers every routed repo (default
+    // + scope-mapped remotes, with branch overrides — #328 review, round 2)
+    // and seeds aggregate sync health with a known state.
+    let initial_pull =
+        (args.require_remote_sync && remote_url.is_some()).then_some((&auth, args.branch.as_str()));
 
     let vector_reporter = health.vector_index.clone();
     let (index, reindex_ok) = memory_mcp::server::startup_prepare_index(
