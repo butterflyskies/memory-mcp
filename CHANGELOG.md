@@ -1,3 +1,10 @@
+## [0.17.1] - 2026-07-19
+
+### Fixed
+
+- **Fresh deployments no longer signal ready with an empty semantic index.** On a fresh repository path with a configured remote and `--require-remote-sync`, startup rebuilt and certified the vector index *before* the initial pull — `/readyz` went green while semantic recall missed every memory stored on the remote, for the entire first lifetime of the process. Startup now completes the initial pull before index freshness is decided, so a fresh boot rebuilds and certifies against post-pull git truth before ready is signaled (#328).
+- **Per-scope mapped repositories are pulled at startup too.** With per-scope remote mapping configured, mapped repositories were initialized locally without fetching, so a fresh deployment could report ready while every remotely stored mapped-scope memory was absent until an explicit `sync`. Startup now pulls the default repository plus every scope-mapped route (respecting per-route branch overrides), and aggregate sync health settles once from the complete outcome — a failed mapped-remote pull followed by a clean pull no longer reports healthy (#328).
+
 ## [0.17.0] - 2026-07-19
 
 ### Behavior changes — read before upgrading
