@@ -1,7 +1,9 @@
 # ADR-0001: Streamable HTTP Only
 
 ## Status
-Accepted
+Accepted. Superseded in part by ADR-0040: stdio is now available as an opt-in
+transport for single-user local deployments; Streamable HTTP remains the
+default and the only supported transport for networked deployments.
 
 ## Context
 MCP supports three server transports: stdio, SSE, and Streamable HTTP. The server needs to

@@ -243,6 +243,53 @@ fn load_key_map(path_str: &str) -> Result<KeyMapData, MemoryError> {
     }
 }
 
+/// Sentinel written into a persisted key map's `commit_sha` when shutdown
+/// could not leave the durable reindex-required marker (#329 review,
+/// round 5). Never a valid git SHA, so the startup freshness comparison can
+/// never match it against HEAD — whether HEAD is a real commit or absent.
+pub const REVOKED_COMMIT_SHA_SENTINEL: &str = "revoked:shutdown-drain-timeout";
+
+/// Durably revoke the certification stored in the on-disk index snapshot.
+///
+/// Fallback for a failed reindex-required marker write (#329 review,
+/// round 5): rewrites only the `commit_sha` field of
+/// `<dir>/all/index.usearch.keys.json` — the authoritative certification
+/// the startup freshness check reads via [`UsearchStore::load`] — to
+/// [`REVOKED_COMMIT_SHA_SENTINEL`]. The snapshot's key map and vector data
+/// are preserved untouched, and dirty in-memory index state is never
+/// persisted. The rewrite goes through the hardened
+/// `crate::fs_util::atomic_write_durable` helper
+/// (fsynced temp file, `O_NOFOLLOW` on Unix, atomic rename, parent-dir
+/// fsync), so the revocation is crash-durable and symlink-safe.
+///
+/// A missing, legacy (bare key map, no `commit_sha` field), or unparseable
+/// key-map file already cannot certify the snapshot at startup — absence
+/// loads as no stored SHA, and a corrupt file fails the snapshot load so a
+/// fresh uncertified index is built — so those cases are treated as
+/// success.
+pub fn revoke_persisted_certification(dir: &Path) -> std::io::Result<()> {
+    let keys_path = dir.join("all").join("index.usearch.keys.json");
+    let json = match std::fs::read_to_string(&keys_path) {
+        Ok(json) => json,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        // Unparseable snapshots cannot certify: loading them fails and
+        // startup falls back to a fresh, uncertified index.
+        Err(_) => return Ok(()),
+    };
+    // Legacy bare-HashMap files carry no commit_sha field; they load with
+    // no stored SHA and therefore cannot pass the freshness check.
+    if !value.is_object() || value.get("key_map").is_none() {
+        return Ok(());
+    }
+    value["commit_sha"] = serde_json::Value::from(REVOKED_COMMIT_SHA_SENTINEL);
+    let payload = serde_json::to_string(&value).map_err(std::io::Error::other)?;
+    crate::fs_util::atomic_write_durable(&keys_path, payload.as_bytes())
+}
+
 /// Convert a `RawIndexError` to `MemoryError::Index`, preserving the message
 /// but stripping backend-specific type identity.
 fn raw_err(e: RawIndexError) -> MemoryError {

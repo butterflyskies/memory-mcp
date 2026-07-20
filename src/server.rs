@@ -7,13 +7,10 @@ const SNIPPET_MAX_CHARS: usize = 500;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use rmcp::{
-    handler::server::{
-        router::tool::ToolRouter,
-        tool::{Extension, ToolCallContext},
-        wrapper::Parameters,
-    },
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, ErrorData, Meta, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, ErrorData, Extensions, Meta, ServerCapabilities,
+        ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
@@ -21,11 +18,19 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn, Instrument};
 
-/// Extract the `Mcp-Session-Id` header from HTTP request parts.
+/// Extract the `Mcp-Session-Id` header from the request's HTTP parts.
+///
+/// The streamable HTTP transport stores `http::request::Parts` in the request
+/// extensions; over stdio there is no HTTP request, so the parts are absent
+/// and the session is labelled `"stdio"` (one stdio process serves exactly
+/// one client, so no further disambiguation is needed).
 ///
 /// Returns `"unknown"` if the header is absent or not valid UTF-8.
 /// Truncates to 128 chars to bound span field size from untrusted input.
-fn extract_session_id(parts: &http::request::Parts) -> String {
+fn extract_session_id(extensions: &Extensions) -> String {
+    let Some(parts) = extensions.get::<http::request::Parts>() else {
+        return "stdio".to_owned();
+    };
     let raw = parts
         .headers
         .get("mcp-session-id")
@@ -430,17 +435,32 @@ impl Drop for EditStageTiming {
 /// requester is needed to observe the failure. The `JoinError` arm below is
 /// only the *reporting* path for a requester that is still awaiting; it is
 /// not what the contract relies on.
-async fn shielded_mutation_unit<T, F>(
-    lexical: &Arc<LexicalIndex>,
-    unit: F,
-) -> Result<T, MemoryError>
+///
+/// Every unit also registers with [`AppState::mutations`] before it is
+/// spawned (#329 review, round 3): the transport's shutdown drain is bounded
+/// and detaches handler tasks, so index persistence gates on this registry —
+/// not the transport — to know when application mutations have quiesced. The
+/// slot is held by an RAII guard inside the detached task, so panic unwinds
+/// and task drops release it alongside the `DegradeOnDrop` marking.
+///
+/// The unconditional `enter` below is *nested* accounting: every caller is a
+/// handler that already holds an admission slot from [`admit_mutation`]
+/// (#329 review, round 4), so this unit is sealed-in work by construction —
+/// the shutdown seal must not reject it. The nested slot exists because the
+/// detached task can outlive its (cancellable) requester, whose admission
+/// guard dies with the handler future.
+async fn shielded_mutation_unit<T, F>(state: &Arc<AppState>, unit: F) -> Result<T, MemoryError>
 where
     F: std::future::Future<Output = Result<T, MemoryError>> + Send + 'static,
     T: Send + 'static,
 {
-    let guard_lexical = Arc::clone(lexical);
+    // Enter the registry before spawning: from this point shutdown cannot
+    // certify index persistence until the unit's slot is released.
+    let mutation_slot = state.mutations.enter();
+    let guard_lexical = Arc::clone(&state.lexical);
     let worker = tokio::spawn(
         async move {
+            let _mutation_slot = mutation_slot;
             let guard = DegradeOnDrop::new(guard_lexical, "mutation unit died before completing");
             let outcome = unit.await;
             guard.defuse();
@@ -452,6 +472,23 @@ where
         Ok(outcome) => outcome,
         Err(e) => Err(MemoryError::Join(format!("mutation unit task failed: {e}"))),
     }
+}
+
+/// Admit a mutating handler into the shutdown registry, or reject it cleanly.
+///
+/// Called at handler *admission* — before any await point or state mutation
+/// (#329 review, round 4). Registration cannot happen later: `remember` and
+/// `edit` embed and mutate the vector index before their shielded unit
+/// spawns, so a slot first taken inside `shielded_mutation_unit` would leave
+/// that pre-registration work invisible to the shutdown drain — the drain
+/// could observe zero in-flight, certify, and exit around it.
+///
+/// After [`MutationRegistry::seal`](crate::types::MutationRegistry::seal)
+/// the admission is refused with [`MemoryError::ShuttingDown`]; nothing has
+/// mutated at that point, so the client can safely retry against the next
+/// server instance.
+fn admit_mutation(state: &AppState) -> Result<crate::types::MutationGuard, MemoryError> {
+    state.mutations.try_enter().ok_or(MemoryError::ShuttingDown)
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1054,7 @@ pub async fn startup_prepare_index(
     initial_pull: Option<(&crate::auth::AuthProvider, &str)>,
     router: &crate::repo_router::RepoRouter,
     embedding: &dyn EmbeddingBackend,
+    index_dir: &std::path::Path,
     loaded_index: Box<dyn VectorStore>,
     fresh_index: impl FnOnce() -> Box<dyn VectorStore>,
 ) -> (Box<dyn VectorStore>, bool) {
@@ -1032,7 +1070,11 @@ pub async fn startup_prepare_index(
     // rebuild from scratch — this prevents ghost entries from deleted
     // memories lingering.
     let head_sha = router.head_sha().await;
-    if head_sha == loaded_index.commit_sha() {
+    if !startup_needs_reindex(
+        index_dir,
+        head_sha.as_deref(),
+        loaded_index.commit_sha().as_deref(),
+    ) {
         tracing::debug!(sha = ?head_sha, "index SHA matches repo HEAD — skipping reindex");
         return (loaded_index, true);
     }
@@ -1051,7 +1093,205 @@ pub async fn startup_prepare_index(
         startup_reindex_and_certify(router, embedding, index.as_ref(), head_sha.as_deref())
             .instrument(tracing::info_span!("startup.full_reindex"))
             .await;
+    if reindex_ok {
+        clear_reindex_required_marker(index_dir);
+    }
     (index, reindex_ok)
+}
+
+/// File name of the durable reindex-required marker inside the index dir.
+///
+/// Written when the shutdown mutation drain deadline expires. In-memory
+/// certification revocation alone is not durable on that path: `run_serve`
+/// deliberately skips index persistence after a timeout, so the previous
+/// clean on-disk snapshot survives — and its stored SHA can still equal an
+/// unadvanced git HEAD (#329 review, round 4). The marker outlives the
+/// process so the next startup forces a rebuild *before* any SHA freshness
+/// comparison, honouring the invariant that every timeout guarantees a
+/// next-start reindex independently of HEAD.
+pub const REINDEX_REQUIRED_MARKER: &str = ".reindex-required";
+
+fn reindex_marker_path(index_dir: &std::path::Path) -> std::path::PathBuf {
+    index_dir.join(REINDEX_REQUIRED_MARKER)
+}
+
+/// Durably record that the next startup must rebuild the vector index.
+///
+/// Goes through the hardened `crate::fs_util::atomic_write_durable` helper
+/// (#329 review, round 5):
+/// the temp file is fsynced before the atomic rename and the parent
+/// directory is fsynced after it, so the marker survives power loss once
+/// this returns and a partially written marker never exists under the final
+/// name. On Unix the temp file is opened with `O_NOFOLLOW`, so a
+/// pre-planted symlink at the temp path fails the write instead of
+/// truncating its target; a symlink planted at the final marker path is
+/// atomically replaced by the rename without ever writing through it. Only
+/// this tiny marker touches disk — the dirty in-memory index state is never
+/// persisted on the timeout path.
+pub fn write_reindex_required_marker(index_dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(index_dir)?;
+    crate::fs_util::atomic_write_durable(
+        &reindex_marker_path(index_dir),
+        b"shutdown mutation drain deadline expired; the on-disk index snapshot \
+          is no longer certified - startup must rebuild from git truth\n",
+    )
+}
+
+/// Whether a durable reindex-required marker is present in the index dir.
+///
+/// Inspects with `symlink_metadata` (#329 review, round 5): a dangling
+/// symlink at the marker path still counts as present, and every other
+/// inspection error propagates as `Err` instead of collapsing to `false`.
+/// Callers must fail closed — "cannot inspect" is not evidence of absence,
+/// so an `Err` must be treated as reindex-required.
+pub fn reindex_required_marker_present(index_dir: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(reindex_marker_path(index_dir)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove the reindex-required marker after a clean startup rebuild.
+///
+/// Call only once the rebuild certified (`startup_reindex_and_certify`
+/// returned `true`): clearing earlier would drop the forced-reindex
+/// guarantee if the process died mid-rebuild while the old snapshot still
+/// matched HEAD. Absence is not an error; any other removal failure is
+/// logged and left in place — a lingering marker only costs a redundant
+/// rebuild, never correctness.
+pub fn clear_reindex_required_marker(index_dir: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(reindex_marker_path(index_dir)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                error = %e,
+                "failed to clear reindex-required marker — the next startup \
+                 will redundantly rebuild the vector index"
+            );
+        }
+    }
+}
+
+/// Decide whether startup must rebuild the vector index from git truth.
+///
+/// The durable reindex-required marker is checked *before* the SHA
+/// freshness comparison: a drain-timeout shutdown revokes certification
+/// only in memory and skips persistence entirely, so the surviving on-disk
+/// snapshot can still carry a stored SHA equal to an unadvanced HEAD (#329
+/// review, round 4). Without the marker taking precedence, that equality
+/// would skip the rebuild the timeout contract promised.
+pub fn startup_needs_reindex(
+    index_dir: &std::path::Path,
+    head_sha: Option<&str>,
+    stored_sha: Option<&str>,
+) -> bool {
+    match reindex_required_marker_present(index_dir) {
+        Ok(true) => {
+            info!(
+                "reindex-required marker present — forcing rebuild from git truth \
+                 regardless of stored-SHA/HEAD equality"
+            );
+            return true;
+        }
+        Ok(false) => {}
+        // Fail closed (#329 review, round 5): a metadata error is not
+        // evidence the marker is absent. Treating it as absent would let
+        // stored-SHA == HEAD equality skip the rebuild a timed-out shutdown
+        // promised. A redundant rebuild is the safe failure mode.
+        Err(e) => {
+            warn!(
+                error = %e,
+                "could not inspect reindex-required marker — failing closed \
+                 and rebuilding from git truth"
+            );
+            return true;
+        }
+    }
+    head_sha != stored_sha
+}
+
+/// Await in-flight application mutation units before shutdown persistence.
+///
+/// The transport's own shutdown drain cannot vouch for these: rmcp's awaited
+/// cancellation bounds its response drain (~2s in rmcp 1.8) and detaches
+/// handler tasks, so a mutation stalled past the window — e.g. an embedding
+/// call after the git commit already landed — is still running when
+/// `waiting()` returns (#329 review, round 3). This waits on the
+/// application's [`MutationRegistry`](crate::types::MutationRegistry)
+/// instead, with no transport-imposed ceiling.
+///
+/// Admission is sealed first (#329 review, round 4): a handler task the
+/// transport detached but has not yet polled would otherwise slip in *after*
+/// the drain observed zero in-flight. Once sealed, mutating tools fail with
+/// a clean shutting-down error before touching any state, and the drain
+/// converges over exactly the sealed-in units.
+///
+/// Returns `Ok(true)` when every unit completed within `deadline`. On
+/// timeout it records a mirror gap, *revokes the index's stored
+/// certification SHA*, and writes a durable reindex-required marker into
+/// `index_dir` before returning `Ok(false)`. Revocation must not depend on
+/// HEAD comparison (#329
+/// review, round 4): an abandoned `remember`/`edit` may have mutated the
+/// vector index while its shielded git save never advanced HEAD, so the
+/// previously verified SHA can still equal HEAD while the index is dirty —
+/// keeping it would let the next startup certify the dirty index and skip
+/// the reindex. And because `run_serve` deliberately skips persistence on
+/// timeout, the in-memory revocation alone would die with the process while
+/// the old clean snapshot (stored SHA possibly == unadvanced HEAD) survived
+/// — only the on-disk marker makes the forced next-start reindex durable
+/// (#329 review, round 4, remaining Low). A hard shutdown deadline may
+/// abandon a mutation, but it must never certify the index as intact.
+///
+/// Marker I/O must not fail open (#329 review, round 5): when the marker
+/// cannot be written, the durable guarantee falls back to revoking the
+/// certification inside the persisted snapshot itself
+/// ([`crate::index::usearch::revoke_persisted_certification`] — rewrites
+/// only the stored `commit_sha`, never dirty in-memory index state). Only
+/// if *both* durable channels fail does this return `Err`, so the caller
+/// propagates a shutdown error instead of logging the guarantee away and
+/// exiting as if it held.
+pub async fn drain_mutations_before_persist(
+    state: &AppState,
+    index_dir: &std::path::Path,
+    deadline: std::time::Duration,
+) -> Result<bool, MemoryError> {
+    state.mutations.seal();
+    if state.mutations.drained_within(deadline).await {
+        Ok(true)
+    } else {
+        warn!(
+            in_flight = state.mutations.in_flight(),
+            deadline_ms = deadline.as_millis() as u64,
+            "mutation units still in flight at shutdown drain deadline — \
+             revoking index certification so the next startup reindexes from git truth"
+        );
+        state.mark_index_mirror_incomplete();
+        // Independent of HEAD equality: the abandoned unit may have dirtied
+        // the vector index without advancing git HEAD, so the last verified
+        // SHA is no longer trustworthy evidence of freshness.
+        state.index.set_commit_sha(None);
+        // The in-memory revocation dies with this process while persistence
+        // is skipped — make the forced next-start reindex durable.
+        if let Err(marker_err) = write_reindex_required_marker(index_dir) {
+            tracing::error!(
+                error = %marker_err,
+                "failed to write reindex-required marker — falling back to \
+                 revoking the certification inside the persisted snapshot"
+            );
+            if let Err(revoke_err) =
+                crate::index::usearch::revoke_persisted_certification(index_dir)
+            {
+                return Err(MemoryError::Internal(format!(
+                    "shutdown drain deadline expired but no durable revocation \
+                     could be recorded: reindex-required marker write failed \
+                     ({marker_err}) and persisted-certification revocation \
+                     failed ({revoke_err}); the next startup could wrongly \
+                     certify the stale on-disk snapshot"
+                )));
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Persist the vector index at graceful shutdown.
@@ -1059,10 +1299,11 @@ pub async fn startup_prepare_index(
 /// Advances the stored composite SHA to the router's current HEAD only when
 /// the in-process mirror is intact ([`AppState::index_mirror_is_intact`]).
 /// When a mirror gap was recorded — e.g. a sync's post-pull change discovery
-/// failed and the sync mirror refused SHA advancement — the index
-/// keeps the SHA it last legitimately verified, so the next startup sees the
-/// mismatch against git HEAD and rebuilds the vector index from git truth
-/// instead of trusting the incomplete mirror (#293 review, round 2).
+/// failed and the sync mirror refused SHA advancement, or the shutdown
+/// mutation drain deadline expired — the index keeps the SHA it last
+/// legitimately verified, so the next startup sees the mismatch against git
+/// HEAD and rebuilds the vector index from git truth instead of trusting the
+/// incomplete mirror (#293 review, round 2).
 pub async fn persist_index_on_shutdown(
     state: &AppState,
     index_dir: &std::path::Path,
@@ -1108,8 +1349,13 @@ impl MemoryServer {
     async fn remember(
         &self,
         Parameters(args): Parameters<RememberArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round
+        // 4): the slot spans the handler's full lifetime, so the embed and
+        // vector-index add below — which run *before* the shielded unit
+        // takes its own nested slot — are visible to the shutdown drain.
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         if args.content.len() > MAX_CONTENT_SIZE {
             return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
@@ -1120,7 +1366,7 @@ impl MemoryServer {
                 ),
             }));
         }
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let content_size = args.content.len();
         let span = tracing::info_span!(
             "handler.remember",
@@ -1158,7 +1404,7 @@ impl MemoryServer {
             // git while stranding the mirror dispatch (#310, ADR-0039).
             let start = Instant::now();
             let unit_state = Arc::clone(&state);
-            let memory = shielded_mutation_unit(&state.lexical, async move {
+            let memory = shielded_mutation_unit(&state, async move {
                 unit_state.router.save_memory(&memory).await?;
                 info!(repo_ms = start.elapsed().as_millis(), "saved to repo");
 
@@ -1224,9 +1470,9 @@ impl MemoryServer {
     async fn recall(
         &self,
         Parameters(args): Parameters<RecallArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let recall_id = RecallLog::generate_recall_id();
         // Note: query text is intentionally omitted from the span (R-17 privacy decision).
         let span = tracing::info_span!(
@@ -1327,9 +1573,25 @@ impl MemoryServer {
                 results_vec.push(recall_entry_json(&memory, &hit));
             }
 
+            // The recall-log write is durable state, so it takes a registry
+            // slot for its (synchronous, no-await) duration — otherwise the
+            // shutdown drain could observe zero in-flight and `process::exit`
+            // could kill the SQLite write mid-flight (#329 review, round 4,
+            // low). After the seal the write is skipped instead: losing one
+            // recall log entry at shutdown is preferable to failing the read.
             if let Some(ref log) = state.recall_log {
-                if let Err(e) = log.log_results(&recall_id, &session_id, &log_entries) {
-                    warn!(error = %e, "failed to write recall log entries");
+                match state.mutations.try_enter() {
+                    Some(_write_slot) => {
+                        if let Err(e) = log.log_results(&recall_id, &session_id, &log_entries) {
+                            warn!(error = %e, "failed to write recall log entries");
+                        }
+                    }
+                    None => {
+                        warn!(
+                            recall_id = %recall_id,
+                            "shutdown sealed mutation admission — skipping recall log write"
+                        );
+                    }
                 }
             }
 
@@ -1366,10 +1628,12 @@ impl MemoryServer {
     async fn forget(
         &self,
         Parameters(args): Parameters<ForgetArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round 4).
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.forget",
             session_id = %session_id,
@@ -1387,7 +1651,7 @@ impl MemoryServer {
             // deletion while stranding the index removals (#310, ADR-0039).
             let unit_state = Arc::clone(&state);
             let unit_name = name.clone();
-            shielded_mutation_unit(&state.lexical, async move {
+            shielded_mutation_unit(&state, async move {
                 // Delete from repo first — if this fails, index is untouched,
                 // memory stays functional.
                 unit_state
@@ -1445,8 +1709,13 @@ impl MemoryServer {
     async fn edit(
         &self,
         Parameters(args): Parameters<EditArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round
+        // 4): the re-embed and vector-index upsert below run before the
+        // shielded unit's nested slot, so this handler-lifetime slot is what
+        // makes them visible to the shutdown drain.
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let mut timing = EditStageTiming::new();
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         if args.content.is_none() && args.tags.is_none() {
@@ -1465,7 +1734,7 @@ impl MemoryServer {
                 }));
             }
         }
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let content_size = args.content.as_ref().map(|c| c.len()).unwrap_or(0);
         let span = tracing::info_span!(
             "handler.edit",
@@ -1522,7 +1791,7 @@ impl MemoryServer {
             // git while stranding the mirror dispatch (#310, ADR-0039).
             timing.stage = "repo_save";
             let unit_state = Arc::clone(&state);
-            let (memory, mut timing) = shielded_mutation_unit(&state.lexical, async move {
+            let (memory, mut timing) = shielded_mutation_unit(&state, async move {
                 let stage_start = Instant::now();
                 let save_result = unit_state.router.save_memory(&memory).await;
                 timing.repo_save_ms = elapsed_ms(stage_start);
@@ -1596,14 +1865,16 @@ impl MemoryServer {
     async fn move_memory(
         &self,
         Parameters(args): Parameters<MoveArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round 4).
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         let new_name = match args.new_name {
             Some(n) => MemoryName::new(n).map_err(ErrorData::from)?,
             None => name.clone(),
         };
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.move",
             session_id = %session_id,
@@ -1658,7 +1929,7 @@ impl MemoryServer {
             let unit_new_name = new_name.clone();
             let unit_from_scope = from_scope.clone();
             let unit_to_scope = to_scope.clone();
-            let dest = shielded_mutation_unit(&state.lexical, async move {
+            let dest = shielded_mutation_unit(&state, async move {
                 // 2. Atomically read source, write destination, delete source
                 //    in one git commit. Must happen before index mutations so a
                 //    failure leaves the index consistent with the repo on disk.
@@ -1775,9 +2046,9 @@ impl MemoryServer {
     async fn list(
         &self,
         Parameters(args): Parameters<ListToolArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.list",
             session_id = %session_id,
@@ -1848,10 +2119,10 @@ impl MemoryServer {
     async fn read(
         &self,
         Parameters(args): Parameters<ReadArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.read",
             session_id = %session_id,
@@ -1905,10 +2176,12 @@ impl MemoryServer {
     async fn sync(
         &self,
         Parameters(args): Parameters<SyncArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round 4).
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let pull_first = args.pull_first.unwrap_or(true);
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.sync",
             session_id = %session_id,
@@ -1925,7 +2198,7 @@ impl MemoryServer {
             let unit_state = Arc::clone(&state);
             let unit_branch = branch.clone();
             let (sync_result, total_reindex, any_reindex) =
-                shielded_mutation_unit(&state.lexical, async move {
+                shielded_mutation_unit(&state, async move {
                     let sync_result = unit_state
                         .router
                         .sync_all(&unit_state.auth, &unit_branch, pull_first)
@@ -2019,9 +2292,14 @@ impl MemoryServer {
     async fn mark_applied(
         &self,
         Parameters(args): Parameters<MarkAppliedArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        // Admission before any await (#329 review, round 4, low): the SQLite
+        // verdict write is durable state the shutdown drain must count. The
+        // slot moves into the blocking closure below so the write stays
+        // covered even if this (cancellable) handler future is dropped.
+        let mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.mark_applied",
             session_id = %session_id,
@@ -2052,6 +2330,10 @@ impl MemoryServer {
                 let application = args.application.clone();
                 let confidence = args.confidence.clone();
                 traced_spawn_blocking(move || {
+                    // Hold the admission slot inside the blocking task: a
+                    // dropped handler future must not strand this write
+                    // outside the shutdown drain.
+                    let _mutation_admission = mutation_admission;
                     log.mark_applied(
                         &recall_id,
                         &memory,
@@ -2113,9 +2395,12 @@ impl MemoryServer {
     async fn batch_mark_applied(
         &self,
         Parameters(args): Parameters<BatchMarkAppliedArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        // Admission before any await (#329 review, round 4, low) — see
+        // `mark_applied`; the slot rides inside the blocking write.
+        let mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
+        let session_id = extract_session_id(&extensions);
         let count = args.verdicts.len();
         let span = tracing::info_span!(
             "handler.batch_mark_applied",
@@ -2164,6 +2449,10 @@ impl MemoryServer {
                     .collect();
 
                 let per_entry = traced_spawn_blocking(move || {
+                    // Hold the admission slot inside the blocking task: a
+                    // dropped handler future must not strand this write
+                    // outside the shutdown drain.
+                    let _mutation_admission = mutation_admission;
                     let refs: Vec<BatchVerdict<'_>> = owned
                         .iter()
                         .map(|o| BatchVerdict {
@@ -2231,9 +2520,9 @@ impl MemoryServer {
     async fn recall_stats(
         &self,
         Parameters(_args): Parameters<RecallStatsArgs>,
-        Extension(parts): Extension<http::request::Parts>,
+        extensions: Extensions,
     ) -> Result<String, ErrorData> {
-        let session_id = extract_session_id(&parts);
+        let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.recall_stats",
             session_id = %session_id,
@@ -2558,12 +2847,15 @@ mod tests {
         MemoryServer::new(state)
     }
 
-    fn list_test_parts() -> http::request::Parts {
-        http::Request::builder()
+    fn list_test_extensions() -> Extensions {
+        let parts = http::Request::builder()
             .body(())
             .expect("request")
             .into_parts()
-            .0
+            .0;
+        let mut ext = Extensions::new();
+        ext.insert(parts);
+        ext
     }
 
     #[test]
@@ -2596,7 +2888,7 @@ mod tests {
                     cursor: None,
                     fields: None,
                 }),
-                Extension(list_test_parts()),
+                list_test_extensions(),
             )
             .await
             .expect_err("zero limit must fail");
@@ -2610,7 +2902,7 @@ mod tests {
                     cursor: Some("garbage".to_string()),
                     fields: None,
                 }),
-                Extension(list_test_parts()),
+                list_test_extensions(),
             )
             .await
             .expect_err("malformed cursor must fail");
@@ -2639,7 +2931,7 @@ mod tests {
                         cursor,
                         fields: Some(vec![ListField::Name]),
                     }),
-                    Extension(list_test_parts()),
+                    list_test_extensions(),
                 )
                 .await
                 .expect("list page");
@@ -2688,7 +2980,7 @@ mod tests {
                     cursor: None,
                     fields: Some(vec![ListField::Name]),
                 }),
-                Extension(list_test_parts()),
+                list_test_extensions(),
             )
             .await
             .expect("default-limit page");
@@ -3325,13 +3617,16 @@ mod tests {
             }
         }
 
-        fn parts() -> http::request::Parts {
-            http::Request::builder()
+        fn test_extensions() -> Extensions {
+            let parts = http::Request::builder()
                 .uri("/")
                 .body(())
                 .expect("request")
                 .into_parts()
-                .0
+                .0;
+            let mut ext = Extensions::new();
+            ext.insert(parts);
+            ext
         }
 
         fn test_state(tmp: &tempfile::TempDir) -> Arc<AppState> {
@@ -3391,7 +3686,7 @@ mod tests {
                         scope: None,
                         source: None,
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
         }
@@ -3437,7 +3732,7 @@ mod tests {
                         tags: None,
                         scope: None,
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("edit must stay best-effort despite the lexical failure");
@@ -3468,7 +3763,7 @@ mod tests {
                         name: "doomed".to_string(),
                         scope: None,
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("forget must stay best-effort despite the lexical failure");
@@ -3496,7 +3791,7 @@ mod tests {
                         to_scope: "proj".to_string(),
                         new_name: None,
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("move must stay best-effort despite the lexical failure");
@@ -3607,7 +3902,7 @@ mod tests {
                         scope: None,
                         limit: Some(5),
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("recall must serve semantic-only while degraded");
@@ -3694,7 +3989,7 @@ mod tests {
                             tags: None,
                             scope: None,
                         }),
-                        Extension(parts()),
+                        test_extensions(),
                     )
                     .await
             });
@@ -3742,7 +4037,7 @@ mod tests {
                             name: "doomed".to_string(),
                             scope: None,
                         }),
-                        Extension(parts()),
+                        test_extensions(),
                     )
                     .await
             });
@@ -3789,7 +4084,7 @@ mod tests {
                             to_scope: "proj".to_string(),
                             new_name: None,
                         }),
-                        Extension(parts()),
+                        test_extensions(),
                     )
                     .await
             });
@@ -3922,7 +4217,7 @@ mod tests {
                     Parameters(SyncArgs {
                         pull_first: Some(pull_first),
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
         }
@@ -4562,6 +4857,7 @@ mod tests {
                 Some((&auth, "main")),
                 &router,
                 &MockEmbedding,
+                server_dir.path().join(".memory-mcp-index").as_path(),
                 Box::new(InMemoryStore::new(4)),
                 || Box::new(InMemoryStore::new(4)),
             )
@@ -4701,6 +4997,10 @@ mod tests {
                 Some((&auth, "main")),
                 &router,
                 &MockEmbedding,
+                server_default_dir
+                    .path()
+                    .join(".memory-mcp-index")
+                    .as_path(),
                 Box::new(InMemoryStore::new(4)),
                 || Box::new(InMemoryStore::new(4)),
             )
@@ -4914,6 +5214,767 @@ mod tests {
             );
         }
 
+        /// #329 review round 3: a shutdown drain deadline that expires with
+        /// a mutation unit still in flight must never certify the index.
+        /// The unit here holds its registry slot while git HEAD has already
+        /// advanced (the unit's commit landed; its index mirror has not) —
+        /// the exact `move` failure mode from the review. The drain must
+        /// time out, record a mirror gap, and persistence must keep the
+        /// last verified SHA so the next startup reindexes from git truth.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shutdown_drain_timeout_refuses_index_certification() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            // Verified state at A: git truth exists, mirror is intact, and
+            // shutdown-style persistence stamps HEAD-A.
+            let note_a = Memory::from_validated(
+                MemoryName::new("note-a".to_string()).unwrap(),
+                "payload a".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&note_a).await.expect("save a");
+            let dir_a = tempfile::tempdir().expect("index dir a");
+            persist_index_on_shutdown(&state, dir_a.path())
+                .await
+                .expect("persist at A");
+            let sha_a = state.index.commit_sha().expect("verified SHA at A");
+
+            // A mutation unit is in flight past the drain deadline: its git
+            // commit already moved HEAD past A, its index mirror is pending.
+            let stuck_unit_slot = state.mutations.enter();
+            let note_b = Memory::from_validated(
+                MemoryName::new("note-b".to_string()).unwrap(),
+                "payload b".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&note_b).await.expect("save b");
+            let head_b = state.router.head_sha().await.expect("git HEAD at B");
+            assert_ne!(head_b, sha_a, "git must have advanced past A");
+
+            // The deadline expires: certification must be refused…
+            let drained = drain_mutations_before_persist(
+                &state,
+                dir_a.path(),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect("marker write must succeed on a writable index dir");
+            assert!(!drained, "drain must report the expired deadline");
+            assert!(
+                reindex_required_marker_present(dir_a.path()).expect("inspect marker"),
+                "an expired drain deadline must leave a durable marker"
+            );
+            assert!(
+                !state.index_mirror_is_intact(),
+                "an expired drain deadline must record a mirror gap — \
+                 certifying here is exactly the round-3 data-loss path"
+            );
+            // …and revoked outright (#329 review, round 4): keeping the SHA
+            // verified at A is only safe while HEAD has moved past A.
+            assert_eq!(
+                state.index.commit_sha(),
+                None,
+                "an expired drain deadline must revoke the stored certification"
+            );
+
+            // Even if a persistence path runs anyway, no certification
+            // survives: the next startup cannot match stored-SHA == HEAD.
+            let dir_b = tempfile::tempdir().expect("index dir b");
+            persist_index_on_shutdown(&state, dir_b.path())
+                .await
+                .expect("persist after timeout");
+            assert_eq!(
+                state.index.commit_sha(),
+                None,
+                "timeout persistence must not resurrect a certification SHA"
+            );
+            assert_ne!(
+                state.index.commit_sha().as_deref(),
+                Some(head_b.as_str()),
+                "stamping HEAD after an expired drain would make the next \
+                 startup skip the reindex that repairs the missing mirror"
+            );
+            drop(stuck_unit_slot);
+        }
+
+        /// #329 review rounds 4–5: the round-3 test above advances HEAD A→B
+        /// before the timeout, so it only ever exercises the SHA-mismatch
+        /// path. Here git HEAD never advances — `remember`/`edit` mutate the
+        /// vector index before their shielded git save — so the previously
+        /// certified on-disk snapshot's SHA still equals current HEAD at the
+        /// next boot. In-memory revocation alone is not durable on this path
+        /// because production (`run_serve`) deliberately *skips* persistence
+        /// after a timeout (round 4, remaining Low). This test follows the
+        /// exact production ordering — timeout → revoke → skip persistence →
+        /// process exit — then reloads with unchanged HEAD and proves the
+        /// durable marker forces the rebuild and is consumed by it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shutdown_drain_timeout_forces_reindex_without_head_advance() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let index_dir = tempfile::tempdir().expect("index dir");
+            let usearch_state = |tmp: &tempfile::TempDir, index: Box<dyn VectorStore>| {
+                let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo init");
+                Arc::new(AppState::new(
+                    Arc::new(repo),
+                    "main".to_string(),
+                    Box::new(MockEmbedding),
+                    index,
+                    AuthProvider::new(),
+                    HealthRegistry::new(),
+                    None,
+                ))
+            };
+
+            // ---- Session 1: a clean shutdown leaves an on-disk snapshot
+            // certified at HEAD-A.
+            let sha_a = {
+                let state = usearch_state(
+                    &tmp,
+                    Box::new(crate::index::UsearchStore::new(4).expect("usearch store")),
+                );
+                let note_a = Memory::from_validated(
+                    MemoryName::new("note-a".to_string()).unwrap(),
+                    "payload a".to_string(),
+                    MemoryMetadata::new(Scope::Root, vec![], None),
+                );
+                state.repo.save_memory(&note_a).await.expect("save a");
+                assert!(
+                    drain_mutations_before_persist(
+                        &state,
+                        index_dir.path(),
+                        std::time::Duration::from_millis(200)
+                    )
+                    .await
+                    .expect("clean drain must not error"),
+                    "an idle registry must drain cleanly"
+                );
+                persist_index_on_shutdown(&state, index_dir.path())
+                    .await
+                    .expect("persist at A");
+                state.index.commit_sha().expect("verified SHA at A")
+            };
+            assert!(
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                "a clean shutdown must not leave a reindex-required marker"
+            );
+
+            // ---- Session 2: production ordering on a drain timeout. The
+            // snapshot is loaded from disk exactly as `run_serve` does.
+            {
+                let loaded = crate::index::UsearchStore::load(index_dir.path(), 4)
+                    .expect("load snapshot at A");
+                assert_eq!(
+                    loaded.commit_sha().as_deref(),
+                    Some(sha_a.as_str()),
+                    "precondition: the loaded snapshot is certified at A"
+                );
+                let state = usearch_state(&tmp, Box::new(loaded));
+
+                // An admitted unit dirties the in-memory vector index (the
+                // pre-shielded `remember`/`edit` step) and stalls before its
+                // git save — HEAD does NOT advance.
+                let stuck_unit_slot = state.mutations.enter();
+                state
+                    .index
+                    .add(
+                        &Scope::Root,
+                        &[0.0, 0.0, 1.0, 0.0],
+                        qualified(&Scope::Root, "ghost"),
+                    )
+                    .expect("dirty the vector index without a git commit");
+                assert_eq!(
+                    state.router.head_sha().await.as_deref(),
+                    Some(sha_a.as_str()),
+                    "precondition: git HEAD must not have advanced past A"
+                );
+
+                // Timeout: revoke in memory + write the durable marker…
+                let drained = drain_mutations_before_persist(
+                    &state,
+                    index_dir.path(),
+                    std::time::Duration::from_millis(50),
+                )
+                .await
+                .expect("marker write must succeed on a writable index dir");
+                assert!(!drained, "drain must report the expired deadline");
+                assert_eq!(
+                    state.index.commit_sha(),
+                    None,
+                    "certification must be revoked even though stored SHA \
+                     still equals HEAD"
+                );
+                assert!(
+                    reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                    "the timeout must leave a durable reindex-required marker"
+                );
+
+                // …then production explicitly SKIPS persist_index_on_shutdown
+                // (`run_serve` leaves the on-disk index untouched on timeout),
+                // and the process exits — the dirty in-memory index and the
+                // in-memory revocation both die here.
+                drop(stuck_unit_slot);
+            }
+
+            // ---- Session 3: restart with UNCHANGED git HEAD.
+            let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo reopen");
+            let router = RepoRouter::single(Arc::new(repo));
+            let head = router.head_sha().await;
+            let loaded =
+                crate::index::UsearchStore::load(index_dir.path(), 4).expect("reload snapshot");
+            assert_eq!(
+                loaded.find_by_name(&qualified(&Scope::Root, "ghost")),
+                None,
+                "the dirty in-memory state must never have been persisted"
+            );
+            // The trap the marker exists to disarm: the surviving snapshot's
+            // stored SHA equals the unadvanced HEAD, so the SHA check alone
+            // would skip the reindex.
+            assert_eq!(
+                loaded.commit_sha().as_deref(),
+                Some(sha_a.as_str()),
+                "precondition: the old snapshot still carries the SHA \
+                 certified at A"
+            );
+            assert_eq!(
+                head.as_deref(),
+                Some(sha_a.as_str()),
+                "precondition: git HEAD is unchanged, so stored SHA == HEAD"
+            );
+            assert!(
+                startup_needs_reindex(
+                    index_dir.path(),
+                    head.as_deref(),
+                    loaded.commit_sha().as_deref()
+                ),
+                "the durable marker must force the rebuild before the \
+                 SHA==HEAD comparison can skip it"
+            );
+
+            // Startup discards the loaded snapshot and rebuilds from git
+            // truth (mirroring `run_serve`), then consumes the marker only
+            // once the rebuild certified.
+            let fresh = crate::index::UsearchStore::new(4).expect("fresh store");
+            assert!(
+                startup_reindex_and_certify(&router, &MockEmbedding, &fresh, head.as_deref()).await,
+                "the forced rebuild from git truth must certify"
+            );
+            assert!(
+                fresh
+                    .find_by_name(&qualified(&Scope::Root, "note-a"))
+                    .is_some(),
+                "the rebuild must reindex git truth"
+            );
+            assert_eq!(fresh.commit_sha(), head, "the rebuild must stamp HEAD");
+            clear_reindex_required_marker(index_dir.path());
+            assert!(
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                "a certified rebuild must consume the marker"
+            );
+            assert!(
+                !startup_needs_reindex(
+                    index_dir.path(),
+                    head.as_deref(),
+                    fresh.commit_sha().as_deref()
+                ),
+                "with the marker consumed and the rebuild certified, the \
+                 next boot may skip the reindex again"
+            );
+        }
+
+        /// #329 review round 5: the marker write must never follow a
+        /// pre-planted symlink. A symlink at the temp path must fail the
+        /// write (`O_NOFOLLOW`) instead of truncating its target; a symlink
+        /// at the final marker path is atomically replaced by the rename
+        /// without the target ever being written through.
+        #[cfg(unix)]
+        #[test]
+        fn reindex_marker_write_does_not_follow_planted_symlinks() {
+            // Temp-path attack.
+            let index_dir = tempfile::tempdir().expect("index dir");
+            let victim = index_dir.path().join("victim");
+            std::fs::write(&victim, b"precious").expect("victim");
+            let tmp_path = index_dir
+                .path()
+                .join(format!(".{REINDEX_REQUIRED_MARKER}.tmp"));
+            std::os::unix::fs::symlink(&victim, &tmp_path).expect("plant temp symlink");
+            write_reindex_required_marker(index_dir.path())
+                .expect_err("writing through a planted temp symlink must fail, not truncate");
+            assert_eq!(
+                std::fs::read(&victim).expect("victim survives"),
+                b"precious",
+                "the planted temp symlink must not truncate its target"
+            );
+            assert!(
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                "the failed write must not leave a marker behind"
+            );
+
+            // Final-path attack.
+            let index_dir2 = tempfile::tempdir().expect("index dir 2");
+            let victim2 = index_dir2.path().join("victim2");
+            std::fs::write(&victim2, b"precious2").expect("victim2");
+            let marker_path = index_dir2.path().join(REINDEX_REQUIRED_MARKER);
+            std::os::unix::fs::symlink(&victim2, &marker_path).expect("plant marker symlink");
+            write_reindex_required_marker(index_dir2.path())
+                .expect("replacing a planted final-path symlink is safe");
+            assert_eq!(
+                std::fs::read(&victim2).expect("victim2 survives"),
+                b"precious2",
+                "the rename must replace the symlink, never write through it"
+            );
+            let meta = std::fs::symlink_metadata(&marker_path).expect("marker meta");
+            assert!(
+                meta.file_type().is_file(),
+                "the marker must be a regular file, not the planted symlink"
+            );
+        }
+
+        /// #329 review round 5: a failed marker write must surface as `Err`
+        /// (so the drain can fall back / propagate) and must leave neither a
+        /// marker nor a stray temp file behind.
+        #[cfg(unix)]
+        #[test]
+        fn reindex_marker_write_failure_surfaces_and_leaves_no_marker() {
+            use std::os::unix::fs::PermissionsExt;
+            // Permission-based failure injection is meaningless as root.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let index_dir = tempfile::tempdir().expect("index dir");
+            let set_mode = |mode: u32| {
+                let mut perms = std::fs::metadata(index_dir.path())
+                    .expect("meta")
+                    .permissions();
+                perms.set_mode(mode);
+                std::fs::set_permissions(index_dir.path(), perms).expect("chmod");
+            };
+            set_mode(0o555);
+            write_reindex_required_marker(index_dir.path())
+                .expect_err("a read-only index dir must fail the marker write");
+            set_mode(0o755);
+            assert!(
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                "the failed write must not leave a marker"
+            );
+            assert!(
+                std::fs::read_dir(index_dir.path())
+                    .expect("read dir")
+                    .next()
+                    .is_none(),
+                "the failed write must not leave a stray temp file"
+            );
+        }
+
+        /// #329 review round 5: marker inspection must fail closed. A
+        /// dangling symlink or an uninspectable directory is not evidence of
+        /// absence — both must force the rebuild even when the stored SHA
+        /// equals HEAD.
+        #[cfg(unix)]
+        #[test]
+        fn startup_reindex_check_fails_closed_on_marker_inspection() {
+            // Dangling symlink at the marker path: `Path::exists()` would
+            // collapse this to `false`; `symlink_metadata` sees the entry.
+            let index_dir = tempfile::tempdir().expect("index dir");
+            std::os::unix::fs::symlink(
+                index_dir.path().join("nonexistent-target"),
+                index_dir.path().join(REINDEX_REQUIRED_MARKER),
+            )
+            .expect("plant dangling symlink");
+            assert!(
+                reindex_required_marker_present(index_dir.path())
+                    .expect("a dangling symlink is inspectable"),
+                "a dangling symlink at the marker path must count as present"
+            );
+            assert!(
+                startup_needs_reindex(index_dir.path(), Some("sha-a"), Some("sha-a")),
+                "a dangling-symlink marker must force the rebuild despite \
+                 stored SHA == HEAD"
+            );
+
+            // Uninspectable directory: metadata errors surface as Err and
+            // the startup decision fails closed. Meaningless as root.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let locked = tempfile::tempdir().expect("locked dir");
+            let orig = std::fs::metadata(locked.path())
+                .expect("meta")
+                .permissions();
+            let mut none = orig.clone();
+            none.set_mode(0o000);
+            std::fs::set_permissions(locked.path(), none).expect("lock dir");
+            assert!(
+                reindex_required_marker_present(locked.path()).is_err(),
+                "a metadata error must surface as Err, never collapse to false"
+            );
+            assert!(
+                startup_needs_reindex(locked.path(), Some("sha-a"), Some("sha-a")),
+                "an uninspectable marker must fail closed into a rebuild"
+            );
+            std::fs::set_permissions(locked.path(), orig).expect("restore perms");
+        }
+
+        /// #329 review round 5: marker I/O must not fail open. When the
+        /// marker cannot be created, the drain falls back to durably
+        /// revoking the certification inside the persisted snapshot itself
+        /// — so a restart with unchanged HEAD still rebuilds. When that
+        /// fallback has no writable channel either, the drain propagates an
+        /// error instead of exiting as if the guarantee held.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn drain_timeout_marker_write_failure_revokes_persisted_certification() {
+            use std::os::unix::fs::PermissionsExt;
+            // Permission-based failure injection is meaningless as root.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let index_dir = tempfile::tempdir().expect("index dir");
+            let set_mode = |path: &std::path::Path, mode: u32| {
+                let mut perms = std::fs::metadata(path).expect("meta").permissions();
+                perms.set_mode(mode);
+                std::fs::set_permissions(path, perms).expect("chmod");
+            };
+            let usearch_state = |index: Box<dyn VectorStore>| {
+                let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo init");
+                Arc::new(AppState::new(
+                    Arc::new(repo),
+                    "main".to_string(),
+                    Box::new(MockEmbedding),
+                    index,
+                    AuthProvider::new(),
+                    HealthRegistry::new(),
+                    None,
+                ))
+            };
+
+            // A clean shutdown leaves an on-disk snapshot certified at
+            // HEAD-A.
+            let sha_a = {
+                let state = usearch_state(Box::new(
+                    crate::index::UsearchStore::new(4).expect("usearch store"),
+                ));
+                let note = Memory::from_validated(
+                    MemoryName::new("note-a".to_string()).unwrap(),
+                    "payload a".to_string(),
+                    MemoryMetadata::new(Scope::Root, vec![], None),
+                );
+                state.repo.save_memory(&note).await.expect("save a");
+                assert!(
+                    drain_mutations_before_persist(
+                        &state,
+                        index_dir.path(),
+                        std::time::Duration::from_millis(200)
+                    )
+                    .await
+                    .expect("clean drain must not error"),
+                    "an idle registry must drain cleanly"
+                );
+                persist_index_on_shutdown(&state, index_dir.path())
+                    .await
+                    .expect("persist at A");
+                state.index.commit_sha().expect("verified SHA at A")
+            };
+
+            // Marker writes into the index-dir root now fail (read-only)
+            // while `all/` stays writable for the fallback.
+            set_mode(index_dir.path(), 0o555);
+
+            // A drain timeout with a stuck unit and unchanged HEAD: the
+            // marker write fails, the fallback must absorb it.
+            {
+                let loaded = crate::index::UsearchStore::load(index_dir.path(), 4)
+                    .expect("load snapshot at A");
+                assert_eq!(
+                    loaded.commit_sha().as_deref(),
+                    Some(sha_a.as_str()),
+                    "precondition: the loaded snapshot is certified at A"
+                );
+                let state = usearch_state(Box::new(loaded));
+                let stuck_unit_slot = state.mutations.enter();
+                let drained = drain_mutations_before_persist(
+                    &state,
+                    index_dir.path(),
+                    std::time::Duration::from_millis(50),
+                )
+                .await
+                .expect("the fallback revocation must absorb the marker-write failure");
+                assert!(!drained, "drain must report the expired deadline");
+                drop(stuck_unit_slot);
+            }
+            assert!(
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                "precondition: the marker write must have failed on the \
+                 read-only index dir"
+            );
+
+            // The certification inside the snapshot itself was revoked
+            // durably…
+            let loaded =
+                crate::index::UsearchStore::load(index_dir.path(), 4).expect("reload snapshot");
+            assert_eq!(
+                loaded.commit_sha().as_deref(),
+                Some(crate::index::usearch::REVOKED_COMMIT_SHA_SENTINEL),
+                "the fallback must rewrite the persisted commit_sha to the \
+                 revocation sentinel"
+            );
+            // …so a restart with UNCHANGED git HEAD still rebuilds.
+            let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo reopen");
+            let router = RepoRouter::single(Arc::new(repo));
+            let head = router.head_sha().await;
+            assert_eq!(
+                head.as_deref(),
+                Some(sha_a.as_str()),
+                "precondition: git HEAD is unchanged"
+            );
+            assert!(
+                startup_needs_reindex(
+                    index_dir.path(),
+                    head.as_deref(),
+                    loaded.commit_sha().as_deref()
+                ),
+                "the revoked persisted certification must force the rebuild \
+                 without any marker"
+            );
+
+            // When the fallback ALSO has no durable channel, the drain must
+            // propagate instead of logging the guarantee away.
+            set_mode(&index_dir.path().join("all"), 0o555);
+            {
+                let state = usearch_state(Box::new(
+                    crate::index::UsearchStore::new(4).expect("usearch store"),
+                ));
+                let stuck_unit_slot = state.mutations.enter();
+                let err = drain_mutations_before_persist(
+                    &state,
+                    index_dir.path(),
+                    std::time::Duration::from_millis(50),
+                )
+                .await
+                .expect_err(
+                    "with no durable revocation channel the drain must error, \
+                     not fail open",
+                );
+                assert!(
+                    err.to_string().contains("reindex-required marker"),
+                    "the error must name both failed channels, got: {err}"
+                );
+                drop(stuck_unit_slot);
+            }
+
+            // Restore permissions so the tempdir can clean up.
+            set_mode(&index_dir.path().join("all"), 0o755);
+            set_mode(index_dir.path(), 0o755);
+        }
+
+        /// #329 review round 4: once the shutdown drain seals admission,
+        /// mutating tools must fail with a clean shutting-down error before
+        /// touching any state, and the registry must remain drained — a
+        /// late entrant can neither mutate nor extend the drain.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sealed_shutdown_rejects_late_mutating_handlers() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            // An idle shutdown drain seals admission and reports drained.
+            let marker_dir = tempfile::tempdir().expect("marker dir");
+            assert!(
+                drain_mutations_before_persist(
+                    &state,
+                    marker_dir.path(),
+                    std::time::Duration::from_millis(200)
+                )
+                .await
+                .expect("clean drain must not error"),
+                "an idle registry must drain cleanly"
+            );
+            assert!(
+                !reindex_required_marker_present(marker_dir.path()).expect("inspect marker"),
+                "a clean drain must not leave a reindex-required marker"
+            );
+
+            // A handler arriving after the seal (e.g. a detached task the
+            // transport spawned but had not yet polled) is rejected cleanly.
+            let err = server
+                .remember(
+                    Parameters(RememberArgs {
+                        name: "late".to_string(),
+                        content: "late payload".to_string(),
+                        scope: None,
+                        tags: vec![],
+                        source: None,
+                    }),
+                    test_extensions(),
+                )
+                .await
+                .expect_err("a sealed registry must reject the handler");
+            assert!(
+                err.message.contains("shutting down"),
+                "rejection must be a clean shutting-down error, got: {}",
+                err.message
+            );
+
+            // Nothing was admitted or mutated: the registry is still
+            // drained and the memory was never written.
+            assert_eq!(state.mutations.in_flight(), 0);
+            let late_name = MemoryName::new("late".to_string()).unwrap();
+            assert!(
+                state
+                    .router
+                    .read_memory(&late_name, &Scope::Root)
+                    .await
+                    .is_err(),
+                "the rejected handler must not have written the memory"
+            );
+        }
+
+        /// #329 review round 4: `remember` embeds and mutates the vector
+        /// index *before* `shielded_mutation_unit` takes its nested slot.
+        /// Admission-time registration must make that pre-shielded section
+        /// visible to the shutdown drain: while the handler is stalled
+        /// inside the embed await, the registry must not report drained.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn handler_admission_covers_pre_shielded_embedding() {
+            struct GatedEmbedding {
+                entered: Arc<tokio::sync::Notify>,
+                release: Arc<tokio::sync::Notify>,
+            }
+
+            #[async_trait]
+            impl crate::embedding::EmbeddingBackend for GatedEmbedding {
+                async fn embed(
+                    &self,
+                    texts: &[String],
+                ) -> Result<Vec<Vec<f32>>, crate::error::MemoryError> {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    Ok(texts.iter().map(|_| vec![0.0, 0.0, 0.0, 1.0]).collect())
+                }
+
+                fn dimensions(&self) -> usize {
+                    4
+                }
+            }
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo init");
+            let state = Arc::new(AppState::new(
+                Arc::new(repo),
+                "main".to_string(),
+                Box::new(GatedEmbedding {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+                Box::new(InMemoryStore::new(4)),
+                AuthProvider::new(),
+                HealthRegistry::new(),
+                None,
+            ));
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            let handler_state = Arc::clone(&state);
+            let handler = tokio::spawn(async move {
+                MemoryServer::new(handler_state)
+                    .remember(
+                        Parameters(RememberArgs {
+                            name: "gated".to_string(),
+                            content: "gated payload".to_string(),
+                            scope: None,
+                            tags: vec![],
+                            source: None,
+                        }),
+                        test_extensions(),
+                    )
+                    .await
+            });
+
+            // The handler is provably stalled in the embed await — before
+            // any shielded unit exists — and must already hold its slot.
+            entered.notified().await;
+            assert!(
+                state.mutations.in_flight() >= 1,
+                "admission must register the handler before the embed await"
+            );
+            assert!(
+                !state
+                    .mutations
+                    .drained_within(std::time::Duration::from_millis(50))
+                    .await,
+                "the drain must not report quiescence while pre-shielded \
+                 handler work is executing — this is the round-4 late-entrant gap"
+            );
+
+            release.notify_one();
+            handler
+                .await
+                .expect("handler task")
+                .expect("remember must succeed");
+            assert!(
+                state
+                    .mutations
+                    .drained_within(std::time::Duration::from_secs(5))
+                    .await,
+                "the slot must release when the handler completes"
+            );
+            drop(server);
+        }
+
+        /// #329 review round 3: `shielded_mutation_unit` must account its
+        /// unit in the shutdown mutation registry for the unit's full
+        /// duration — the registry, not the transport, is what gates index
+        /// persistence at shutdown.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shielded_mutation_unit_holds_registry_slot_until_completion() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let unit_entered = Arc::clone(&entered);
+            let unit_release = Arc::clone(&release);
+            let requester_state = Arc::clone(&state);
+            let requester = tokio::spawn(async move {
+                shielded_mutation_unit::<(), _>(&requester_state, async move {
+                    unit_entered.notify_one();
+                    unit_release.notified().await;
+                    Ok(())
+                })
+                .await
+            });
+
+            entered.notified().await;
+            assert_eq!(
+                state.mutations.in_flight(),
+                1,
+                "a running unit must hold exactly one registry slot"
+            );
+            assert!(
+                !state
+                    .mutations
+                    .drained_within(std::time::Duration::from_millis(50))
+                    .await,
+                "the registry must not drain while the unit is executing"
+            );
+
+            release.notify_one();
+            requester
+                .await
+                .expect("requester task")
+                .expect("unit outcome");
+            assert!(
+                state
+                    .mutations
+                    .drained_within(std::time::Duration::from_secs(5))
+                    .await,
+                "the slot must be released when the unit completes"
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn post_pull_diff_failure_marks_degraded_and_schedules_repair() {
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -5008,7 +6069,7 @@ mod tests {
                         scope: None,
                         limit: Some(5),
                     }),
-                    Extension(parts()),
+                    test_extensions(),
                 )
                 .await
                 .expect("recall must serve semantic-only while degraded");
@@ -5050,9 +6111,9 @@ mod tests {
 
             let unit_state = Arc::clone(&state);
             let unit_release = Arc::clone(&release);
-            let requester_lexical = Arc::clone(&state.lexical);
+            let requester_state = Arc::clone(&state);
             let requester = tokio::spawn(async move {
-                shielded_mutation_unit::<(), _>(&requester_lexical, async move {
+                shielded_mutation_unit::<(), _>(&requester_state, async move {
                     // Real git commit — the unit dies *after* truth moved.
                     let memory = Memory::from_validated(
                         MemoryName::new("committed".to_string()).unwrap(),
@@ -5078,6 +6139,17 @@ mod tests {
             // The Drop-guard owned by the detached task must record the
             // divergence with no requester left to observe a JoinError.
             await_degraded(&state).await;
+
+            // The panicked unit must also release its shutdown-registry
+            // slot (#329 review, round 3) — a leaked slot would hold up
+            // shutdown persistence until the drain deadline every time.
+            assert!(
+                state
+                    .mutations
+                    .drained_within(std::time::Duration::from_secs(5))
+                    .await,
+                "a panicked mutation unit must release its registry slot"
+            );
 
             // Git truth holds the memory the panic stranded.
             state

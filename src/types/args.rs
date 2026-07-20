@@ -375,6 +375,142 @@ pub struct ReindexStats {
 }
 
 // ---------------------------------------------------------------------------
+// MutationRegistry
+// ---------------------------------------------------------------------------
+
+/// Registry of in-flight application mutation units, awaited at shutdown
+/// independently of the transport's bounded response drain (#329 review,
+/// round 3).
+///
+/// rmcp's awaited cancellation drains handler *responses* for a bounded
+/// window (~2s in rmcp 1.8) and detaches handler tasks — a mutation that
+/// outlives the window also outlives `waiting()`. Index persistence must
+/// therefore gate on the application's own accounting of mutation units:
+/// each handler admits itself here *before any await or state mutation* and
+/// releases its slot via an RAII [`MutationGuard`] — so panic unwinds and
+/// task drops release too — and shutdown awaits quiescence with no
+/// transport-imposed ceiling before the index SHA may be certified.
+///
+/// Admission is *sealable* (#329 review, round 4): a handler task the
+/// transport detached but has not yet polled would otherwise register
+/// *after* shutdown observed zero in-flight — a late entrant the drain
+/// never counts. Once [`seal`](Self::seal) is called,
+/// [`try_enter`](Self::try_enter) refuses new admissions, so the drain converges over
+/// exactly the sealed-in units.
+#[derive(Debug, Default)]
+pub struct MutationRegistry {
+    in_flight: std::sync::atomic::AtomicUsize,
+    sealed: std::sync::atomic::AtomicBool,
+    drained: tokio::sync::Notify,
+}
+
+impl MutationRegistry {
+    /// Register one in-flight mutation unit, bypassing the shutdown seal.
+    ///
+    /// Only for work *nested under an admission slot that is already held*
+    /// (e.g. the detached task `shielded_mutation_unit` spawns on behalf of
+    /// an admitted handler) — such work is sealed-in by construction. New
+    /// top-level work must go through [`try_enter`](Self::try_enter) so the
+    /// shutdown seal can reject it.
+    ///
+    /// The returned guard must be held for the unit's full duration;
+    /// dropping it (normal completion, panic unwind, or task drop) releases
+    /// the slot and wakes shutdown waiters when the registry empties.
+    pub fn enter(self: &Arc<Self>) -> MutationGuard {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        MutationGuard {
+            registry: Arc::clone(self),
+        }
+    }
+
+    /// Admit one mutation unit unless shutdown has sealed the registry.
+    ///
+    /// Returns `None` once [`seal`](Self::seal) has been called — the caller
+    /// must fail cleanly without mutating any state. Increment-then-check
+    /// makes the race with `seal` safe: both the counter increment and the
+    /// seal flag use `SeqCst`, so if this load observes the registry
+    /// unsealed, the preceding increment is ordered before the seal in the
+    /// single total order — a drain that starts after sealing therefore
+    /// cannot miss this admission.
+    pub fn try_enter(self: &Arc<Self>) -> Option<MutationGuard> {
+        let guard = self.enter();
+        if self.sealed.load(std::sync::atomic::Ordering::SeqCst) {
+            // Guard drop releases the provisional slot and wakes waiters.
+            drop(guard);
+            None
+        } else {
+            Some(guard)
+        }
+    }
+
+    /// Seal admission for shutdown: every subsequent
+    /// [`try_enter`](Self::try_enter) is refused, so
+    /// [`drained`](Self::drained) converges over exactly the units admitted
+    /// before the seal (plus their nested [`enter`](Self::enter) slots).
+    /// Sealing is sticky for the registry's lifetime.
+    pub fn seal(&self) {
+        self.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `true` once shutdown has sealed admission.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Number of currently registered units.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolve once no mutation units are in flight. No internal deadline —
+    /// the whole point is to outwait the transport's bounded drain.
+    pub async fn drained(&self) {
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            // Register for `notify_waiters` *before* reading the counter, so
+            // a guard dropped between the load and the await cannot strand
+            // this waiter (an unpolled `Notified` receives no wakeup).
+            notified.as_mut().enable();
+            if self.in_flight() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Await quiescence, giving up after `deadline`.
+    ///
+    /// Returns `true` when every unit completed. Returns `false` on timeout
+    /// — the caller must then refuse to certify derived state as intact,
+    /// because a unit may still be mutating git or index state.
+    pub async fn drained_within(&self, deadline: std::time::Duration) -> bool {
+        tokio::time::timeout(deadline, self.drained()).await.is_ok()
+    }
+}
+
+/// RAII slot held by one in-flight mutation unit. See
+/// [`MutationRegistry::enter`].
+#[derive(Debug)]
+pub struct MutationGuard {
+    registry: Arc<MutationRegistry>,
+}
+
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
+        if self
+            .registry
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.registry.drained.notify_waiters();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
@@ -402,6 +538,9 @@ pub struct AppState {
     pub health: HealthRegistry,
     /// Optional append-only recall event log for threshold calibration.
     pub recall_log: Option<Arc<crate::recall_log::RecallLog>>,
+    /// In-flight mutation units, awaited at shutdown before index
+    /// persistence may certify (#329 review, round 3).
+    pub mutations: Arc<MutationRegistry>,
     /// `true` while every git HEAD advance since the vector index's stored
     /// commit SHA has been fully mirrored into the vector index.
     ///
@@ -438,6 +577,7 @@ impl AppState {
             branch,
             health,
             recall_log,
+            mutations: Arc::new(MutationRegistry::default()),
             index_mirror_intact: std::sync::atomic::AtomicBool::new(true),
         }
     }
@@ -468,6 +608,7 @@ impl AppState {
             branch,
             health,
             recall_log,
+            mutations: Arc::new(MutationRegistry::default()),
             index_mirror_intact: std::sync::atomic::AtomicBool::new(true),
         }
     }
@@ -679,5 +820,120 @@ mod tests {
                 "fields schema must advertise '{field}': {serialized}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // MutationRegistry (#329 review, round 3)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mutation_registry_drain_waits_for_last_guard() {
+        let registry = Arc::new(MutationRegistry::default());
+        let guard = registry.enter();
+        assert_eq!(registry.in_flight(), 1);
+
+        // While the guard is held, drain must not report quiescence.
+        assert!(
+            !registry
+                .drained_within(std::time::Duration::from_millis(50))
+                .await,
+            "drain must time out while a mutation unit is registered"
+        );
+
+        // Release from another task; the waiter must observe it.
+        let release_registry = Arc::clone(&registry);
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(guard);
+            drop(release_registry);
+        });
+        assert!(
+            registry
+                .drained_within(std::time::Duration::from_secs(10))
+                .await,
+            "drain must resolve once the last guard drops"
+        );
+        assert_eq!(registry.in_flight(), 0);
+        releaser.await.expect("releaser task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mutation_registry_releases_slot_on_panic() {
+        let registry = Arc::new(MutationRegistry::default());
+        let guard = registry.enter();
+        let worker = tokio::spawn(async move {
+            let _held = guard;
+            panic!("injected panic while holding a mutation slot");
+        });
+        assert!(worker.await.is_err(), "worker must have panicked");
+        assert!(
+            registry
+                .drained_within(std::time::Duration::from_secs(5))
+                .await,
+            "a panicked unit must release its slot via the RAII guard — \
+             otherwise shutdown would wait forever on a dead mutation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Admission seal (#329 review, round 4)
+    // -----------------------------------------------------------------------
+
+    /// A sealed registry refuses new admissions without leaking the
+    /// provisional slot, while pre-seal admissions are still counted by the
+    /// drain — the late-entrant window from the round-4 review.
+    #[tokio::test]
+    async fn mutation_registry_seal_rejects_late_admissions() {
+        let registry = Arc::new(MutationRegistry::default());
+
+        let pre_seal = registry.try_enter().expect("unsealed registry admits");
+        assert_eq!(registry.in_flight(), 1);
+
+        registry.seal();
+        assert!(registry.is_sealed());
+        assert!(
+            registry.try_enter().is_none(),
+            "a sealed registry must reject new admissions"
+        );
+        assert_eq!(
+            registry.in_flight(),
+            1,
+            "a rejected admission must not leak its provisional slot"
+        );
+
+        // The sealed-in unit still gates the drain…
+        assert!(
+            !registry
+                .drained_within(std::time::Duration::from_millis(50))
+                .await,
+            "drain must wait for the unit admitted before the seal"
+        );
+        // …and nested (bypass) slots for sealed-in work are still allowed.
+        let nested = registry.enter();
+        assert_eq!(registry.in_flight(), 2);
+        drop(nested);
+        drop(pre_seal);
+        assert!(
+            registry
+                .drained_within(std::time::Duration::from_secs(5))
+                .await,
+            "drain must resolve once sealed-in work completes"
+        );
+    }
+
+    /// A rejected admission on an otherwise idle sealed registry must leave
+    /// it immediately drained — the provisional increment/decrement pair
+    /// must not wedge a waiter.
+    #[tokio::test]
+    async fn mutation_registry_rejected_admission_leaves_registry_drained() {
+        let registry = Arc::new(MutationRegistry::default());
+        registry.seal();
+        assert!(registry.try_enter().is_none());
+        assert!(
+            registry
+                .drained_within(std::time::Duration::from_millis(200))
+                .await,
+            "a rejected admission must leave the sealed registry drained"
+        );
     }
 }

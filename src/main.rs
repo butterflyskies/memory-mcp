@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use mcp_session::BoundedSessionManagerBuilder;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio_util::sync::CancellationToken;
@@ -82,8 +82,25 @@ struct LoginArgs {
     k8s_secret_name: String,
 }
 
+/// MCP transport for the `serve` command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Transport {
+    /// Streamable HTTP server on `--bind` (default). Shared daemon; serves
+    /// many clients and networked deployments (ADR-0001).
+    Http,
+    /// JSON-RPC over stdin/stdout. One process per client, lifecycle managed
+    /// by the MCP client; for single-user local use (ADR-0040).
+    Stdio,
+}
+
 #[derive(Args)]
 struct ServeArgs {
+    /// MCP transport. `http` serves Streamable HTTP on --bind; `stdio`
+    /// serves a single client over stdin/stdout. HTTP-only flags (--bind,
+    /// --mcp-path, session limits, --allowed-host) are ignored under stdio.
+    #[arg(long, value_enum, default_value = "http", env = "MEMORY_MCP_TRANSPORT")]
+    transport: Transport,
+
     /// Address to bind the HTTP server to.
     #[arg(long, default_value = "127.0.0.1:8080", env = "MEMORY_MCP_BIND")]
     bind: String,
@@ -635,6 +652,7 @@ async fn main() -> anyhow::Result<()> {
             let cli = Cli::parse_from(["memory-mcp", "serve"]);
             match cli.command {
                 Some(Command::Serve(args)) => {
+                    let is_stdio = args.transport == Transport::Stdio;
                     #[cfg(feature = "otlp")]
                     let _otlp_provider = init_tracing_for_serve(&args);
                     let result = run_serve(args).await;
@@ -642,18 +660,25 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(provider) = _otlp_provider {
                         let _ = provider.shutdown();
                     }
+                    if is_stdio {
+                        exit_after_stdio_serve(result);
+                    }
                     result?;
                 }
                 _ => unreachable!(),
             }
         }
         Some(Command::Serve(args)) => {
+            let is_stdio = args.transport == Transport::Stdio;
             #[cfg(feature = "otlp")]
             let _otlp_provider = init_tracing_for_serve(&args);
             let result = run_serve(args).await;
             #[cfg(feature = "otlp")]
             if let Some(provider) = _otlp_provider {
                 let _ = provider.shutdown();
+            }
+            if is_stdio {
+                exit_after_stdio_serve(result);
             }
             result?;
         }
@@ -701,11 +726,133 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long shutdown waits for in-flight application mutation units after
+/// the transport has closed, before giving up and persisting the index
+/// *uncertified* (#329 review, round 3).
+///
+/// Generous on purpose: a unit mid-embedding on a cold CPU backend can
+/// legitimately take tens of seconds. Expiry never certifies — the drain
+/// helper records a mirror gap so the persisted index keeps its last
+/// verified SHA and the next startup reindexes from git truth.
+const SHUTDOWN_MUTATION_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Terminate the process explicitly after a stdio serve session.
+///
+/// tokio's `Stdin` performs reads on the blocking thread pool; a read that
+/// is still pending — the client held its end of the pipe open while we shut
+/// down on a signal — keeps the runtime's drop at the end of `main` waiting
+/// indefinitely. All durable state (git repos, vector index, recall log) has
+/// already been flushed by `run_serve` by the time it returns — including
+/// awaiting the in-flight mutation registry, or refusing index certification
+/// when its deadline expired — so exiting here loses nothing and makes
+/// SIGTERM shutdown deterministic.
+fn exit_after_stdio_serve(result: anyhow::Result<()>) -> ! {
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single-writer lock
+// ---------------------------------------------------------------------------
+
+/// Acquire the advisory single-writer lock for one memory repository.
+///
+/// The server assumes exclusive ownership of every git repo it opens, the
+/// usearch index files, and the recall log; none of these tolerate a second
+/// writer (ADR-0040). That covers not just the default `--repo-path` repo
+/// but every scope-mapped repository from config — two processes with
+/// different defaults can still share a mapped repo, so `run_serve` calls
+/// this once per distinct canonical repo path, in sorted order, and retains
+/// all guards. Sorted acquisition keeps contention deterministic: processes
+/// sharing any subset of repos always collide on the first shared path.
+///
+/// The lock is an OS advisory lock ([`std::fs::File::try_lock`], `flock`
+/// semantics on Linux) on `<repo>/.memory-mcp-index/.lock`, so the kernel
+/// releases it when the process exits — including on crash — and it can
+/// never go stale.
+///
+/// Fails fast when another process holds the lock, naming the holder's pid
+/// and the contended repository path. No waiting, no lease heuristics: a
+/// second server writing the same repository is a deployment error
+/// regardless of which transport either process uses or whether the repo is
+/// a default or a mapping.
+///
+/// The returned guard must be kept alive for the lifetime of the server;
+/// dropping it releases the lock.
+fn acquire_single_writer_lock(repo_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let index_dir = repo_path.join(".memory-mcp-index");
+    std::fs::create_dir_all(&index_dir)
+        .with_context(|| format!("failed to create index dir {}", index_dir.display()))?;
+    let lock_path = index_dir.join(".lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        anyhow::bail!(
+            "refusing symlink at single-writer lock path {}",
+            lock_path.display()
+        );
+    }
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
+    anyhow::ensure!(
+        file.metadata()
+            .with_context(|| format!("failed to inspect lock file {}", lock_path.display()))?
+            .is_file(),
+        "single-writer lock path is not a regular file: {}",
+        lock_path.display()
+    );
+    match file.try_lock() {
+        Ok(()) => {
+            // Best-effort holder breadcrumb for the contention error below.
+            // The lock itself is the flock, not this content.
+            file.set_len(0).ok();
+            use std::io::Write;
+            let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
+            Ok(file)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            use std::io::Read;
+            let mut holder_text = String::new();
+            let holder = (&file)
+                .read_to_string(&mut holder_text)
+                .ok()
+                .map(|_| holder_text.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            anyhow::bail!(
+                "another memory-mcp process (pid {holder}) is already serving the \
+                 repository at {} (lock file: {}). The server requires exclusive \
+                 access to every memory repo it opens — default or scope-mapped — \
+                 including its vector index and recall log. Stop the other \
+                 instance, or remove the shared repository from one of the \
+                 configurations.",
+                repo_path.display(),
+                lock_path.display()
+            )
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to lock {}", lock_path.display())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server startup
 // ---------------------------------------------------------------------------
 
-/// Start and run the MCP HTTP server with the provided arguments.
+/// Start and run the MCP server with the provided arguments, over the
+/// selected transport (streamable HTTP by default, or stdio).
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Validate branch name early to prevent ref injection.
     validate_branch_name(&args.branch).context("invalid --branch value")?;
@@ -721,8 +868,65 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         .context("failed to canonicalize repo path")?;
     info!("repo path: {}", repo_path.display());
 
+    // Data-dir layout: the vector index, recall log, and single-writer lock
+    // all live under `.memory-mcp-index` inside the repo path.
+    let index_dir = repo_path.join(".memory-mcp-index");
+
+    // Load per-scope remote config BEFORE locking: scope-mapped repositories
+    // are written by this process exactly like the default one, so the
+    // single-writer guarantee must cover every repo the config names — two
+    // processes with distinct defaults sharing one mapped repo would
+    // otherwise hold different locks while mutating the same git tree
+    // (#329 review, round 2).
+    let config = {
+        let config_path = match &args.config {
+            Some(p) if p.is_empty() => None,
+            Some(p) => Some(expand_path(p)?),
+            None => memory_mcp::config::Config::resolve_path().ok(),
+        };
+        match config_path {
+            Some(path) => Some(
+                memory_mcp::config::Config::load(&path)
+                    .with_context(|| format!("failed to load config from {}", path.display()))?,
+            ),
+            None => None,
+        }
+    };
+
+    // Collect every distinct repository this process will write: the default
+    // plus all mapped paths, canonicalized so different spellings of one
+    // location cannot yield different lock files. BTreeSet gives sorted,
+    // deduplicated acquisition order — deterministic contention, and no
+    // self-conflict when a mapping resolves to the default repo (the router
+    // rejects that collision later with a clearer error).
+    let mut lock_targets = std::collections::BTreeSet::new();
+    lock_targets.insert(repo_path.clone());
+    if let Some(config) = &config {
+        for mapping in &config.remotes {
+            let mapped = mapping
+                .resolved_path()
+                .with_context(|| format!("failed to resolve path for scope '{}'", mapping.scope))?;
+            let mapped =
+                memory_mcp::fs_util::canonicalize_allow_missing(&mapped).with_context(|| {
+                    format!(
+                        "failed to canonicalize repo path for scope '{}'",
+                        mapping.scope
+                    )
+                })?;
+            lock_targets.insert(mapped);
+        }
+    }
+
+    // Enforce single-writer before any subsystem opens: the git repos, index
+    // files, and recall log all assume exclusive ownership (ADR-0040).
+    // Acquiring before the (slow) embedding init makes contention fail fast.
+    let _single_writer_locks: Vec<std::fs::File> = lock_targets
+        .iter()
+        .map(|repo| acquire_single_writer_lock(repo))
+        .collect::<anyhow::Result<_>>()?;
+
     // Filter out empty string to treat MEMORY_MCP_REMOTE_URL="" as unset.
-    let remote_url = args.remote_url.filter(|u| !u.is_empty());
+    let remote_url = args.remote_url.clone().filter(|u| !u.is_empty());
 
     if args.require_remote_sync && remote_url.is_none() {
         anyhow::bail!("--require-remote-sync requires --remote-url to be set");
@@ -757,9 +961,6 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let dimensions = embedding.dimensions();
 
-    // Attempt to load the scoped index; create fresh if missing or corrupt.
-    let index_dir = repo_path.join(".memory-mcp-index");
-
     // Remove legacy single-index files if they still exist from an old install.
     let old_index = index_dir.join("index.usearch");
     if old_index.exists() {
@@ -777,31 +978,20 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let repo = Arc::new(repo);
 
-    // Load per-scope remote config and build the repo router.
-    let router = {
-        let config_path = match &args.config {
-            Some(p) if p.is_empty() => None,
-            Some(p) => Some(expand_path(p)?),
-            None => memory_mcp::config::Config::resolve_path().ok(),
-        };
-
-        if let Some(ref path) = config_path {
-            let config = memory_mcp::config::Config::load(path)
-                .with_context(|| format!("failed to load config from {}", path.display()))?;
-            if config.remotes.is_empty() {
-                memory_mcp::repo_router::RepoRouter::single(Arc::clone(&repo))
-            } else {
-                memory_mcp::repo_router::RepoRouter::from_config(
-                    Arc::clone(&repo),
-                    &config.remotes,
-                    &health.git,
-                    &health.sync,
-                )
-                .context("failed to initialise scope-specific repos from config")?
-            }
-        } else {
-            memory_mcp::repo_router::RepoRouter::single(Arc::clone(&repo))
+    // Build the repo router from the config loaded above (before lock
+    // acquisition) — every repo the router opens is already covered by a
+    // single-writer lock held by this process.
+    let router = match &config {
+        Some(config) if !config.remotes.is_empty() => {
+            memory_mcp::repo_router::RepoRouter::from_config(
+                Arc::clone(&repo),
+                &config.remotes,
+                &health.git,
+                &health.sync,
+            )
+            .context("failed to initialise scope-specific repos from config")?
         }
+        _ => memory_mcp::repo_router::RepoRouter::single(Arc::clone(&repo)),
     };
 
     // Load the persisted index; create fresh if missing or corrupt. Freshness
@@ -833,6 +1023,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         initial_pull,
         &router,
         embedding.as_ref(),
+        &index_dir,
         loaded_index,
         move || {
             Box::new(
@@ -918,6 +1109,84 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // Keep a reference for post-shutdown index persistence.
     let state_for_shutdown = Arc::clone(&state);
 
+    match args.transport {
+        Transport::Http => serve_http(&args, Arc::clone(&state)).await?,
+        Transport::Stdio => serve_stdio(Arc::clone(&state)).await?,
+    }
+
+    // The transport drain above cannot vouch for application mutations:
+    // rmcp bounds its awaited response drain (~2s) and detaches handler
+    // tasks, so a mutation stalled past that window is still running when
+    // the transport reports closed (#329 review, round 3). Seal admission
+    // and await the application's own mutation registry before touching the
+    // index (#329 review, round 4: the seal closes the window where a
+    // detached handler not yet polled could register *after* the drain
+    // observed zero in-flight).
+    match memory_mcp::server::drain_mutations_before_persist(
+        &state_for_shutdown,
+        &index_dir,
+        SHUTDOWN_MUTATION_DRAIN_DEADLINE,
+    )
+    .await
+    {
+        Ok(true) => {
+            info!("mutation units drained — persisting vector index");
+
+            // Persist the scoped vector index so the next startup can skip a
+            // full reindex. The stored SHA only advances when the in-process
+            // mirror is intact — a recorded mirror gap keeps the last verified
+            // SHA so the next startup rebuilds from git truth.
+            if let Err(e) =
+                memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
+            {
+                tracing::warn!("failed to persist vector index on shutdown: {}", e);
+            } else {
+                info!("vector index saved to {}", index_dir.display());
+            }
+        }
+        Ok(false) => {
+            // Drain deadline expired with a mutation abandoned mid-flight. Do
+            // not touch the on-disk index at all (#329 review, round 4): the
+            // in-memory index may hold that unit's partial mirror *without* git
+            // HEAD having advanced, so writing it out — even with the last
+            // verified SHA — could hand the next startup a dirty index whose
+            // stored SHA still equals HEAD. The untouched on-disk snapshot was
+            // consistent with git when it was written: if the abandoned unit's
+            // commit landed, HEAD moved and the SHA check forces a reindex; if
+            // it never landed, the snapshot still mirrors git truth. The drain
+            // helper has also revoked the in-memory certification for any other
+            // persistence path, and — because that revocation dies with this
+            // process while the old snapshot's stored SHA may still equal an
+            // unadvanced HEAD — durably recorded the forced next-start reindex
+            // (reindex-required marker, or on marker-write failure the
+            // persisted certification itself is revoked) so the next startup
+            // rebuilds regardless of SHA/HEAD equality (#329 review, rounds
+            // 4–5).
+            tracing::warn!(
+                "mutation drain deadline expired — leaving the on-disk vector index \
+                 untouched; the durable revocation forces the next startup to \
+                 rebuild from git truth"
+            );
+        }
+        Err(e) => {
+            // Neither durable revocation channel could be recorded (#329
+            // review, round 5): exiting normally here would let the next
+            // startup wrongly certify the stale on-disk snapshot when HEAD
+            // did not advance. Propagate so shutdown reports failure
+            // (non-zero exit) instead of logging the guarantee away.
+            return Err(anyhow::Error::from(e)
+                .context("shutdown could not durably revoke index certification"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Serve MCP over streamable HTTP (ADR-0001): axum router with health
+/// endpoints, bounded session manager, graceful shutdown on SIGINT/SIGTERM.
+async fn serve_http(args: &ServeArgs, state: Arc<AppState>) -> anyhow::Result<()> {
+    let state_for_routes = Arc::clone(&state);
+
     // Build the MCP service.
     let ct = CancellationToken::new();
     let ct_child = ct.child_token();
@@ -962,7 +1231,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         .route("/healthz", axum::routing::get(healthz_handler))
         .route("/readyz", axum::routing::get(readyz_handler))
         .route("/version", axum::routing::get(version_handler))
-        .with_state(Arc::clone(&state_for_shutdown))
+        .with_state(state_for_routes)
         .nest_service(&mcp_path, service);
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
@@ -973,40 +1242,95 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = sigterm.recv() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("failed to listen for ctrl-c");
-            }
+            shutdown_signal().await;
             info!("shutdown signal received");
             ct.cancel();
         })
         .await
         .context("server error")?;
 
-    // Persist the scoped vector index so the next startup can skip a full
-    // reindex. The stored SHA only advances when the in-process mirror is
-    // intact — a recorded mirror gap keeps the last verified SHA so the next
-    // startup rebuilds from git truth.
-    if let Err(e) =
-        memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
-    {
-        tracing::warn!("failed to persist vector index on shutdown: {}", e);
-    } else {
-        info!("vector index saved to {}", index_dir.display());
+    Ok(())
+}
+
+/// Serve MCP over stdio (ADR-0040): stdout carries JSON-RPC framing (all
+/// tracing goes to stderr), stdin EOF is the normal end-of-session signal.
+/// One process serves exactly one client; the MCP client owns the lifecycle.
+async fn serve_stdio(state: Arc<AppState>) -> anyhow::Result<()> {
+    info!("serving MCP over stdio (stdout is the protocol channel)");
+
+    let service = rmcp::serve_server(MemoryServer::new(state), rmcp::transport::stdio())
+        .await
+        .context("failed to initialize stdio transport")?;
+
+    drive_service_until_quit(service, shutdown_signal()).await
+}
+
+/// Run an initialized rmcp service until the client closes the session or
+/// `shutdown` resolves (SIGINT/SIGTERM in production).
+///
+/// The signal path must not simply drop the `waiting()` future: rmcp only
+/// guarantees cleanup ordering — draining in-flight handler responses, then
+/// closing the transport — for an *awaited* cancellation; a dropped future
+/// leaves the drop guard cancelling asynchronously while `run_serve`
+/// proceeds to stamp and persist the vector index, racing any in-flight
+/// mutation (#329 review, round 2). So on shutdown this cancels through the
+/// service's token and then awaits the same waiting future, making
+/// drain-before-persist a contract instead of a coincidence.
+///
+/// That contract is *bounded*: rmcp 1.8 drains handler responses for at
+/// most ~2 seconds and its handler tasks are detached, so a mutation
+/// stalled past the window outlives this function (#329 review, round 3).
+/// Returning here therefore only means the transport is closed —
+/// `run_serve` must still await the application's mutation registry
+/// (`drain_mutations_before_persist`) before index persistence may certify.
+async fn drive_service_until_quit<S>(
+    service: rmcp::service::RunningService<rmcp::RoleServer, S>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()>
+where
+    S: rmcp::service::Service<rmcp::RoleServer>,
+{
+    // Grab the cancellation token before `waiting()` consumes the service.
+    let ct = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    tokio::pin!(shutdown);
+
+    tokio::select! {
+        quit = &mut waiting => {
+            let reason = quit.context("stdio transport task failed")?;
+            info!(?reason, "stdio transport closed");
+        }
+        _ = &mut shutdown => {
+            info!("shutdown signal received — draining service before index persistence");
+            ct.cancel();
+            let reason = waiting
+                .await
+                .context("stdio transport task failed during shutdown drain")?;
+            info!(?reason, "stdio transport drained and closed");
+        }
     }
 
     Ok(())
+}
+
+/// Resolve when the process receives SIGINT (ctrl-c) or, on unix, SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl-c");
+    }
 }
 
 /// Print recall precision statistics bucketed by distance range.
@@ -1139,6 +1463,80 @@ mod tests {
             Some(Command::Serve(args)) => assert_eq!(args.bind, "0.0.0.0:9090"),
             _ => panic!("expected Serve command"),
         }
+    }
+
+    #[test]
+    fn test_cli_serve_transport_defaults_to_http() {
+        let cli = Cli::try_parse_from(["memory-mcp", "serve"]).expect("serve should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.transport, Transport::Http),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_transport_stdio_parses() {
+        let cli = Cli::try_parse_from(["memory-mcp", "serve", "--transport", "stdio"])
+            .expect("serve --transport stdio should parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.transport, Transport::Stdio),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_transport_rejects_unknown_value() {
+        assert!(
+            Cli::try_parse_from(["memory-mcp", "serve", "--transport", "carrier-pigeon"]).is_err(),
+            "unknown transport value must be rejected"
+        );
+    }
+
+    #[test]
+    fn single_writer_lock_excludes_second_acquisition_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_dir = tmp.path().join(".memory-mcp-index");
+
+        let guard = acquire_single_writer_lock(&index_dir).expect("first acquire");
+
+        // flock is per open-file-description, so a second acquisition from
+        // the same process still contends — same shape as a second process.
+        let err = acquire_single_writer_lock(&index_dir).expect_err("second acquire must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already serving"),
+            "error should explain the contention: {msg}"
+        );
+        assert!(
+            msg.contains(&std::process::id().to_string()),
+            "error should name the holder pid: {msg}"
+        );
+
+        drop(guard);
+        let _reacquired = acquire_single_writer_lock(&index_dir).expect("re-acquire after release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_writer_lock_rejects_planted_symlink_without_clobbering_target() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let index_dir = repo.path().join(".memory-mcp-index");
+        std::fs::create_dir(&index_dir).expect("index dir");
+        let target = repo.path().join("decoy");
+        std::fs::write(&target, b"do not clobber\n").expect("seed target");
+        std::os::unix::fs::symlink(&target, index_dir.join(".lock")).expect("plant symlink");
+
+        let err = acquire_single_writer_lock(repo.path())
+            .expect_err("O_NOFOLLOW must reject a planted lock symlink");
+        assert!(
+            format!("{err:#}").contains("failed to open lock file"),
+            "startup must fail loudly at the unsafe lock path: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"do not clobber\n",
+            "PID breadcrumb writes must never reach the symlink target"
+        );
     }
 
     #[test]
@@ -1617,5 +2015,224 @@ mod tests {
             },
             _ => panic!("expected Auth command"),
         }
+    }
+
+    /// Test handler whose only tool call blocks until released, recording
+    /// entry and completion so tests can assert drain ordering. When a
+    /// mutation registry is supplied, the call holds a registry slot for its
+    /// full duration — the same accounting `shielded_mutation_unit` gives
+    /// real mutation units.
+    #[derive(Clone)]
+    struct BlockingToolServer {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        done: Arc<std::sync::atomic::AtomicBool>,
+        registry: Option<Arc<memory_mcp::types::MutationRegistry>>,
+    }
+
+    impl rmcp::ServerHandler for BlockingToolServer {
+        async fn call_tool(
+            &self,
+            _request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+            let _slot = self.registry.as_ref().map(|r| r.enter());
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(rmcp::model::CallToolResult::success(vec![]))
+        }
+    }
+
+    /// Drive the client half of an in-memory stdio transport: initialize
+    /// handshake, then a `tools/call` that blocks inside the handler. Holds
+    /// its end of the pipe open, draining server output until close.
+    fn spawn_blocking_tool_client(
+        client_io: tokio::io::DuplexStream,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        tokio::spawn(async move {
+            let (read_half, mut write_half) = tokio::io::split(client_io);
+            let mut lines = BufReader::new(read_half).lines();
+            write_half
+                .write_all(
+                    concat!(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":"#,
+                        r#"{"protocolVersion":"2025-03-26","capabilities":{},"#,
+                        r#""clientInfo":{"name":"drain-test","version":"0"}}}"#,
+                        "\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write initialize");
+            lines
+                .next_line()
+                .await
+                .expect("read initialize response")
+                .expect("initialize response before EOF");
+            write_half
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .expect("write initialized notification");
+            write_half
+                .write_all(
+                    concat!(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":"#,
+                        r#"{"name":"block","arguments":{}}}"#,
+                        "\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write tools/call");
+            // Hold the connection open (keeping write_half alive) and drain
+            // whatever the server sends until it closes the transport.
+            while let Ok(Some(_)) = lines.next_line().await {}
+            drop(write_half);
+        })
+    }
+
+    /// Regression for #329 review round 2 (medium): a shutdown signal must
+    /// not let `drive_service_until_quit` return while a tool call is still
+    /// executing. `run_serve` persists the vector index immediately after
+    /// this function returns, so returning early would race persistence
+    /// against the in-flight mutation. The blocked handler is released only
+    /// 250ms *after* the shutdown fires; the old drop-the-waiting-future
+    /// code returned immediately and failed the `done` assertion.
+    #[tokio::test]
+    async fn shutdown_signal_drains_in_flight_tool_call_before_returning() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = BlockingToolServer {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            done: Arc::clone(&done),
+            registry: None,
+        };
+
+        let client = spawn_blocking_tool_client(client_io);
+
+        let service = rmcp::serve_server(handler, server_io)
+            .await
+            .expect("initialize over in-memory transport");
+
+        // Wait until the mutation is provably in flight.
+        entered.notified().await;
+
+        // Release the blocked handler 250ms after the signal fires — well
+        // inside rmcp's cancellation drain window — from a separate task, so
+        // an implementation that returns without draining is caught red-
+        // handed by the `done` flag.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            release.notify_one();
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        shutdown_tx.send(()).expect("send shutdown signal");
+        drive_service_until_quit(service, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("drive_service_until_quit");
+
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "service returned before the in-flight tool call completed — \
+             index persistence would race the mutation"
+        );
+        releaser.await.expect("releaser task");
+        client.abort();
+    }
+
+    /// Regression for #329 review round 3 (medium): rmcp's awaited
+    /// cancellation drain is bounded (~2s in rmcp 1.8) and its handler tasks
+    /// are detached, so a mutation blocked *beyond* that window outlives
+    /// `waiting()` — the round-2 test above releases at 250ms, inside the
+    /// window, and cannot exercise this boundary. Here the handler holds a
+    /// mutation-registry slot (the same accounting `shielded_mutation_unit`
+    /// gives real units) and stays blocked until 4s after the shutdown
+    /// signal, proving:
+    ///
+    /// 1. the transport drain returns first with the mutation still
+    ///    executing (`done` is false) — exactly the state in which
+    ///    `run_serve` previously began stamping the index, and
+    /// 2. the registry drain — the gate `run_serve` now applies before
+    ///    persistence — does not pass until the mutation completes, with no
+    ///    2s ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_awaits_mutation_blocked_beyond_rmcp_drain_window() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let registry = Arc::new(memory_mcp::types::MutationRegistry::default());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = BlockingToolServer {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            done: Arc::clone(&done),
+            registry: Some(Arc::clone(&registry)),
+        };
+
+        let client = spawn_blocking_tool_client(client_io);
+
+        let service = rmcp::serve_server(handler, server_io)
+            .await
+            .expect("initialize over in-memory transport");
+
+        // Wait until the mutation is provably in flight and registered.
+        entered.notified().await;
+        assert_eq!(registry.in_flight(), 1, "handler must hold its slot");
+
+        // Release the blocked handler 4s after the signal fires — well
+        // *outside* rmcp's ~2s cancellation drain window.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            release.notify_one();
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        shutdown_tx.send(()).expect("send shutdown signal");
+        drive_service_until_quit(service, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("drive_service_until_quit");
+
+        // The transport gave up before the mutation finished. If this fires,
+        // rmcp's bounded-drain behavior changed (it now awaits handlers
+        // fully) — re-evaluate whether the registry gate and this regression
+        // still model reality.
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "expected the transport drain to return while the mutation was \
+             still blocked (rmcp's ~2s drain ceiling); it drained fully instead"
+        );
+        assert_eq!(
+            registry.in_flight(),
+            1,
+            "the abandoned mutation must still hold its registry slot"
+        );
+
+        // The gate `run_serve` applies before persistence: it must wait out
+        // the mutation rather than inherit the transport's ceiling.
+        assert!(
+            registry
+                .drained_within(std::time::Duration::from_secs(30))
+                .await,
+            "registry drain must resolve once the mutation completes"
+        );
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "registry drained before the mutation completed — index \
+             persistence would still race the mutation"
+        );
+        releaser.await.expect("releaser task");
+        client.abort();
     }
 }

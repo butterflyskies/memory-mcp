@@ -61,6 +61,12 @@ pub enum MemoryError {
     /// Catch-all for unexpected internal failures.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// The server sealed mutation admission for shutdown; the request was
+    /// rejected before any state changed and can be safely retried against
+    /// the next server instance.
+    #[error("server is shutting down; request rejected before any state changed")]
+    ShuttingDown,
 }
 
 impl From<MemoryError> for rmcp::model::ErrorData {

@@ -1,7 +1,8 @@
 # Client setup
 
-memory-mcp exposes MCP over Streamable HTTP. The default endpoint is
-`http://localhost:8080/mcp`.
+memory-mcp exposes MCP over Streamable HTTP (the default; endpoint
+`http://localhost:8080/mcp`) or, for single-user local setups, over stdio
+with `memory-mcp serve --transport stdio`.
 
 Client configuration formats evolve independently from memory-mcp. Treat these
 examples as starting points and consult the client documentation when a current
@@ -78,20 +79,24 @@ mcpServers:
     url: http://localhost:8080/mcp
 ```
 
-## Clients that require stdio
+## stdio (no daemon)
 
-memory-mcp intentionally ships only Streamable HTTP. A client without native
-HTTP support can use a bridge such as `mcp-remote`:
+For single-user local use, let the client manage the server process directly —
+no background daemon, port, or Host allowlist needed. Claude Code example:
 
 ```json
 {
   "mcpServers": {
     "memory": {
-      "command": "npx",
-      "args": ["mcp-remote", "http://localhost:8080/mcp"]
+      "command": "memory-mcp",
+      "args": ["serve", "--transport", "stdio"]
     }
   }
 }
 ```
 
-The bridge is a separate process and dependency; it is not part of memory-mcp.
+Each stdio client gets its own server process (and its own embedding model in
+memory), and all processes must share one repository sequentially: a second
+server against the same repo exits with an error while another is running
+(ADR-0040). Prefer the HTTP daemon when more than one client is connected at
+a time.
