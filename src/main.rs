@@ -804,10 +804,10 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     };
 
-    // Load the persisted index and check freshness against repo HEAD.
-    // If the SHA doesn't match, discard the loaded index entirely and start
-    // fresh — this prevents ghost entries from deleted memories lingering.
-    let mut index: Box<dyn VectorStore> = Box::new(
+    // Load the persisted index; create fresh if missing or corrupt. Freshness
+    // against repo HEAD is decided inside `startup_prepare_index`, after the
+    // initial pull.
+    let loaded_index: Box<dyn VectorStore> = Box::new(
         UsearchStore::load_with_reporter(&index_dir, dimensions, health.vector_index.clone())
             .unwrap_or_else(|e| {
                 tracing::warn!("could not load index ({}), creating fresh", e);
@@ -816,69 +816,37 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             }),
     );
 
-    let head_sha = router.head_sha().await;
-    let needs_reindex = head_sha != index.commit_sha();
-    // Track whether the reindex (if it ran) completed without errors.
-    // Used below to gate startup report_ok for embedding and vector_index.
-    let reindex_ok;
-    if needs_reindex {
-        info!(
-            head = ?head_sha,
-            index = ?index.commit_sha(),
-            "index SHA does not match repo HEAD — rebuilding from scratch"
-        );
-        index = Box::new(
-            UsearchStore::new_with_reporter(dimensions, health.vector_index.clone())
-                .expect("failed to create index"),
-        );
-
-        // Certification requires errors == 0 (#293 review, round 3): a
-        // partial rebuild must not stamp the SHA, or the next startup would
-        // see index SHA == HEAD and skip the reindex that repairs the gap.
-        reindex_ok = memory_mcp::server::startup_reindex_and_certify(
-            &router,
-            embedding.as_ref(),
-            index.as_ref(),
-            head_sha.as_deref(),
-        )
-        .instrument(tracing::info_span!("startup.full_reindex"))
-        .await;
-    } else {
-        tracing::debug!(sha = ?head_sha, "index SHA matches repo HEAD — skipping reindex");
-        reindex_ok = true;
-    }
-
     let auth = AuthProvider::new();
+
+    // When --require-remote-sync is set, the initial pull runs BEFORE the
+    // index freshness check (#327): on a fresh repo path the pull is what
+    // populates the repo, so the startup reindex must run against post-pull
+    // git truth — otherwise the server reports ready while semantic recall
+    // misses every pulled memory. The pull covers every routed repo (default
+    // + scope-mapped remotes, with branch overrides — #328 review, round 2)
+    // and seeds aggregate sync health with a known state.
+    let initial_pull =
+        (args.require_remote_sync && remote_url.is_some()).then_some((&auth, args.branch.as_str()));
+
+    let vector_reporter = health.vector_index.clone();
+    let (index, reindex_ok) = memory_mcp::server::startup_prepare_index(
+        initial_pull,
+        &router,
+        embedding.as_ref(),
+        loaded_index,
+        move || {
+            Box::new(
+                UsearchStore::new_with_reporter(dimensions, vector_reporter)
+                    .expect("failed to create index"),
+            )
+        },
+    )
+    .await;
 
     // Tracks whether the vector index verifiably mirrors git truth at startup.
     // A reindex that did not complete cleanly is a gap only the next full
     // reindex closes, so SHA advancement must stay blocked for this process.
-    let mut startup_mirror_gap = !reindex_ok;
-
-    // When --require-remote-sync is set, perform an initial pull so the sync
-    // reporter starts with a known state (and the local repo is up-to-date).
-    if args.require_remote_sync && remote_url.is_some() {
-        info!("--require-remote-sync: performing initial pull");
-        match repo.pull(&auth, &args.branch).await {
-            Ok(result) => {
-                info!(?result, "initial pull completed");
-                if matches!(
-                    result,
-                    memory_mcp::types::PullResult::FastForward { .. }
-                        | memory_mcp::types::PullResult::Merged { .. }
-                ) {
-                    // The pull moved git HEAD past the SHA the index was just
-                    // verified against without mirroring the pulled changes.
-                    // Block SHA advancement so the next startup reindexes them
-                    // instead of a later stamp hiding the gap.
-                    startup_mirror_gap = true;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "initial pull failed — sync reporter will show degraded");
-            }
-        }
-    }
+    let startup_mirror_gap = !reindex_ok;
 
     // Only mark subsystems healthy if the reindex succeeded or was skipped
     // (SHA matched). If the reindex had errors, the subsystems have already
