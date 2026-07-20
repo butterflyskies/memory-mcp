@@ -268,3 +268,149 @@ fn second_instance_fails_fast_while_first_holds_the_lock() {
         "first instance clean exit, got: {status:?}"
     );
 }
+
+/// Scope-mapped repositories are covered by the single-writer lock too
+/// (#329 review, round 2): two processes with *distinct* default repos that
+/// share one mapped repo must contend on the shared repo's lock — the
+/// second exits non-zero, fast, naming the holder's pid and the contended
+/// path.
+#[test]
+fn second_instance_fails_fast_when_configs_share_a_mapped_repo() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let default_a = tmp.path().join("default-a");
+    let default_b = tmp.path().join("default-b");
+    let shared = tmp.path().join("shared-mapped");
+    std::fs::create_dir_all(&default_a).expect("create default-a");
+    std::fs::create_dir_all(&default_b).expect("create default-b");
+
+    // Two configs, both mapping the `work` scope to the same local repo.
+    // The URL is never fetched at startup; only the path matters here.
+    let write_config = |name: &str| {
+        let path = tmp.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "[[remotes]]\nscope = \"work\"\nurl = \"https://example.invalid/shared.git\"\npath = \"{}\"\n",
+                shared.display()
+            ),
+        )
+        .expect("write config");
+        path
+    };
+    let config_a = write_config("config-a.toml");
+    let config_b = write_config("config-b.toml");
+
+    let stderr_file =
+        std::fs::File::create(tmp.path().join("first-stderr.log")).expect("stderr capture");
+    let mut first = Command::new(env!("CARGO_BIN_EXE_memory-mcp"))
+        .args([
+            "serve",
+            "--transport",
+            "stdio",
+            "--repo-path",
+            default_a.to_str().expect("utf8 temp path"),
+            "--config",
+            config_a.to_str().expect("utf8 temp path"),
+        ])
+        .env("RUST_LOG", "debug")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map(ServerGuard)
+        .expect("spawn first instance");
+    let rx = stdout_lines(&mut first.0);
+
+    // Complete the handshake so the first instance provably holds every
+    // lock (they are all acquired before subsystem init).
+    initialize(&mut first.0, &rx);
+
+    // Second instance: different default repo, same mapped repo. Without
+    // mapped-repo locking both processes would happily serve and mutate the
+    // shared git repo concurrently; it must fail fast on the shared lock.
+    let output = Command::new(env!("CARGO_BIN_EXE_memory-mcp"))
+        .args([
+            "serve",
+            "--repo-path",
+            default_b.to_str().expect("utf8 temp path"),
+            "--config",
+            config_b.to_str().expect("utf8 temp path"),
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .output()
+        .expect("run second memory-mcp instance");
+
+    assert!(
+        !output.status.success(),
+        "second instance must exit non-zero while the shared mapped repo \
+         lock is held, got: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already serving"),
+        "second instance should explain the contention: {stderr}"
+    );
+    assert!(
+        stderr.contains("shared-mapped"),
+        "second instance should name the contended mapped repo path: {stderr}"
+    );
+    let first_pid = first.0.id().to_string();
+    assert!(
+        stderr.contains(&first_pid),
+        "second instance should name the holder pid {first_pid}: {stderr}"
+    );
+
+    drop(first.0.stdin.take());
+    let status = wait_with_timeout(&mut first.0, Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "first instance clean exit, got: {status:?}"
+    );
+}
+
+/// SIGTERM during an active session exercises the signal branch of
+/// shutdown (#329 review, round 2): the running service must be cancelled
+/// and awaited — draining rmcp cleanup — *before* `run_serve` persists the
+/// vector index. The stderr log order is the receipt: the drain completion
+/// line must precede the index-saved line, and the exit must be clean
+/// (the in-process `shutdown_signal_drains_in_flight_tool_call_before_returning`
+/// unit test proves the drain blocks on in-flight mutations).
+#[cfg(unix)]
+#[test]
+fn sigterm_drains_service_before_index_persistence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stderr_path = tmp.path().join("stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr capture");
+
+    let mut server = spawn_stdio_server(tmp.path(), Stdio::from(stderr_file));
+    let rx = stdout_lines(&mut server.0);
+    initialize(&mut server.0, &rx);
+
+    // SIGTERM, not stdin EOF: the client end stays open so only the signal
+    // path can end the session.
+    let kill_status = Command::new("kill")
+        .args(["-TERM", &server.0.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill_status.success(), "kill -TERM failed: {kill_status:?}");
+
+    let status = wait_with_timeout(&mut server.0, Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "clean exit after SIGTERM (graceful shutdown, not signal death), got: {status:?}"
+    );
+
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read captured stderr");
+    let drained = stderr
+        .find("stdio transport drained and closed")
+        .unwrap_or_else(|| panic!("missing drain completion log line in stderr:\n{stderr}"));
+    let saved = stderr
+        .find("vector index saved")
+        .unwrap_or_else(|| panic!("missing index persistence log line in stderr:\n{stderr}"));
+    assert!(
+        drained < saved,
+        "service drain must complete before index persistence:\n{stderr}"
+    );
+}
