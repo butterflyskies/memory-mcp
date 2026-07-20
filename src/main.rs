@@ -1095,11 +1095,11 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // The transport drain above cannot vouch for application mutations:
     // rmcp bounds its awaited response drain (~2s) and detaches handler
     // tasks, so a mutation stalled past that window is still running when
-    // the transport reports closed (#329 review, round 3). Await the
-    // application's own mutation registry before touching the index. On
-    // deadline expiry the helper records a mirror gap, so persistence below
-    // keeps the last verified SHA instead of certifying an index a killed
-    // mutation never finished mirroring.
+    // the transport reports closed (#329 review, round 3). Seal admission
+    // and await the application's own mutation registry before touching the
+    // index (#329 review, round 4: the seal closes the window where a
+    // detached handler not yet polled could register *after* the drain
+    // observed zero in-flight).
     if memory_mcp::server::drain_mutations_before_persist(
         &state_for_shutdown,
         SHUTDOWN_MUTATION_DRAIN_DEADLINE,
@@ -1107,18 +1107,34 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     .await
     {
         info!("mutation units drained — persisting vector index");
-    }
 
-    // Persist the scoped vector index so the next startup can skip a full
-    // reindex. The stored SHA only advances when the in-process mirror is
-    // intact — a recorded mirror gap keeps the last verified SHA so the next
-    // startup rebuilds from git truth.
-    if let Err(e) =
-        memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
-    {
-        tracing::warn!("failed to persist vector index on shutdown: {}", e);
+        // Persist the scoped vector index so the next startup can skip a
+        // full reindex. The stored SHA only advances when the in-process
+        // mirror is intact — a recorded mirror gap keeps the last verified
+        // SHA so the next startup rebuilds from git truth.
+        if let Err(e) =
+            memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
+        {
+            tracing::warn!("failed to persist vector index on shutdown: {}", e);
+        } else {
+            info!("vector index saved to {}", index_dir.display());
+        }
     } else {
-        info!("vector index saved to {}", index_dir.display());
+        // Drain deadline expired with a mutation abandoned mid-flight. Do
+        // not touch the on-disk index at all (#329 review, round 4): the
+        // in-memory index may hold that unit's partial mirror *without* git
+        // HEAD having advanced, so writing it out — even with the last
+        // verified SHA — could hand the next startup a dirty index whose
+        // stored SHA still equals HEAD. The untouched on-disk snapshot was
+        // consistent with git when it was written: if the abandoned unit's
+        // commit landed, HEAD moved and the SHA check forces a reindex; if
+        // it never landed, the snapshot still mirrors git truth. The drain
+        // helper has also revoked the in-memory certification for any other
+        // persistence path.
+        tracing::warn!(
+            "mutation drain deadline expired — leaving the on-disk vector index \
+             untouched; the next startup reindexes from git truth as needed"
+        );
     }
 
     Ok(())

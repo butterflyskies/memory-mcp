@@ -386,18 +386,32 @@ pub struct ReindexStats {
 /// window (~2s in rmcp 1.8) and detaches handler tasks — a mutation that
 /// outlives the window also outlives `waiting()`. Index persistence must
 /// therefore gate on the application's own accounting of mutation units:
-/// each unit registers here before it is spawned and releases its slot via
-/// an RAII [`MutationGuard`] — so panic unwinds and task drops release too —
-/// and shutdown awaits quiescence with no transport-imposed ceiling before
-/// the index SHA may be certified.
+/// each handler admits itself here *before any await or state mutation* and
+/// releases its slot via an RAII [`MutationGuard`] — so panic unwinds and
+/// task drops release too — and shutdown awaits quiescence with no
+/// transport-imposed ceiling before the index SHA may be certified.
+///
+/// Admission is *sealable* (#329 review, round 4): a handler task the
+/// transport detached but has not yet polled would otherwise register
+/// *after* shutdown observed zero in-flight — a late entrant the drain
+/// never counts. Once [`seal`](Self::seal) is called, [`try_enter`]
+/// (Self::try_enter) refuses new admissions, so the drain converges over
+/// exactly the sealed-in units.
 #[derive(Debug, Default)]
 pub struct MutationRegistry {
     in_flight: std::sync::atomic::AtomicUsize,
+    sealed: std::sync::atomic::AtomicBool,
     drained: tokio::sync::Notify,
 }
 
 impl MutationRegistry {
-    /// Register one in-flight mutation unit.
+    /// Register one in-flight mutation unit, bypassing the shutdown seal.
+    ///
+    /// Only for work *nested under an admission slot that is already held*
+    /// (e.g. the detached task `shielded_mutation_unit` spawns on behalf of
+    /// an admitted handler) — such work is sealed-in by construction. New
+    /// top-level work must go through [`try_enter`](Self::try_enter) so the
+    /// shutdown seal can reject it.
     ///
     /// The returned guard must be held for the unit's full duration;
     /// dropping it (normal completion, panic unwind, or task drop) releases
@@ -408,6 +422,40 @@ impl MutationRegistry {
         MutationGuard {
             registry: Arc::clone(self),
         }
+    }
+
+    /// Admit one mutation unit unless shutdown has sealed the registry.
+    ///
+    /// Returns `None` once [`seal`](Self::seal) has been called — the caller
+    /// must fail cleanly without mutating any state. Increment-then-check
+    /// makes the race with `seal` safe: both the counter increment and the
+    /// seal flag use `SeqCst`, so if this load observes the registry
+    /// unsealed, the preceding increment is ordered before the seal in the
+    /// single total order — a drain that starts after sealing therefore
+    /// cannot miss this admission.
+    pub fn try_enter(self: &Arc<Self>) -> Option<MutationGuard> {
+        let guard = self.enter();
+        if self.sealed.load(std::sync::atomic::Ordering::SeqCst) {
+            // Guard drop releases the provisional slot and wakes waiters.
+            drop(guard);
+            None
+        } else {
+            Some(guard)
+        }
+    }
+
+    /// Seal admission for shutdown: every subsequent
+    /// [`try_enter`](Self::try_enter) is refused, so
+    /// [`drained`](Self::drained) converges over exactly the units admitted
+    /// before the seal (plus their nested [`enter`](Self::enter) slots).
+    /// Sealing is sticky for the registry's lifetime.
+    pub fn seal(&self) {
+        self.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `true` once shutdown has sealed admission.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Number of currently registered units.
@@ -824,6 +872,68 @@ mod tests {
                 .await,
             "a panicked unit must release its slot via the RAII guard — \
              otherwise shutdown would wait forever on a dead mutation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Admission seal (#329 review, round 4)
+    // -----------------------------------------------------------------------
+
+    /// A sealed registry refuses new admissions without leaking the
+    /// provisional slot, while pre-seal admissions are still counted by the
+    /// drain — the late-entrant window from the round-4 review.
+    #[tokio::test]
+    async fn mutation_registry_seal_rejects_late_admissions() {
+        let registry = Arc::new(MutationRegistry::default());
+
+        let pre_seal = registry.try_enter().expect("unsealed registry admits");
+        assert_eq!(registry.in_flight(), 1);
+
+        registry.seal();
+        assert!(registry.is_sealed());
+        assert!(
+            registry.try_enter().is_none(),
+            "a sealed registry must reject new admissions"
+        );
+        assert_eq!(
+            registry.in_flight(),
+            1,
+            "a rejected admission must not leak its provisional slot"
+        );
+
+        // The sealed-in unit still gates the drain…
+        assert!(
+            !registry
+                .drained_within(std::time::Duration::from_millis(50))
+                .await,
+            "drain must wait for the unit admitted before the seal"
+        );
+        // …and nested (bypass) slots for sealed-in work are still allowed.
+        let nested = registry.enter();
+        assert_eq!(registry.in_flight(), 2);
+        drop(nested);
+        drop(pre_seal);
+        assert!(
+            registry
+                .drained_within(std::time::Duration::from_secs(5))
+                .await,
+            "drain must resolve once sealed-in work completes"
+        );
+    }
+
+    /// A rejected admission on an otherwise idle sealed registry must leave
+    /// it immediately drained — the provisional increment/decrement pair
+    /// must not wedge a waiter.
+    #[tokio::test]
+    async fn mutation_registry_rejected_admission_leaves_registry_drained() {
+        let registry = Arc::new(MutationRegistry::default());
+        registry.seal();
+        assert!(registry.try_enter().is_none());
+        assert!(
+            registry
+                .drained_within(std::time::Duration::from_millis(200))
+                .await,
+            "a rejected admission must leave the sealed registry drained"
         );
     }
 }

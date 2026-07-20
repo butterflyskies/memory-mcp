@@ -442,6 +442,13 @@ impl Drop for EditStageTiming {
 /// not the transport — to know when application mutations have quiesced. The
 /// slot is held by an RAII guard inside the detached task, so panic unwinds
 /// and task drops release it alongside the `DegradeOnDrop` marking.
+///
+/// The unconditional `enter` below is *nested* accounting: every caller is a
+/// handler that already holds an admission slot from [`admit_mutation`]
+/// (#329 review, round 4), so this unit is sealed-in work by construction —
+/// the shutdown seal must not reject it. The nested slot exists because the
+/// detached task can outlive its (cancellable) requester, whose admission
+/// guard dies with the handler future.
 async fn shielded_mutation_unit<T, F>(state: &Arc<AppState>, unit: F) -> Result<T, MemoryError>
 where
     F: std::future::Future<Output = Result<T, MemoryError>> + Send + 'static,
@@ -465,6 +472,23 @@ where
         Ok(outcome) => outcome,
         Err(e) => Err(MemoryError::Join(format!("mutation unit task failed: {e}"))),
     }
+}
+
+/// Admit a mutating handler into the shutdown registry, or reject it cleanly.
+///
+/// Called at handler *admission* — before any await point or state mutation
+/// (#329 review, round 4). Registration cannot happen later: `remember` and
+/// `edit` embed and mutate the vector index before their shielded unit
+/// spawns, so a slot first taken inside `shielded_mutation_unit` would leave
+/// that pre-registration work invisible to the shutdown drain — the drain
+/// could observe zero in-flight, certify, and exit around it.
+///
+/// After [`MutationRegistry::seal`](crate::types::MutationRegistry::seal)
+/// the admission is refused with [`MemoryError::ShuttingDown`]; nothing has
+/// mutated at that point, so the client can safely retry against the next
+/// server instance.
+fn admit_mutation(state: &AppState) -> Result<crate::types::MutationGuard, MemoryError> {
+    state.mutations.try_enter().ok_or(MemoryError::ShuttingDown)
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,17 +1109,29 @@ pub async fn startup_prepare_index(
 /// application's [`MutationRegistry`](crate::types::MutationRegistry)
 /// instead, with no transport-imposed ceiling.
 ///
+/// Admission is sealed first (#329 review, round 4): a handler task the
+/// transport detached but has not yet polled would otherwise slip in *after*
+/// the drain observed zero in-flight. Once sealed, mutating tools fail with
+/// a clean shutting-down error before touching any state, and the drain
+/// converges over exactly the sealed-in units.
+///
 /// Returns `true` when every unit completed within `deadline`. On timeout it
-/// records a mirror gap and returns `false`: persistence then keeps the last
-/// verified SHA instead of stamping the (already mutated) git HEAD onto an
-/// index whose mirror the killed unit never finished, so the next startup
-/// detects the mismatch and reindexes from git truth. A hard shutdown
+/// records a mirror gap, *revokes the index's stored certification SHA*, and
+/// returns `false`. Revocation must not depend on HEAD comparison (#329
+/// review, round 4): an abandoned `remember`/`edit` may have mutated the
+/// vector index while its shielded git save never advanced HEAD, so the
+/// previously verified SHA can still equal HEAD while the index is dirty —
+/// keeping it would let the next startup certify the dirty index and skip
+/// the reindex. With the SHA revoked (and `run_serve` additionally skipping
+/// persistence entirely on timeout), the next startup can never match
+/// stored-SHA == HEAD and always rebuilds from git truth. A hard shutdown
 /// deadline may abandon a mutation, but it must never certify the index as
 /// intact.
 pub async fn drain_mutations_before_persist(
     state: &AppState,
     deadline: std::time::Duration,
 ) -> bool {
+    state.mutations.seal();
     if state.mutations.drained_within(deadline).await {
         true
     } else {
@@ -1103,9 +1139,13 @@ pub async fn drain_mutations_before_persist(
             in_flight = state.mutations.in_flight(),
             deadline_ms = deadline.as_millis() as u64,
             "mutation units still in flight at shutdown drain deadline — \
-             refusing index certification so the next startup reindexes from git truth"
+             revoking index certification so the next startup reindexes from git truth"
         );
         state.mark_index_mirror_incomplete();
+        // Independent of HEAD equality: the abandoned unit may have dirtied
+        // the vector index without advancing git HEAD, so the last verified
+        // SHA is no longer trustworthy evidence of freshness.
+        state.index.set_commit_sha(None);
         false
     }
 }
@@ -1167,6 +1207,11 @@ impl MemoryServer {
         Parameters(args): Parameters<RememberArgs>,
         extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round
+        // 4): the slot spans the handler's full lifetime, so the embed and
+        // vector-index add below — which run *before* the shielded unit
+        // takes its own nested slot — are visible to the shutdown drain.
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         if args.content.len() > MAX_CONTENT_SIZE {
             return Err(ErrorData::from(crate::error::MemoryError::InvalidInput {
@@ -1384,9 +1429,25 @@ impl MemoryServer {
                 results_vec.push(recall_entry_json(&memory, &hit));
             }
 
+            // The recall-log write is durable state, so it takes a registry
+            // slot for its (synchronous, no-await) duration — otherwise the
+            // shutdown drain could observe zero in-flight and `process::exit`
+            // could kill the SQLite write mid-flight (#329 review, round 4,
+            // low). After the seal the write is skipped instead: losing one
+            // recall log entry at shutdown is preferable to failing the read.
             if let Some(ref log) = state.recall_log {
-                if let Err(e) = log.log_results(&recall_id, &session_id, &log_entries) {
-                    warn!(error = %e, "failed to write recall log entries");
+                match state.mutations.try_enter() {
+                    Some(_write_slot) => {
+                        if let Err(e) = log.log_results(&recall_id, &session_id, &log_entries) {
+                            warn!(error = %e, "failed to write recall log entries");
+                        }
+                    }
+                    None => {
+                        warn!(
+                            recall_id = %recall_id,
+                            "shutdown sealed mutation admission — skipping recall log write"
+                        );
+                    }
                 }
             }
 
@@ -1425,6 +1486,8 @@ impl MemoryServer {
         Parameters(args): Parameters<ForgetArgs>,
         extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round 4).
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
@@ -1504,6 +1567,11 @@ impl MemoryServer {
         Parameters(args): Parameters<EditArgs>,
         extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round
+        // 4): the re-embed and vector-index upsert below run before the
+        // shielded unit's nested slot, so this handler-lifetime slot is what
+        // makes them visible to the shutdown drain.
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let mut timing = EditStageTiming::new();
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         if args.content.is_none() && args.tags.is_none() {
@@ -1655,6 +1723,8 @@ impl MemoryServer {
         Parameters(args): Parameters<MoveArgs>,
         extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round 4).
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let name = MemoryName::new(args.name).map_err(ErrorData::from)?;
         let new_name = match args.new_name {
             Some(n) => MemoryName::new(n).map_err(ErrorData::from)?,
@@ -1964,6 +2034,8 @@ impl MemoryServer {
         Parameters(args): Parameters<SyncArgs>,
         extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await or state mutation (#329 review, round 4).
+        let _mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let pull_first = args.pull_first.unwrap_or(true);
         let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
@@ -2078,6 +2150,11 @@ impl MemoryServer {
         Parameters(args): Parameters<MarkAppliedArgs>,
         extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await (#329 review, round 4, low): the SQLite
+        // verdict write is durable state the shutdown drain must count. The
+        // slot moves into the blocking closure below so the write stays
+        // covered even if this (cancellable) handler future is dropped.
+        let mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let session_id = extract_session_id(&extensions);
         let span = tracing::info_span!(
             "handler.mark_applied",
@@ -2109,6 +2186,10 @@ impl MemoryServer {
                 let application = args.application.clone();
                 let confidence = args.confidence.clone();
                 traced_spawn_blocking(move || {
+                    // Hold the admission slot inside the blocking task: a
+                    // dropped handler future must not strand this write
+                    // outside the shutdown drain.
+                    let _mutation_admission = mutation_admission;
                     log.mark_applied(
                         &recall_id,
                         &memory,
@@ -2172,6 +2253,9 @@ impl MemoryServer {
         Parameters(args): Parameters<BatchMarkAppliedArgs>,
         extensions: Extensions,
     ) -> Result<String, ErrorData> {
+        // Admission before any await (#329 review, round 4, low) — see
+        // `mark_applied`; the slot rides inside the blocking write.
+        let mutation_admission = admit_mutation(&self.state).map_err(ErrorData::from)?;
         let session_id = extract_session_id(&extensions);
         let count = args.verdicts.len();
         let span = tracing::info_span!(
@@ -2221,6 +2305,10 @@ impl MemoryServer {
                     .collect();
 
                 let per_entry = traced_spawn_blocking(move || {
+                    // Hold the admission slot inside the blocking task: a
+                    // dropped handler future must not strand this write
+                    // outside the shutdown drain.
+                    let _mutation_admission = mutation_admission;
                     let refs: Vec<BatchVerdict<'_>> = owned
                         .iter()
                         .map(|o| BatchVerdict {
@@ -5024,16 +5112,24 @@ mod tests {
                 "an expired drain deadline must record a mirror gap — \
                  certifying here is exactly the round-3 data-loss path"
             );
+            // …and revoked outright (#329 review, round 4): keeping the SHA
+            // verified at A is only safe while HEAD has moved past A.
+            assert_eq!(
+                state.index.commit_sha(),
+                None,
+                "an expired drain deadline must revoke the stored certification"
+            );
 
-            // …so persistence keeps the SHA verified at A, not HEAD-B.
+            // Even if a persistence path runs anyway, no certification
+            // survives: the next startup cannot match stored-SHA == HEAD.
             let dir_b = tempfile::tempdir().expect("index dir b");
             persist_index_on_shutdown(&state, dir_b.path())
                 .await
                 .expect("persist after timeout");
             assert_eq!(
-                state.index.commit_sha().as_deref(),
-                Some(sha_a.as_str()),
-                "timeout persistence must keep the last verified SHA"
+                state.index.commit_sha(),
+                None,
+                "timeout persistence must not resurrect a certification SHA"
             );
             assert_ne!(
                 state.index.commit_sha().as_deref(),
@@ -5042,6 +5138,222 @@ mod tests {
                  startup skip the reindex that repairs the missing mirror"
             );
             drop(stuck_unit_slot);
+        }
+
+        /// #329 review round 4: the round-3 test above advances HEAD A→B
+        /// before the timeout, so it only ever exercises the SHA-mismatch
+        /// path. Here the abandoned unit has dirtied the *vector index*
+        /// while git HEAD never advanced — `remember`/`edit` mutate the
+        /// index before their shielded git save — so the previously
+        /// verified SHA still equals current HEAD. Certification must be
+        /// revoked independently of HEAD equality, or the next startup
+        /// would accept the dirty index and skip the reindex.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shutdown_drain_timeout_forces_reindex_without_head_advance() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+
+            // Verified state at A: stored SHA == git HEAD.
+            let note_a = Memory::from_validated(
+                MemoryName::new("note-a".to_string()).unwrap(),
+                "payload a".to_string(),
+                MemoryMetadata::new(Scope::Root, vec![], None),
+            );
+            state.repo.save_memory(&note_a).await.expect("save a");
+            let dir_a = tempfile::tempdir().expect("index dir a");
+            persist_index_on_shutdown(&state, dir_a.path())
+                .await
+                .expect("persist at A");
+            let sha_a = state.index.commit_sha().expect("verified SHA at A");
+
+            // An admitted unit dirties the vector index (the pre-shielded
+            // `remember`/`edit` step) and then stalls before its git save —
+            // HEAD does NOT advance.
+            let stuck_unit_slot = state.mutations.enter();
+            state
+                .index
+                .add(
+                    &Scope::Root,
+                    &[0.0, 0.0, 1.0, 0.0],
+                    qualified(&Scope::Root, "ghost"),
+                )
+                .expect("dirty the vector index without a git commit");
+            assert_eq!(
+                state.router.head_sha().await.as_deref(),
+                Some(sha_a.as_str()),
+                "precondition: git HEAD must not have advanced past A"
+            );
+
+            let drained =
+                drain_mutations_before_persist(&state, std::time::Duration::from_millis(50)).await;
+            assert!(!drained, "drain must report the expired deadline");
+
+            // The falsely fresh SHA (old SHA == current HEAD) must be gone…
+            assert_eq!(
+                state.index.commit_sha(),
+                None,
+                "certification must be revoked even though stored SHA still \
+                 equals HEAD — HEAD equality is not evidence of a clean mirror"
+            );
+
+            // …including through any persistence that runs afterwards, so
+            // the next boot can never see stored-SHA == HEAD and must
+            // reindex from git truth.
+            let dir_b = tempfile::tempdir().expect("index dir b");
+            persist_index_on_shutdown(&state, dir_b.path())
+                .await
+                .expect("persist after timeout");
+            assert_eq!(state.index.commit_sha(), None);
+            assert_ne!(
+                state.index.commit_sha().as_deref(),
+                state.router.head_sha().await.as_deref(),
+                "the dirty index must not be bootable as fresh"
+            );
+            drop(stuck_unit_slot);
+        }
+
+        /// #329 review round 4: once the shutdown drain seals admission,
+        /// mutating tools must fail with a clean shutting-down error before
+        /// touching any state, and the registry must remain drained — a
+        /// late entrant can neither mutate nor extend the drain.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sealed_shutdown_rejects_late_mutating_handlers() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = test_state(&tmp);
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            // An idle shutdown drain seals admission and reports drained.
+            assert!(
+                drain_mutations_before_persist(&state, std::time::Duration::from_millis(200)).await,
+                "an idle registry must drain cleanly"
+            );
+
+            // A handler arriving after the seal (e.g. a detached task the
+            // transport spawned but had not yet polled) is rejected cleanly.
+            let err = server
+                .remember(
+                    Parameters(RememberArgs {
+                        name: "late".to_string(),
+                        content: "late payload".to_string(),
+                        scope: None,
+                        tags: vec![],
+                        source: None,
+                    }),
+                    test_extensions(),
+                )
+                .await
+                .expect_err("a sealed registry must reject the handler");
+            assert!(
+                err.message.contains("shutting down"),
+                "rejection must be a clean shutting-down error, got: {}",
+                err.message
+            );
+
+            // Nothing was admitted or mutated: the registry is still
+            // drained and the memory was never written.
+            assert_eq!(state.mutations.in_flight(), 0);
+            let late_name = MemoryName::new("late".to_string()).unwrap();
+            assert!(
+                state
+                    .router
+                    .read_memory(&late_name, &Scope::Root)
+                    .await
+                    .is_err(),
+                "the rejected handler must not have written the memory"
+            );
+        }
+
+        /// #329 review round 4: `remember` embeds and mutates the vector
+        /// index *before* `shielded_mutation_unit` takes its nested slot.
+        /// Admission-time registration must make that pre-shielded section
+        /// visible to the shutdown drain: while the handler is stalled
+        /// inside the embed await, the registry must not report drained.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn handler_admission_covers_pre_shielded_embedding() {
+            struct GatedEmbedding {
+                entered: Arc<tokio::sync::Notify>,
+                release: Arc<tokio::sync::Notify>,
+            }
+
+            #[async_trait]
+            impl crate::embedding::EmbeddingBackend for GatedEmbedding {
+                async fn embed(
+                    &self,
+                    texts: &[String],
+                ) -> Result<Vec<Vec<f32>>, crate::error::MemoryError> {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    Ok(texts.iter().map(|_| vec![0.0, 0.0, 0.0, 1.0]).collect())
+                }
+
+                fn dimensions(&self) -> usize {
+                    4
+                }
+            }
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo init");
+            let state = Arc::new(AppState::new(
+                Arc::new(repo),
+                "main".to_string(),
+                Box::new(GatedEmbedding {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+                Box::new(InMemoryStore::new(4)),
+                AuthProvider::new(),
+                HealthRegistry::new(),
+                None,
+            ));
+            let server = MemoryServer::new(Arc::clone(&state));
+
+            let handler_state = Arc::clone(&state);
+            let handler = tokio::spawn(async move {
+                MemoryServer::new(handler_state)
+                    .remember(
+                        Parameters(RememberArgs {
+                            name: "gated".to_string(),
+                            content: "gated payload".to_string(),
+                            scope: None,
+                            tags: vec![],
+                            source: None,
+                        }),
+                        test_extensions(),
+                    )
+                    .await
+            });
+
+            // The handler is provably stalled in the embed await — before
+            // any shielded unit exists — and must already hold its slot.
+            entered.notified().await;
+            assert!(
+                state.mutations.in_flight() >= 1,
+                "admission must register the handler before the embed await"
+            );
+            assert!(
+                !state
+                    .mutations
+                    .drained_within(std::time::Duration::from_millis(50))
+                    .await,
+                "the drain must not report quiescence while pre-shielded \
+                 handler work is executing — this is the round-4 late-entrant gap"
+            );
+
+            release.notify_one();
+            handler
+                .await
+                .expect("handler task")
+                .expect("remember must succeed");
+            assert!(
+                state
+                    .mutations
+                    .drained_within(std::time::Duration::from_secs(5))
+                    .await,
+                "the slot must release when the handler completes"
+            );
+            drop(server);
         }
 
         /// #329 review round 3: `shielded_mutation_unit` must account its
