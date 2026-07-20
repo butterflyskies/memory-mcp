@@ -4,6 +4,13 @@
 
 - **Chunk-addressable retrieval contract** (#262 slice 1, ADR-0042): typed identity and wire shapes for fact-level retrieval units — deterministic `FactId` (parent id + chunker version + source span + content digest, canonical `fact:v1:...` string form), validated non-empty UTF-8 `SourceSpan`, `ChunkerVersion`, and the crate-internal catalog (`FactRecord`) and recall-provenance (`MatchedChunk`) shapes, which go public when their slices wire them. Contract only — no behavioral wiring; the deterministic chunker, derived catalog, chunk indexes, and response wiring land in later slices. `MemoryRef` gains strict `Serialize`/`Deserialize` support for shapes that embed a parent reference. Existing whole-memory retrieval is unchanged. ADR-0042 carries the #262 invariant ledger (each invariant mapped to enforcement, test, and owning slice) and the index-persistence posture; `proptest` lands as a dev-dependency seeding the repository's property-based-testing layer (serde round-trip totality, canonical-form totality, span validity, and collision-resistance evidence over generated inputs).
 
+## [0.17.1] - 2026-07-19
+
+### Fixed
+
+- **Fresh deployments no longer signal ready with an empty semantic index.** On a fresh repository path with a configured remote and `--require-remote-sync`, startup rebuilt and certified the vector index *before* the initial pull — `/readyz` went green while semantic recall missed every memory stored on the remote, for the entire first lifetime of the process. Startup now completes the initial pull before index freshness is decided, so a fresh boot rebuilds and certifies against post-pull git truth before ready is signaled (#328).
+- **Per-scope mapped repositories are pulled at startup too.** With per-scope remote mapping configured, mapped repositories were initialized locally without fetching, so a fresh deployment could report ready while every remotely stored mapped-scope memory was absent until an explicit `sync`. Startup now pulls the default repository plus every scope-mapped route (respecting per-route branch overrides), and aggregate sync health settles once from the complete outcome — a failed mapped-remote pull followed by a clean pull no longer reports healthy (#328).
+
 ## [0.17.0] - 2026-07-19
 
 ### Behavior changes — read before upgrading
