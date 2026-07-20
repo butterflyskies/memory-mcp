@@ -1101,47 +1101,61 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // index (#329 review, round 4: the seal closes the window where a
     // detached handler not yet polled could register *after* the drain
     // observed zero in-flight).
-    if memory_mcp::server::drain_mutations_before_persist(
+    match memory_mcp::server::drain_mutations_before_persist(
         &state_for_shutdown,
         &index_dir,
         SHUTDOWN_MUTATION_DRAIN_DEADLINE,
     )
     .await
     {
-        info!("mutation units drained — persisting vector index");
+        Ok(true) => {
+            info!("mutation units drained — persisting vector index");
 
-        // Persist the scoped vector index so the next startup can skip a
-        // full reindex. The stored SHA only advances when the in-process
-        // mirror is intact — a recorded mirror gap keeps the last verified
-        // SHA so the next startup rebuilds from git truth.
-        if let Err(e) =
-            memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
-        {
-            tracing::warn!("failed to persist vector index on shutdown: {}", e);
-        } else {
-            info!("vector index saved to {}", index_dir.display());
+            // Persist the scoped vector index so the next startup can skip a
+            // full reindex. The stored SHA only advances when the in-process
+            // mirror is intact — a recorded mirror gap keeps the last verified
+            // SHA so the next startup rebuilds from git truth.
+            if let Err(e) =
+                memory_mcp::server::persist_index_on_shutdown(&state_for_shutdown, &index_dir).await
+            {
+                tracing::warn!("failed to persist vector index on shutdown: {}", e);
+            } else {
+                info!("vector index saved to {}", index_dir.display());
+            }
         }
-    } else {
-        // Drain deadline expired with a mutation abandoned mid-flight. Do
-        // not touch the on-disk index at all (#329 review, round 4): the
-        // in-memory index may hold that unit's partial mirror *without* git
-        // HEAD having advanced, so writing it out — even with the last
-        // verified SHA — could hand the next startup a dirty index whose
-        // stored SHA still equals HEAD. The untouched on-disk snapshot was
-        // consistent with git when it was written: if the abandoned unit's
-        // commit landed, HEAD moved and the SHA check forces a reindex; if
-        // it never landed, the snapshot still mirrors git truth. The drain
-        // helper has also revoked the in-memory certification for any other
-        // persistence path, and — because that revocation dies with this
-        // process while the old snapshot's stored SHA may still equal an
-        // unadvanced HEAD — written a durable reindex-required marker so the
-        // next startup rebuilds regardless of SHA/HEAD equality (#329
-        // review, round 4).
-        tracing::warn!(
-            "mutation drain deadline expired — leaving the on-disk vector index \
-             untouched; the reindex-required marker forces the next startup to \
-             rebuild from git truth"
-        );
+        Ok(false) => {
+            // Drain deadline expired with a mutation abandoned mid-flight. Do
+            // not touch the on-disk index at all (#329 review, round 4): the
+            // in-memory index may hold that unit's partial mirror *without* git
+            // HEAD having advanced, so writing it out — even with the last
+            // verified SHA — could hand the next startup a dirty index whose
+            // stored SHA still equals HEAD. The untouched on-disk snapshot was
+            // consistent with git when it was written: if the abandoned unit's
+            // commit landed, HEAD moved and the SHA check forces a reindex; if
+            // it never landed, the snapshot still mirrors git truth. The drain
+            // helper has also revoked the in-memory certification for any other
+            // persistence path, and — because that revocation dies with this
+            // process while the old snapshot's stored SHA may still equal an
+            // unadvanced HEAD — durably recorded the forced next-start reindex
+            // (reindex-required marker, or on marker-write failure the
+            // persisted certification itself is revoked) so the next startup
+            // rebuilds regardless of SHA/HEAD equality (#329 review, rounds
+            // 4–5).
+            tracing::warn!(
+                "mutation drain deadline expired — leaving the on-disk vector index \
+                 untouched; the durable revocation forces the next startup to \
+                 rebuild from git truth"
+            );
+        }
+        Err(e) => {
+            // Neither durable revocation channel could be recorded (#329
+            // review, round 5): exiting normally here would let the next
+            // startup wrongly certify the stale on-disk snapshot when HEAD
+            // did not advance. Propagate so shutdown reports failure
+            // (non-zero exit) instead of logging the guarantee away.
+            return Err(anyhow::Error::from(e)
+                .context("shutdown could not durably revoke index certification"));
+        }
     }
 
     Ok(())

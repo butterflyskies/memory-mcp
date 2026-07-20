@@ -1117,24 +1117,38 @@ fn reindex_marker_path(index_dir: &std::path::Path) -> std::path::PathBuf {
 
 /// Durably record that the next startup must rebuild the vector index.
 ///
-/// Crash-safe-ish: the content is written to a temp file and renamed into
-/// place, so a partially written marker never exists under the final name.
-/// Only this tiny marker touches disk — the dirty in-memory index state is
-/// never persisted on the timeout path.
+/// Goes through [`crate::fs_util::atomic_write`] (#329 review, round 5):
+/// the temp file is fsynced before the atomic rename and the parent
+/// directory is fsynced after it, so the marker survives power loss once
+/// this returns and a partially written marker never exists under the final
+/// name. On Unix the temp file is opened with `O_NOFOLLOW`, so a
+/// pre-planted symlink at the temp path fails the write instead of
+/// truncating its target; a symlink planted at the final marker path is
+/// atomically replaced by the rename without ever writing through it. Only
+/// this tiny marker touches disk — the dirty in-memory index state is never
+/// persisted on the timeout path.
 pub fn write_reindex_required_marker(index_dir: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(index_dir)?;
-    let tmp = index_dir.join(".reindex-required.tmp");
-    std::fs::write(
-        &tmp,
+    crate::fs_util::atomic_write(
+        &reindex_marker_path(index_dir),
         b"shutdown mutation drain deadline expired; the on-disk index snapshot \
           is no longer certified - startup must rebuild from git truth\n",
-    )?;
-    std::fs::rename(&tmp, reindex_marker_path(index_dir))
+    )
 }
 
 /// Whether a durable reindex-required marker is present in the index dir.
-pub fn reindex_required_marker_present(index_dir: &std::path::Path) -> bool {
-    reindex_marker_path(index_dir).exists()
+///
+/// Inspects with `symlink_metadata` (#329 review, round 5): a dangling
+/// symlink at the marker path still counts as present, and every other
+/// inspection error propagates as `Err` instead of collapsing to `false`.
+/// Callers must fail closed — "cannot inspect" is not evidence of absence,
+/// so an `Err` must be treated as reindex-required.
+pub fn reindex_required_marker_present(index_dir: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(reindex_marker_path(index_dir)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Remove the reindex-required marker after a clean startup rebuild.
@@ -1170,12 +1184,27 @@ pub fn startup_needs_reindex(
     head_sha: Option<&str>,
     stored_sha: Option<&str>,
 ) -> bool {
-    if reindex_required_marker_present(index_dir) {
-        info!(
-            "reindex-required marker present — forcing rebuild from git truth \
-             regardless of stored-SHA/HEAD equality"
-        );
-        return true;
+    match reindex_required_marker_present(index_dir) {
+        Ok(true) => {
+            info!(
+                "reindex-required marker present — forcing rebuild from git truth \
+                 regardless of stored-SHA/HEAD equality"
+            );
+            return true;
+        }
+        Ok(false) => {}
+        // Fail closed (#329 review, round 5): a metadata error is not
+        // evidence the marker is absent. Treating it as absent would let
+        // stored-SHA == HEAD equality skip the rebuild a timed-out shutdown
+        // promised. A redundant rebuild is the safe failure mode.
+        Err(e) => {
+            warn!(
+                error = %e,
+                "could not inspect reindex-required marker — failing closed \
+                 and rebuilding from git truth"
+            );
+            return true;
+        }
     }
     head_sha != stored_sha
 }
@@ -1196,10 +1225,11 @@ pub fn startup_needs_reindex(
 /// a clean shutting-down error before touching any state, and the drain
 /// converges over exactly the sealed-in units.
 ///
-/// Returns `true` when every unit completed within `deadline`. On timeout it
-/// records a mirror gap, *revokes the index's stored certification SHA*, and
-/// writes a durable reindex-required marker into `index_dir` before
-/// returning `false`. Revocation must not depend on HEAD comparison (#329
+/// Returns `Ok(true)` when every unit completed within `deadline`. On
+/// timeout it records a mirror gap, *revokes the index's stored
+/// certification SHA*, and writes a durable reindex-required marker into
+/// `index_dir` before returning `Ok(false)`. Revocation must not depend on
+/// HEAD comparison (#329
 /// review, round 4): an abandoned `remember`/`edit` may have mutated the
 /// vector index while its shielded git save never advanced HEAD, so the
 /// previously verified SHA can still equal HEAD while the index is dirty —
@@ -1210,14 +1240,23 @@ pub fn startup_needs_reindex(
 /// — only the on-disk marker makes the forced next-start reindex durable
 /// (#329 review, round 4, remaining Low). A hard shutdown deadline may
 /// abandon a mutation, but it must never certify the index as intact.
+///
+/// Marker I/O must not fail open (#329 review, round 5): when the marker
+/// cannot be written, the durable guarantee falls back to revoking the
+/// certification inside the persisted snapshot itself
+/// ([`crate::index::usearch::revoke_persisted_certification`] — rewrites
+/// only the stored `commit_sha`, never dirty in-memory index state). Only
+/// if *both* durable channels fail does this return `Err`, so the caller
+/// propagates a shutdown error instead of logging the guarantee away and
+/// exiting as if it held.
 pub async fn drain_mutations_before_persist(
     state: &AppState,
     index_dir: &std::path::Path,
     deadline: std::time::Duration,
-) -> bool {
+) -> Result<bool, MemoryError> {
     state.mutations.seal();
     if state.mutations.drained_within(deadline).await {
-        true
+        Ok(true)
     } else {
         warn!(
             in_flight = state.mutations.in_flight(),
@@ -1232,15 +1271,25 @@ pub async fn drain_mutations_before_persist(
         state.index.set_commit_sha(None);
         // The in-memory revocation dies with this process while persistence
         // is skipped — make the forced next-start reindex durable.
-        if let Err(e) = write_reindex_required_marker(index_dir) {
+        if let Err(marker_err) = write_reindex_required_marker(index_dir) {
             tracing::error!(
-                error = %e,
-                "failed to write reindex-required marker — if git HEAD did \
-                 not advance, the next startup may wrongly certify the old \
-                 on-disk snapshot as fresh"
+                error = %marker_err,
+                "failed to write reindex-required marker — falling back to \
+                 revoking the certification inside the persisted snapshot"
             );
+            if let Err(revoke_err) =
+                crate::index::usearch::revoke_persisted_certification(index_dir)
+            {
+                return Err(MemoryError::Internal(format!(
+                    "shutdown drain deadline expired but no durable revocation \
+                     could be recorded: reindex-required marker write failed \
+                     ({marker_err}) and persisted-certification revocation \
+                     failed ({revoke_err}); the next startup could wrongly \
+                     certify the stale on-disk snapshot"
+                )));
+            }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -4947,7 +4996,10 @@ mod tests {
                 Some((&auth, "main")),
                 &router,
                 &MockEmbedding,
-                server_default_dir.path().join(".memory-mcp-index").as_path(),
+                server_default_dir
+                    .path()
+                    .join(".memory-mcp-index")
+                    .as_path(),
                 Box::new(InMemoryStore::new(4)),
                 || Box::new(InMemoryStore::new(4)),
             )
@@ -5205,10 +5257,11 @@ mod tests {
                 dir_a.path(),
                 std::time::Duration::from_millis(50),
             )
-            .await;
+            .await
+            .expect("marker write must succeed on a writable index dir");
             assert!(!drained, "drain must report the expired deadline");
             assert!(
-                reindex_required_marker_present(dir_a.path()),
+                reindex_required_marker_present(dir_a.path()).expect("inspect marker"),
                 "an expired drain deadline must leave a durable marker"
             );
             assert!(
@@ -5291,7 +5344,8 @@ mod tests {
                         index_dir.path(),
                         std::time::Duration::from_millis(200)
                     )
-                    .await,
+                    .await
+                    .expect("clean drain must not error"),
                     "an idle registry must drain cleanly"
                 );
                 persist_index_on_shutdown(&state, index_dir.path())
@@ -5300,7 +5354,7 @@ mod tests {
                 state.index.commit_sha().expect("verified SHA at A")
             };
             assert!(
-                !reindex_required_marker_present(index_dir.path()),
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
                 "a clean shutdown must not leave a reindex-required marker"
             );
 
@@ -5340,7 +5394,8 @@ mod tests {
                     index_dir.path(),
                     std::time::Duration::from_millis(50),
                 )
-                .await;
+                .await
+                .expect("marker write must succeed on a writable index dir");
                 assert!(!drained, "drain must report the expired deadline");
                 assert_eq!(
                     state.index.commit_sha(),
@@ -5349,7 +5404,7 @@ mod tests {
                      still equals HEAD"
                 );
                 assert!(
-                    reindex_required_marker_present(index_dir.path()),
+                    reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
                     "the timeout must leave a durable reindex-required marker"
                 );
 
@@ -5412,7 +5467,7 @@ mod tests {
             assert_eq!(fresh.commit_sha(), head, "the rebuild must stamp HEAD");
             clear_reindex_required_marker(index_dir.path());
             assert!(
-                !reindex_required_marker_present(index_dir.path()),
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
                 "a certified rebuild must consume the marker"
             );
             assert!(
@@ -5424,6 +5479,293 @@ mod tests {
                 "with the marker consumed and the rebuild certified, the \
                  next boot may skip the reindex again"
             );
+        }
+
+        /// #329 review round 5: the marker write must never follow a
+        /// pre-planted symlink. A symlink at the temp path must fail the
+        /// write (`O_NOFOLLOW`) instead of truncating its target; a symlink
+        /// at the final marker path is atomically replaced by the rename
+        /// without the target ever being written through.
+        #[cfg(unix)]
+        #[test]
+        fn reindex_marker_write_does_not_follow_planted_symlinks() {
+            // Temp-path attack.
+            let index_dir = tempfile::tempdir().expect("index dir");
+            let victim = index_dir.path().join("victim");
+            std::fs::write(&victim, b"precious").expect("victim");
+            let tmp_path = index_dir
+                .path()
+                .join(format!(".{REINDEX_REQUIRED_MARKER}.tmp"));
+            std::os::unix::fs::symlink(&victim, &tmp_path).expect("plant temp symlink");
+            write_reindex_required_marker(index_dir.path())
+                .expect_err("writing through a planted temp symlink must fail, not truncate");
+            assert_eq!(
+                std::fs::read(&victim).expect("victim survives"),
+                b"precious",
+                "the planted temp symlink must not truncate its target"
+            );
+            assert!(
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                "the failed write must not leave a marker behind"
+            );
+
+            // Final-path attack.
+            let index_dir2 = tempfile::tempdir().expect("index dir 2");
+            let victim2 = index_dir2.path().join("victim2");
+            std::fs::write(&victim2, b"precious2").expect("victim2");
+            let marker_path = index_dir2.path().join(REINDEX_REQUIRED_MARKER);
+            std::os::unix::fs::symlink(&victim2, &marker_path).expect("plant marker symlink");
+            write_reindex_required_marker(index_dir2.path())
+                .expect("replacing a planted final-path symlink is safe");
+            assert_eq!(
+                std::fs::read(&victim2).expect("victim2 survives"),
+                b"precious2",
+                "the rename must replace the symlink, never write through it"
+            );
+            let meta = std::fs::symlink_metadata(&marker_path).expect("marker meta");
+            assert!(
+                meta.file_type().is_file(),
+                "the marker must be a regular file, not the planted symlink"
+            );
+        }
+
+        /// #329 review round 5: a failed marker write must surface as `Err`
+        /// (so the drain can fall back / propagate) and must leave neither a
+        /// marker nor a stray temp file behind.
+        #[cfg(unix)]
+        #[test]
+        fn reindex_marker_write_failure_surfaces_and_leaves_no_marker() {
+            use std::os::unix::fs::PermissionsExt;
+            // Permission-based failure injection is meaningless as root.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let index_dir = tempfile::tempdir().expect("index dir");
+            let set_mode = |mode: u32| {
+                let mut perms = std::fs::metadata(index_dir.path())
+                    .expect("meta")
+                    .permissions();
+                perms.set_mode(mode);
+                std::fs::set_permissions(index_dir.path(), perms).expect("chmod");
+            };
+            set_mode(0o555);
+            write_reindex_required_marker(index_dir.path())
+                .expect_err("a read-only index dir must fail the marker write");
+            set_mode(0o755);
+            assert!(
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                "the failed write must not leave a marker"
+            );
+            assert!(
+                std::fs::read_dir(index_dir.path())
+                    .expect("read dir")
+                    .next()
+                    .is_none(),
+                "the failed write must not leave a stray temp file"
+            );
+        }
+
+        /// #329 review round 5: marker inspection must fail closed. A
+        /// dangling symlink or an uninspectable directory is not evidence of
+        /// absence — both must force the rebuild even when the stored SHA
+        /// equals HEAD.
+        #[cfg(unix)]
+        #[test]
+        fn startup_reindex_check_fails_closed_on_marker_inspection() {
+            // Dangling symlink at the marker path: `Path::exists()` would
+            // collapse this to `false`; `symlink_metadata` sees the entry.
+            let index_dir = tempfile::tempdir().expect("index dir");
+            std::os::unix::fs::symlink(
+                index_dir.path().join("nonexistent-target"),
+                index_dir.path().join(REINDEX_REQUIRED_MARKER),
+            )
+            .expect("plant dangling symlink");
+            assert!(
+                reindex_required_marker_present(index_dir.path())
+                    .expect("a dangling symlink is inspectable"),
+                "a dangling symlink at the marker path must count as present"
+            );
+            assert!(
+                startup_needs_reindex(index_dir.path(), Some("sha-a"), Some("sha-a")),
+                "a dangling-symlink marker must force the rebuild despite \
+                 stored SHA == HEAD"
+            );
+
+            // Uninspectable directory: metadata errors surface as Err and
+            // the startup decision fails closed. Meaningless as root.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let locked = tempfile::tempdir().expect("locked dir");
+            let orig = std::fs::metadata(locked.path())
+                .expect("meta")
+                .permissions();
+            let mut none = orig.clone();
+            none.set_mode(0o000);
+            std::fs::set_permissions(locked.path(), none).expect("lock dir");
+            assert!(
+                reindex_required_marker_present(locked.path()).is_err(),
+                "a metadata error must surface as Err, never collapse to false"
+            );
+            assert!(
+                startup_needs_reindex(locked.path(), Some("sha-a"), Some("sha-a")),
+                "an uninspectable marker must fail closed into a rebuild"
+            );
+            std::fs::set_permissions(locked.path(), orig).expect("restore perms");
+        }
+
+        /// #329 review round 5: marker I/O must not fail open. When the
+        /// marker cannot be created, the drain falls back to durably
+        /// revoking the certification inside the persisted snapshot itself
+        /// — so a restart with unchanged HEAD still rebuilds. When that
+        /// fallback has no writable channel either, the drain propagates an
+        /// error instead of exiting as if the guarantee held.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn drain_timeout_marker_write_failure_revokes_persisted_certification() {
+            use std::os::unix::fs::PermissionsExt;
+            // Permission-based failure injection is meaningless as root.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let index_dir = tempfile::tempdir().expect("index dir");
+            let set_mode = |path: &std::path::Path, mode: u32| {
+                let mut perms = std::fs::metadata(path).expect("meta").permissions();
+                perms.set_mode(mode);
+                std::fs::set_permissions(path, perms).expect("chmod");
+            };
+            let usearch_state = |index: Box<dyn VectorStore>| {
+                let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo init");
+                Arc::new(AppState::new(
+                    Arc::new(repo),
+                    "main".to_string(),
+                    Box::new(MockEmbedding),
+                    index,
+                    AuthProvider::new(),
+                    HealthRegistry::new(),
+                    None,
+                ))
+            };
+
+            // A clean shutdown leaves an on-disk snapshot certified at
+            // HEAD-A.
+            let sha_a = {
+                let state = usearch_state(Box::new(
+                    crate::index::UsearchStore::new(4).expect("usearch store"),
+                ));
+                let note = Memory::from_validated(
+                    MemoryName::new("note-a".to_string()).unwrap(),
+                    "payload a".to_string(),
+                    MemoryMetadata::new(Scope::Root, vec![], None),
+                );
+                state.repo.save_memory(&note).await.expect("save a");
+                assert!(
+                    drain_mutations_before_persist(
+                        &state,
+                        index_dir.path(),
+                        std::time::Duration::from_millis(200)
+                    )
+                    .await
+                    .expect("clean drain must not error"),
+                    "an idle registry must drain cleanly"
+                );
+                persist_index_on_shutdown(&state, index_dir.path())
+                    .await
+                    .expect("persist at A");
+                state.index.commit_sha().expect("verified SHA at A")
+            };
+
+            // Marker writes into the index-dir root now fail (read-only)
+            // while `all/` stays writable for the fallback.
+            set_mode(index_dir.path(), 0o555);
+
+            // A drain timeout with a stuck unit and unchanged HEAD: the
+            // marker write fails, the fallback must absorb it.
+            {
+                let loaded = crate::index::UsearchStore::load(index_dir.path(), 4)
+                    .expect("load snapshot at A");
+                assert_eq!(
+                    loaded.commit_sha().as_deref(),
+                    Some(sha_a.as_str()),
+                    "precondition: the loaded snapshot is certified at A"
+                );
+                let state = usearch_state(Box::new(loaded));
+                let stuck_unit_slot = state.mutations.enter();
+                let drained = drain_mutations_before_persist(
+                    &state,
+                    index_dir.path(),
+                    std::time::Duration::from_millis(50),
+                )
+                .await
+                .expect("the fallback revocation must absorb the marker-write failure");
+                assert!(!drained, "drain must report the expired deadline");
+                drop(stuck_unit_slot);
+            }
+            assert!(
+                !reindex_required_marker_present(index_dir.path()).expect("inspect marker"),
+                "precondition: the marker write must have failed on the \
+                 read-only index dir"
+            );
+
+            // The certification inside the snapshot itself was revoked
+            // durably…
+            let loaded =
+                crate::index::UsearchStore::load(index_dir.path(), 4).expect("reload snapshot");
+            assert_eq!(
+                loaded.commit_sha().as_deref(),
+                Some(crate::index::usearch::REVOKED_COMMIT_SHA_SENTINEL),
+                "the fallback must rewrite the persisted commit_sha to the \
+                 revocation sentinel"
+            );
+            // …so a restart with UNCHANGED git HEAD still rebuilds.
+            let repo = MemoryRepo::init_or_open(tmp.path(), None).expect("repo reopen");
+            let router = RepoRouter::single(Arc::new(repo));
+            let head = router.head_sha().await;
+            assert_eq!(
+                head.as_deref(),
+                Some(sha_a.as_str()),
+                "precondition: git HEAD is unchanged"
+            );
+            assert!(
+                startup_needs_reindex(
+                    index_dir.path(),
+                    head.as_deref(),
+                    loaded.commit_sha().as_deref()
+                ),
+                "the revoked persisted certification must force the rebuild \
+                 without any marker"
+            );
+
+            // When the fallback ALSO has no durable channel, the drain must
+            // propagate instead of logging the guarantee away.
+            set_mode(&index_dir.path().join("all"), 0o555);
+            {
+                let state = usearch_state(Box::new(
+                    crate::index::UsearchStore::new(4).expect("usearch store"),
+                ));
+                let stuck_unit_slot = state.mutations.enter();
+                let err = drain_mutations_before_persist(
+                    &state,
+                    index_dir.path(),
+                    std::time::Duration::from_millis(50),
+                )
+                .await
+                .expect_err(
+                    "with no durable revocation channel the drain must error, \
+                     not fail open",
+                );
+                assert!(
+                    err.to_string().contains("reindex-required marker"),
+                    "the error must name both failed channels, got: {err}"
+                );
+                drop(stuck_unit_slot);
+            }
+
+            // Restore permissions so the tempdir can clean up.
+            set_mode(&index_dir.path().join("all"), 0o755);
+            set_mode(index_dir.path(), 0o755);
         }
 
         /// #329 review round 4: once the shutdown drain seals admission,
@@ -5444,11 +5786,12 @@ mod tests {
                     marker_dir.path(),
                     std::time::Duration::from_millis(200)
                 )
-                .await,
+                .await
+                .expect("clean drain must not error"),
                 "an idle registry must drain cleanly"
             );
             assert!(
-                !reindex_required_marker_present(marker_dir.path()),
+                !reindex_required_marker_present(marker_dir.path()).expect("inspect marker"),
                 "a clean drain must not leave a reindex-required marker"
             );
 
